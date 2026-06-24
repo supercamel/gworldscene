@@ -1,0 +1,33 @@
+#ifndef GWORLD_SCENE_NODE_PRIVATE_H
+#define GWORLD_SCENE_NODE_PRIVATE_H
+
+#include "gworld-scene-node.h"
+
+GWorldSceneCubeNode *_gworld_scene_cube_node_new(GWorldSceneNodeId id,
+                                                 double latitude,
+                                                 double longitude,
+                                                 double altitude_amsl,
+                                                 double width_m,
+                                                 double depth_m,
+                                                 double height_m);
+
+GWorldSceneSphereNode *_gworld_scene_sphere_node_new(GWorldSceneNodeId id,
+                                                     double latitude,
+                                                     double longitude,
+                                                     double altitude_amsl,
+                                                     double diameter_m);
+
+GWorldSceneCylinderNode *_gworld_scene_cylinder_node_new(GWorldSceneNodeId id,
+                                                        double latitude,
+                                                        double longitude,
+                                                        double altitude_amsl,
+                                                        double diameter_m,
+                                                        double height_m);
+
+GWorldSceneModelNode *_gworld_scene_model_node_new(GWorldSceneNodeId id,
+                                                   const char *model_path,
+                                                   double latitude,
+                                                   double longitude,
+                                                   double altitude_amsl);
+
+#endif /* GWORLD_SCENE_NODE_PRIVATE_H */

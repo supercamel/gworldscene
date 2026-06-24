@@ -1,7 +1,20 @@
+#ifndef G_LOG_DOMAIN
+#define G_LOG_DOMAIN "GWorldScene"
+#endif
+
 #include "gworld-scene-view.h"
+#include "gworld-scene-camera-private.h"
+#include "gworld-scene-geo-private.h"
+#include "gworld-scene-light-private.h"
+#include "gworld-scene-lod-private.h"
+#include "gworld-scene-node-private.h"
 #include "gworld-scene-view-private.h"
 
 #include <assimp/Importer.hpp>
+#include <assimp/material.h>
+#include <assimp/postprocess.h>
+#include <assimp/scene.h>
+#include <assimp/texture.h>
 #include <epoxy/gl.h>
 #include <gdal_priv.h>
 #include <gdk-pixbuf/gdk-pixbuf.h>
@@ -32,11 +45,6 @@ namespace {
 
 constexpr double kPi = 3.14159265358979323846;
 constexpr double kMercatorMaxLatitude = 85.05112878;
-constexpr double kEarthMetersPerDegree = 111320.0;
-constexpr double kWgs84A = 6378137.0;
-constexpr double kWgs84F = 1.0 / 298.257223563;
-constexpr double kWgs84B = kWgs84A * (1.0 - kWgs84F);
-constexpr double kWgs84E2 = 1.0 - (kWgs84B * kWgs84B) / (kWgs84A * kWgs84A);
 constexpr int kAtlasTilePixels = 256;
 constexpr int kMaxAtlasTiles = 64;
 constexpr int kMaxAtlasPixels = 4096;
@@ -44,11 +52,35 @@ constexpr guint kSceneUpdateDelayMs = 180;
 constexpr int kMaxTerrainTileLoadsPerUpdate = 10;
 constexpr int kMaxTerrainDownloadsPerUpdate = 8;
 constexpr int kMaxTextureDownloadsPerUpdate = 36;
+constexpr gint64 kTerrainRetryBaseDelayUs = 5 * G_USEC_PER_SEC;
+constexpr gint64 kTerrainRetryMaxDelayUs = 120 * G_USEC_PER_SEC;
 constexpr double kMinCameraPitchDeg = -89.0;
 constexpr double kMaxCameraPitchDeg = 89.0;
+constexpr double kGlobeRenderAltitudeM = 45000.0;
+constexpr double kTerrainDisableAltitudeM = 180000.0;
+constexpr int kShadowMapSize = 2048;
+constexpr double kShadowMaxAltitudeM = kTerrainDisableAltitudeM;
+constexpr int kGlobeLatSegments = 64;
+constexpr int kGlobeLonSegments = 128;
+constexpr int kVertexStride = 16;
+constexpr int kSphereSegments = 24;
+constexpr int kSphereRings = 12;
+constexpr int kCylinderSegments = 32;
+constexpr int kModelTextureTilePixels = 512;
+constexpr int kModelTextureAtlasColumns = 4;
+constexpr int kModelTextureAtlasRows = 4;
+constexpr int kModelTextureAtlasPixels = kModelTextureTilePixels * kModelTextureAtlasColumns;
+constexpr float kMaterialTerrain = 0.0f;
+constexpr float kMaterialSolidNode = 1.0f;
+constexpr float kMaterialGlobe = 2.0f;
+constexpr float kMaterialTexturedModel = 3.0f;
 
 constexpr const char *kDefaultTerrainServer = "https://flightops.silvertone.com.au/terrain/data/";
 constexpr const char *kDefaultMapTileTemplate = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
+
+using gworld_scene::deg_to_rad;
+using gworld_scene::kEarthMetersPerDegree;
+using gworld_scene::ned_to_scene_vector;
 
 struct TileCoord {
   int z = 0;
@@ -105,6 +137,22 @@ struct TerrainCandidate {
   double distance = 0.0;
 };
 
+struct ModelVertex {
+  glm::dvec3 position;
+  glm::dvec3 normal;
+  glm::vec3 color;
+  glm::vec2 texcoord = glm::vec2(-1.0f);
+  bool has_texture = false;
+};
+
+struct ModelMesh {
+  bool loaded = false;
+  bool failed = false;
+  std::string error;
+  std::vector<ModelVertex> vertices;
+  std::vector<unsigned int> indices;
+};
+
 struct TexCoords {
   float detail_u = 0.0f;
   float detail_v = 0.0f;
@@ -118,9 +166,28 @@ enum class TextureLayer {
   Detail,
   Mid,
   Base,
+  Globe,
 };
 
 } // namespace
+
+struct SceneNode {
+  GWorldSceneNodeId id = 0;
+  double latitude = 0.0;
+  double longitude = 0.0;
+  double altitude_amsl = 0.0;
+  double yaw_deg = 0.0;
+  double pitch_deg = 0.0;
+  double roll_deg = 0.0;
+  double width_m = 10.0;
+  double depth_m = 10.0;
+  double height_m = 10.0;
+  double scale_x = 1.0;
+  double scale_y = 1.0;
+  double scale_z = 1.0;
+  glm::vec3 color = glm::vec3(0.96f, 0.54f, 0.20f);
+  std::string model_path;
+};
 
 struct GWorldSceneViewState {
   std::mutex mutex;
@@ -132,6 +199,17 @@ struct GWorldSceneViewState {
   double pitch_deg = -26.0;
   double mesh_origin_latitude = -35.0024;
   double mesh_origin_longitude = 147.4648;
+  double sun_azimuth_deg = 228.0;
+  double sun_elevation_deg = 50.0;
+  double sun_time_of_day = 14.0;
+  double sun_declination_deg = 0.0;
+  bool sun_uses_time_of_day = false;
+  bool fog_enabled = true;
+  double fog_start_m = 12000.0;
+  double fog_end_m = 120000.0;
+  glm::vec3 fog_color = glm::vec3(0.60f, 0.72f, 0.86f);
+  bool shadows_enabled = true;
+  double terrain_normal_smoothing = 0.88;
 
   std::string terrain_server = kDefaultTerrainServer;
   std::string map_tile_template = kDefaultMapTileTemplate;
@@ -141,11 +219,20 @@ struct GWorldSceneViewState {
   std::unordered_map<std::string, TerrainTile> terrain_tiles;
   std::unordered_set<std::string> wanted_terrain_keys;
   std::unordered_set<std::string> pending;
+  std::unordered_set<std::string> unavailable_terrain_keys;
+  std::unordered_map<std::string, unsigned int> terrain_failure_counts;
+  std::unordered_map<std::string, gint64> terrain_retry_after_us;
 
   std::vector<float> vertices;
   std::vector<unsigned int> indices;
   bool mesh_dirty = true;
   std::string mesh_key;
+  bool mesh_includes_terrain = true;
+  guint64 scene_revision = 0;
+  GWorldSceneNodeId next_node_id = 1;
+  std::unordered_map<GWorldSceneNodeId, GWorldSceneNode *> scene_nodes;
+  std::unordered_map<std::string, ModelMesh> model_meshes;
+  std::unordered_map<std::string, int> model_texture_slots;
   AtlasRange mesh_atlas_range;
   AtlasRange mesh_mid_atlas_range;
   AtlasRange mesh_base_atlas_range;
@@ -176,16 +263,44 @@ struct GWorldSceneViewState {
   std::string wanted_base_texture_key;
   std::string pending_base_texture_build_key;
   AtlasRange base_texture_atlas_range;
+
+  std::vector<unsigned char> globe_texture_pixels;
+  int globe_texture_width = 0;
+  int globe_texture_height = 0;
+  bool globe_texture_dirty = false;
+  std::string loaded_globe_texture_key;
+  std::string wanted_globe_texture_key;
+  std::string pending_globe_texture_build_key;
+  AtlasRange globe_texture_atlas_range;
   guint64 texture_source_revision = 0;
 
+  std::vector<unsigned char> model_texture_pixels;
+  int model_texture_width = 0;
+  int model_texture_height = 0;
+  bool model_texture_dirty = false;
+
   GLuint program = 0;
+  GLuint shadow_program = 0;
+  GLuint shadow_fbo = 0;
+  GLuint shadow_depth_texture = 0;
   GLuint vao = 0;
   GLuint vbo = 0;
   GLuint ebo = 0;
   GLuint texture = 0;
   GLuint mid_texture = 0;
   GLuint base_texture = 0;
+  GLuint globe_texture = 0;
+  GLuint model_texture = 0;
   std::size_t index_count = 0;
+
+  std::vector<float> globe_vertices;
+  std::vector<unsigned int> globe_indices;
+  bool globe_mesh_dirty = true;
+  std::string globe_mesh_key;
+  GLuint globe_vao = 0;
+  GLuint globe_vbo = 0;
+  GLuint globe_ebo = 0;
+  std::size_t globe_index_count = 0;
 
   double rotate_drag_last_x = 0.0;
   double rotate_drag_last_y = 0.0;
@@ -228,6 +343,8 @@ struct TextureAtlasBuildResult {
   int width = 0;
   int height = 0;
   int loaded_count = 0;
+  int missing_count = 0;
+  int decode_failed_count = 0;
 };
 
 const char *
@@ -240,6 +357,8 @@ texture_layer_name(TextureLayer layer)
     return "mid";
   case TextureLayer::Base:
     return "base";
+  case TextureLayer::Globe:
+    return "globe";
   }
   return "detail";
 }
@@ -254,6 +373,8 @@ texture_layer_pixels(GWorldSceneViewState *state, TextureLayer layer)
     return state->mid_texture_pixels;
   case TextureLayer::Base:
     return state->base_texture_pixels;
+  case TextureLayer::Globe:
+    return state->globe_texture_pixels;
   }
   return state->texture_pixels;
 }
@@ -268,6 +389,8 @@ texture_layer_width(GWorldSceneViewState *state, TextureLayer layer)
     return state->mid_texture_width;
   case TextureLayer::Base:
     return state->base_texture_width;
+  case TextureLayer::Globe:
+    return state->globe_texture_width;
   }
   return state->texture_width;
 }
@@ -282,6 +405,8 @@ texture_layer_height(GWorldSceneViewState *state, TextureLayer layer)
     return state->mid_texture_height;
   case TextureLayer::Base:
     return state->base_texture_height;
+  case TextureLayer::Globe:
+    return state->globe_texture_height;
   }
   return state->texture_height;
 }
@@ -296,6 +421,8 @@ texture_layer_dirty(GWorldSceneViewState *state, TextureLayer layer)
     return state->mid_texture_dirty;
   case TextureLayer::Base:
     return state->base_texture_dirty;
+  case TextureLayer::Globe:
+    return state->globe_texture_dirty;
   }
   return state->texture_dirty;
 }
@@ -310,6 +437,8 @@ texture_layer_loaded_key(GWorldSceneViewState *state, TextureLayer layer)
     return state->loaded_mid_texture_key;
   case TextureLayer::Base:
     return state->loaded_base_texture_key;
+  case TextureLayer::Globe:
+    return state->loaded_globe_texture_key;
   }
   return state->loaded_texture_key;
 }
@@ -324,6 +453,8 @@ texture_layer_wanted_key(GWorldSceneViewState *state, TextureLayer layer)
     return state->wanted_mid_texture_key;
   case TextureLayer::Base:
     return state->wanted_base_texture_key;
+  case TextureLayer::Globe:
+    return state->wanted_globe_texture_key;
   }
   return state->wanted_texture_key;
 }
@@ -338,6 +469,8 @@ texture_layer_pending_key(GWorldSceneViewState *state, TextureLayer layer)
     return state->pending_mid_texture_build_key;
   case TextureLayer::Base:
     return state->pending_base_texture_build_key;
+  case TextureLayer::Globe:
+    return state->pending_globe_texture_build_key;
   }
   return state->pending_texture_build_key;
 }
@@ -352,14 +485,10 @@ texture_layer_active_range(GWorldSceneViewState *state, TextureLayer layer)
     return state->mid_texture_atlas_range;
   case TextureLayer::Base:
     return state->base_texture_atlas_range;
+  case TextureLayer::Globe:
+    return state->globe_texture_atlas_range;
   }
   return state->texture_atlas_range;
-}
-
-double
-deg_to_rad(double degrees)
-{
-  return degrees * kPi / 180.0;
 }
 
 std::string
@@ -457,14 +586,14 @@ terrain_step_for_altitude(double altitude_amsl)
 double
 terrain_build_radius_for_altitude(double altitude_amsl)
 {
-  const double horizon_m = std::sqrt(std::max(0.0, 2.0 * kWgs84A * altitude_amsl));
+  const double horizon_m = std::sqrt(std::max(0.0, 2.0 * gworld_scene::kWgs84A * altitude_amsl));
   return std::clamp(std::max(altitude_amsl * 70.0, horizon_m * 1.35), 90000.0, 650000.0);
 }
 
 double
 texture_radius_for_altitude(double altitude_amsl)
 {
-  return std::clamp(altitude_amsl * 1.4, 3500.0, 18000.0);
+  return std::clamp(altitude_amsl * 2.1, 5250.0, 27000.0);
 }
 
 double
@@ -576,11 +705,20 @@ texture_extension_for_uri(const std::string &uri)
 }
 
 std::string
+texture_cache_provider_key(const std::string &templ)
+{
+  return std::to_string(g_str_hash(templ.c_str()));
+}
+
+std::string
 texture_cache_path(const std::string &cache_dir,
                    const std::string &uri,
+                   const std::string &templ,
                    TileCoord tile)
 {
-  return join_path(join_path(join_path(cache_dir, "textures"), std::to_string(tile.z)),
+  return join_path(join_path(join_path(join_path(cache_dir, "textures"),
+                                      texture_cache_provider_key(templ)),
+                             std::to_string(tile.z)),
                    join_path(std::to_string(tile.x),
                              std::to_string(tile.y) + "." + texture_extension_for_uri(uri)));
 }
@@ -637,6 +775,20 @@ select_atlas_range(const LatLonBounds &bounds, int desired_zoom)
   return fallback;
 }
 
+AtlasRange
+globe_atlas_range(double latitude, double longitude, double altitude_amsl)
+{
+  const gworld_scene::TileRange lod_range =
+    gworld_scene::globe_texture_range_for_camera(latitude, longitude, altitude_amsl);
+  AtlasRange range;
+  range.z = lod_range.z;
+  range.x_min = lod_range.x_min;
+  range.x_max = lod_range.x_max;
+  range.y_min = lod_range.y_min;
+  range.y_max = lod_range.y_max;
+  return range;
+}
+
 LatLonBounds
 bounds_around_camera(double latitude, double longitude, double radius_m)
 {
@@ -653,22 +805,6 @@ bounds_around_camera(double latitude, double longitude, double radius_m)
 }
 
 glm::dvec3
-geodetic_to_ecef(double lat_deg, double lon_deg, double h)
-{
-  const double lat = deg_to_rad(lat_deg);
-  const double lon = deg_to_rad(lon_deg);
-  const double sin_lat = std::sin(lat);
-  const double cos_lat = std::cos(lat);
-  const double sin_lon = std::sin(lon);
-  const double cos_lon = std::cos(lon);
-  const double n = kWgs84A / std::sqrt(1.0 - kWgs84E2 * sin_lat * sin_lat);
-
-  return glm::dvec3((n + h) * cos_lat * cos_lon,
-                    (n + h) * cos_lat * sin_lon,
-                    (n * (1.0 - kWgs84E2) + h) * sin_lat);
-}
-
-glm::dvec3
 geodetic_to_enu(double lat_deg,
                 double lon_deg,
                 double h,
@@ -676,22 +812,68 @@ geodetic_to_enu(double lat_deg,
                 double ref_lon_deg,
                 double ref_h)
 {
-  const glm::dvec3 ref_ecef = geodetic_to_ecef(ref_lat_deg, ref_lon_deg, ref_h);
-  const glm::dvec3 ecef = geodetic_to_ecef(lat_deg, lon_deg, h);
-  const glm::dvec3 d = ecef - ref_ecef;
+  return gworld_scene::geodetic_to_scene(lat_deg, lon_deg, h, ref_lat_deg, ref_lon_deg, ref_h);
+}
 
-  const double lat0 = deg_to_rad(ref_lat_deg);
-  const double lon0 = deg_to_rad(ref_lon_deg);
-  const double sin_lat = std::sin(lat0);
-  const double cos_lat = std::cos(lat0);
-  const double sin_lon = std::sin(lon0);
-  const double cos_lon = std::cos(lon0);
+glm::dvec3
+safe_normalize(const glm::dvec3 &value, const glm::dvec3 &fallback)
+{
+  const double length = glm::length(value);
+  if (length <= 0.000001)
+    return fallback;
+  return value / length;
+}
 
-  const double east = -sin_lon * d.x + cos_lon * d.y;
-  const double north = -sin_lat * cos_lon * d.x - sin_lat * sin_lon * d.y + cos_lat * d.z;
-  const double up = cos_lat * cos_lon * d.x + cos_lat * sin_lon * d.y + sin_lat * d.z;
+glm::dvec3
+sun_enu_for_state(const GWorldSceneViewState *state, double latitude)
+{
+  if (state->sun_uses_time_of_day)
+    return gworld_scene::sun_direction_from_time(latitude,
+                                                state->sun_time_of_day,
+                                                state->sun_declination_deg);
+  return gworld_scene::sun_direction_from_position(state->sun_azimuth_deg,
+                                                  state->sun_elevation_deg);
+}
 
-  return glm::dvec3(east, up, -north);
+glm::vec3
+sun_scene_direction_from_enu(const glm::dvec3 &enu)
+{
+  const glm::dvec3 scene = safe_normalize(glm::dvec3(enu.x, enu.z, -enu.y),
+                                         glm::dvec3(-0.45, 0.76, 0.38));
+  return glm::vec3(static_cast<float>(scene.x),
+                   static_cast<float>(scene.y),
+                   static_cast<float>(scene.z));
+}
+
+double
+smoothstep_value(double edge0, double edge1, double value)
+{
+  const double t = std::clamp((value - edge0) / (edge1 - edge0), 0.0, 1.0);
+  return t * t * (3.0 - 2.0 * t);
+}
+
+void
+effective_fog_range(double configured_start_m,
+                    double configured_end_m,
+                    double altitude_m,
+                    bool render_globe,
+                    double &start_m,
+                    double &end_m)
+{
+  const double configured_start = std::max(0.0, configured_start_m);
+  const double configured_end = std::max(configured_start + 1.0, configured_end_m);
+
+  if (render_globe) {
+    start_m = std::max(configured_start, altitude_m * 0.65);
+    end_m = std::max(configured_end, altitude_m * 4.8);
+  } else {
+    const double local_start = std::clamp(altitude_m * 2.0, 2500.0, 25000.0);
+    const double local_end = std::clamp(altitude_m * 16.0, 35000.0, 180000.0);
+    start_m = std::min(configured_start, local_start);
+    end_m = std::min(configured_end, local_end);
+  }
+
+  end_m = std::max(end_m, start_m + 1.0);
 }
 
 uint16_t
@@ -892,7 +1074,9 @@ void
 append_vertex(std::vector<float> &vertices,
               const glm::dvec3 &position,
               const TexCoords &uv,
-              const glm::vec3 &normal)
+              const glm::vec3 &normal,
+              const glm::vec3 &color = glm::vec3(1.0f),
+              float material = kMaterialTerrain)
 {
   vertices.push_back(static_cast<float>(position.x));
   vertices.push_back(static_cast<float>(position.y));
@@ -906,6 +1090,510 @@ append_vertex(std::vector<float> &vertices,
   vertices.push_back(normal.x);
   vertices.push_back(normal.y);
   vertices.push_back(normal.z);
+  vertices.push_back(color.r);
+  vertices.push_back(color.g);
+  vertices.push_back(color.b);
+  vertices.push_back(material);
+}
+
+glm::vec3
+clamp_color(const glm::vec3 &color)
+{
+  return glm::vec3(std::clamp(color.r, 0.0f, 1.0f),
+                   std::clamp(color.g, 0.0f, 1.0f),
+                   std::clamp(color.b, 0.0f, 1.0f));
+}
+
+bool
+copy_pixbuf_rgba_scaled(GdkPixbuf *pixbuf,
+                        int target_width,
+                        int target_height,
+                        std::vector<unsigned char> &pixels,
+                        std::string *error_message = nullptr)
+{
+  if (pixbuf == nullptr || target_width <= 0 || target_height <= 0) {
+    if (error_message)
+      *error_message = "invalid image";
+    return false;
+  }
+
+  GdkPixbuf *working = nullptr;
+  if (gdk_pixbuf_get_width(pixbuf) != target_width ||
+      gdk_pixbuf_get_height(pixbuf) != target_height) {
+    working = gdk_pixbuf_scale_simple(pixbuf,
+                                      target_width,
+                                      target_height,
+                                      GDK_INTERP_BILINEAR);
+  } else {
+    working = GDK_PIXBUF(g_object_ref(pixbuf));
+  }
+
+  if (working == nullptr) {
+    if (error_message)
+      *error_message = "failed to scale image";
+    return false;
+  }
+
+  const int width = gdk_pixbuf_get_width(working);
+  const int height = gdk_pixbuf_get_height(working);
+  const int rowstride = gdk_pixbuf_get_rowstride(working);
+  const int channels = gdk_pixbuf_get_n_channels(working);
+  const bool has_alpha = gdk_pixbuf_get_has_alpha(working);
+  const auto *source = gdk_pixbuf_get_pixels(working);
+  if (width <= 0 || height <= 0 || source == nullptr || channels < 3) {
+    if (error_message) {
+      *error_message = "invalid image buffer: " + std::to_string(width) + "x" +
+                       std::to_string(height) + ", channels=" +
+                       std::to_string(channels) + ", rowstride=" +
+                       std::to_string(rowstride);
+    }
+    g_object_unref(working);
+    return false;
+  }
+
+  pixels.assign(static_cast<std::size_t>(target_width * target_height * 4), 0);
+  for (int y = 0; y < target_height; ++y) {
+    for (int x = 0; x < target_width; ++x) {
+      const std::size_t src = static_cast<std::size_t>(y * rowstride + x * channels);
+      const std::size_t dst = static_cast<std::size_t>((y * target_width + x) * 4);
+      pixels[dst + 0] = source[src + 0];
+      pixels[dst + 1] = source[src + 1];
+      pixels[dst + 2] = source[src + 2];
+      pixels[dst + 3] = has_alpha && channels >= 4 ? source[src + 3] : 255;
+    }
+  }
+
+  g_object_unref(working);
+  return true;
+}
+
+bool
+load_image_rgba_scaled(const std::string &path,
+                       int target_width,
+                       int target_height,
+                       std::vector<unsigned char> &pixels,
+                       std::string *error_message = nullptr)
+{
+  g_autoptr(GError) error = nullptr;
+  GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file(path.c_str(), &error);
+  if (pixbuf == nullptr) {
+    if (error_message)
+      *error_message = error ? error->message : "unknown image load error";
+    return false;
+  }
+
+  const bool result = copy_pixbuf_rgba_scaled(pixbuf,
+                                             target_width,
+                                             target_height,
+                                             pixels,
+                                             error_message);
+  g_object_unref(pixbuf);
+  return result;
+}
+
+bool
+load_embedded_texture_rgba_scaled(const aiTexture *texture,
+                                  int target_width,
+                                  int target_height,
+                                  std::vector<unsigned char> &pixels,
+                                  std::string *error_message = nullptr)
+{
+  if (texture == nullptr || target_width <= 0 || target_height <= 0) {
+    if (error_message)
+      *error_message = "invalid embedded texture";
+    return false;
+  }
+
+  if (texture->mHeight == 0) {
+    if (texture->mWidth == 0 || texture->pcData == nullptr) {
+      if (error_message)
+        *error_message = "empty embedded texture";
+      return false;
+    }
+
+    GdkPixbufLoader *loader = gdk_pixbuf_loader_new();
+    GError *error = nullptr;
+    if (!gdk_pixbuf_loader_write(loader,
+                                 reinterpret_cast<const guchar *>(texture->pcData),
+                                 texture->mWidth,
+                                 &error)) {
+      if (error_message)
+        *error_message = error ? error->message : "embedded texture decode failed";
+      g_clear_error(&error);
+      g_object_unref(loader);
+      return false;
+    }
+
+    if (!gdk_pixbuf_loader_close(loader, &error)) {
+      if (error_message)
+        *error_message = error ? error->message : "embedded texture decode failed";
+      g_clear_error(&error);
+      g_object_unref(loader);
+      return false;
+    }
+
+    GdkPixbuf *pixbuf = gdk_pixbuf_loader_get_pixbuf(loader);
+    const bool result = copy_pixbuf_rgba_scaled(pixbuf,
+                                               target_width,
+                                               target_height,
+                                               pixels,
+                                               error_message);
+    g_object_unref(loader);
+    return result;
+  }
+
+  if (texture->mWidth == 0 || texture->pcData == nullptr) {
+    if (error_message)
+      *error_message = "empty embedded texture";
+    return false;
+  }
+
+  pixels.assign(static_cast<std::size_t>(target_width * target_height * 4), 0);
+  for (int y = 0; y < target_height; ++y) {
+    const int sy = std::clamp(static_cast<int>((static_cast<double>(y) / target_height) *
+                                               static_cast<double>(texture->mHeight)),
+                              0,
+                              static_cast<int>(texture->mHeight) - 1);
+    for (int x = 0; x < target_width; ++x) {
+      const int sx = std::clamp(static_cast<int>((static_cast<double>(x) / target_width) *
+                                                 static_cast<double>(texture->mWidth)),
+                                0,
+                                static_cast<int>(texture->mWidth) - 1);
+      const aiTexel &texel = texture->pcData[sy * texture->mWidth + sx];
+      const std::size_t dst = static_cast<std::size_t>((y * target_width + x) * 4);
+      pixels[dst + 0] = texel.r;
+      pixels[dst + 1] = texel.g;
+      pixels[dst + 2] = texel.b;
+      pixels[dst + 3] = texel.a;
+    }
+  }
+
+  return true;
+}
+
+std::string
+model_directory_for_path(const std::string &path)
+{
+  g_autofree char *directory = g_path_get_dirname(path.c_str());
+  return directory ? directory : ".";
+}
+
+std::string
+model_texture_path_from_reference(const std::string &model_path,
+                                  const std::string &texture_reference)
+{
+  if (texture_reference.empty())
+    return std::string();
+
+  if (g_str_has_prefix(texture_reference.c_str(), "file://")) {
+    g_autofree char *filename = g_filename_from_uri(texture_reference.c_str(), nullptr, nullptr);
+    return filename ? filename : std::string();
+  }
+
+  g_autofree char *unescaped = g_uri_unescape_string(texture_reference.c_str(), nullptr);
+  std::string path = unescaped ? unescaped : texture_reference;
+  std::replace(path.begin(), path.end(), '\\', G_DIR_SEPARATOR);
+
+  if (g_path_is_absolute(path.c_str()))
+    return path;
+
+  return join_path(model_directory_for_path(model_path), path);
+}
+
+bool
+load_model_texture_pixels(const aiScene *scene,
+                          const std::string &model_path,
+                          const std::string &texture_reference,
+                          std::vector<unsigned char> &pixels,
+                          std::string *error_message = nullptr)
+{
+  if (scene != nullptr) {
+    const aiTexture *embedded = scene->GetEmbeddedTexture(texture_reference.c_str());
+    if (embedded != nullptr) {
+      return load_embedded_texture_rgba_scaled(embedded,
+                                              kModelTextureTilePixels,
+                                              kModelTextureTilePixels,
+                                              pixels,
+                                              error_message);
+    }
+  }
+
+  const std::string texture_path =
+    model_texture_path_from_reference(model_path, texture_reference);
+  if (texture_path.empty()) {
+    if (error_message)
+      *error_message = "texture reference is not a local file";
+    return false;
+  }
+
+  return load_image_rgba_scaled(texture_path,
+                                kModelTextureTilePixels,
+                                kModelTextureTilePixels,
+                                pixels,
+                                error_message);
+}
+
+bool
+material_texture_reference(const aiMaterial *material, aiString &texture_reference)
+{
+  if (material == nullptr)
+    return false;
+
+  if (aiGetMaterialTexture(material,
+                           aiTextureType_BASE_COLOR,
+                           0,
+                           &texture_reference) == AI_SUCCESS &&
+      texture_reference.C_Str()[0] != '\0') {
+    return true;
+  }
+
+  return aiGetMaterialTexture(material,
+                              aiTextureType_DIFFUSE,
+                              0,
+                              &texture_reference) == AI_SUCCESS &&
+         texture_reference.C_Str()[0] != '\0';
+}
+
+glm::vec2
+model_atlas_uv_for_slot(int slot, const aiVector3D &source_uv)
+{
+  const int column = slot % kModelTextureAtlasColumns;
+  const int row = slot / kModelTextureAtlasColumns;
+  const float u = std::clamp(source_uv.x, 0.0f, 1.0f);
+  const float v = std::clamp(source_uv.y, 0.0f, 1.0f);
+  const float atlas_u = (static_cast<float>(column) + u) /
+                        static_cast<float>(kModelTextureAtlasColumns);
+  const float atlas_v = (static_cast<float>(row) + v) /
+                        static_cast<float>(kModelTextureAtlasRows);
+  const float inset = 0.5f / static_cast<float>(kModelTextureAtlasPixels);
+  return glm::vec2(std::clamp(atlas_u,
+                              static_cast<float>(column) /
+                                static_cast<float>(kModelTextureAtlasColumns) + inset,
+                              static_cast<float>(column + 1) /
+                                static_cast<float>(kModelTextureAtlasColumns) - inset),
+                   std::clamp(atlas_v,
+                              static_cast<float>(row) /
+                                static_cast<float>(kModelTextureAtlasRows) + inset,
+                              static_cast<float>(row + 1) /
+                                static_cast<float>(kModelTextureAtlasRows) - inset));
+}
+
+void
+copy_model_texture_tile_to_atlas(GWorldSceneViewState *state,
+                                 int slot,
+                                 const std::vector<unsigned char> &tile_pixels)
+{
+  if (state->model_texture_pixels.empty()) {
+    state->model_texture_width = kModelTextureAtlasPixels;
+    state->model_texture_height = kModelTextureAtlasPixels;
+    state->model_texture_pixels.assign(static_cast<std::size_t>(state->model_texture_width) *
+                                         static_cast<std::size_t>(state->model_texture_height) * 4,
+                                       0);
+  }
+
+  const int column = slot % kModelTextureAtlasColumns;
+  const int row = slot / kModelTextureAtlasColumns;
+  const int dst_x0 = column * kModelTextureTilePixels;
+  const int dst_y0 = row * kModelTextureTilePixels;
+
+  for (int y = 0; y < kModelTextureTilePixels; ++y) {
+    const std::size_t src_offset = static_cast<std::size_t>(y * kModelTextureTilePixels * 4);
+    const std::size_t dst_offset =
+      static_cast<std::size_t>(((dst_y0 + y) * state->model_texture_width + dst_x0) * 4);
+    std::memcpy(state->model_texture_pixels.data() + dst_offset,
+                tile_pixels.data() + src_offset,
+                static_cast<std::size_t>(kModelTextureTilePixels * 4));
+  }
+
+  state->model_texture_dirty = true;
+}
+
+int
+model_texture_slot_for_material(GWorldSceneViewState *state,
+                                const aiScene *scene,
+                                const aiMaterial *material,
+                                const std::string &model_path)
+{
+  aiString texture_reference;
+  if (!material_texture_reference(material, texture_reference))
+    return -1;
+
+  const std::string reference = texture_reference.C_Str();
+  const std::string key = model_path + "|" + reference;
+  auto iter = state->model_texture_slots.find(key);
+  if (iter != state->model_texture_slots.end())
+    return iter->second;
+
+  const int max_slots = kModelTextureAtlasColumns * kModelTextureAtlasRows;
+  const int slot = static_cast<int>(state->model_texture_slots.size());
+  if (slot >= max_slots) {
+    g_warning("Model texture atlas is full: model=%s texture=%s capacity=%d",
+              model_path.c_str(),
+              reference.c_str(),
+              max_slots);
+    return -1;
+  }
+
+  std::vector<unsigned char> tile_pixels;
+  std::string error_message;
+  if (!load_model_texture_pixels(scene,
+                                 model_path,
+                                 reference,
+                                 tile_pixels,
+                                 &error_message)) {
+    g_warning("Failed to load model texture: model=%s texture=%s error=%s",
+              model_path.c_str(),
+              reference.c_str(),
+              error_message.empty() ? "unknown error" : error_message.c_str());
+    return -1;
+  }
+
+  copy_model_texture_tile_to_atlas(state, slot, tile_pixels);
+  state->model_texture_slots.emplace(key, slot);
+  g_debug("Loaded model texture: model=%s texture=%s slot=%d",
+          model_path.c_str(),
+          reference.c_str(),
+          slot);
+  return slot;
+}
+
+glm::vec3
+material_color_for_mesh(const aiScene *scene, const aiMesh *mesh)
+{
+  if (scene != nullptr &&
+      mesh != nullptr &&
+      mesh->mMaterialIndex < scene->mNumMaterials &&
+      scene->mMaterials[mesh->mMaterialIndex] != nullptr) {
+    aiColor4D base_color;
+    if (aiGetMaterialColor(scene->mMaterials[mesh->mMaterialIndex],
+                           AI_MATKEY_BASE_COLOR,
+                           &base_color) == AI_SUCCESS) {
+      return clamp_color(glm::vec3(base_color.r, base_color.g, base_color.b));
+    }
+
+    aiColor4D diffuse;
+    if (aiGetMaterialColor(scene->mMaterials[mesh->mMaterialIndex],
+                           AI_MATKEY_COLOR_DIFFUSE,
+                           &diffuse) == AI_SUCCESS) {
+      return clamp_color(glm::vec3(diffuse.r, diffuse.g, diffuse.b));
+    }
+  }
+  return glm::vec3(1.0f);
+}
+
+glm::dvec3
+assimp_vec_to_glm(const aiVector3D &value)
+{
+  return glm::dvec3(value.x, value.y, value.z);
+}
+
+bool
+load_model_mesh_from_file(GWorldSceneViewState *state, const std::string &path, ModelMesh &mesh)
+{
+  Assimp::Importer importer;
+  const unsigned int flags = aiProcess_Triangulate |
+                             aiProcess_JoinIdenticalVertices |
+                             aiProcess_GenSmoothNormals |
+                             aiProcess_ImproveCacheLocality |
+                             aiProcess_PreTransformVertices |
+                             aiProcess_OptimizeMeshes |
+                             aiProcess_FindInvalidData;
+  const aiScene *scene = importer.ReadFile(path, flags);
+  if (scene == nullptr || scene->mNumMeshes == 0) {
+    mesh.failed = true;
+    mesh.error = importer.GetErrorString();
+    if (mesh.error.empty())
+      mesh.error = "No meshes found";
+    return false;
+  }
+
+  mesh.vertices.clear();
+  mesh.indices.clear();
+
+  for (unsigned int mesh_index = 0; mesh_index < scene->mNumMeshes; ++mesh_index) {
+    const aiMesh *source = scene->mMeshes[mesh_index];
+    if (source == nullptr || source->mNumVertices == 0)
+      continue;
+
+    const glm::vec3 material_color = material_color_for_mesh(scene, source);
+    const aiMaterial *material = (source->mMaterialIndex < scene->mNumMaterials)
+                                   ? scene->mMaterials[source->mMaterialIndex]
+                                   : nullptr;
+    const bool has_normals = source->HasNormals();
+    const bool has_vertex_colors = source->HasVertexColors(0);
+    const bool has_texcoords = source->HasTextureCoords(0);
+    const int texture_slot = has_texcoords
+                               ? model_texture_slot_for_material(state, scene, material, path)
+                               : -1;
+
+    for (unsigned int face_index = 0; face_index < source->mNumFaces; ++face_index) {
+      const aiFace &face = source->mFaces[face_index];
+      if (face.mNumIndices != 3)
+        continue;
+
+      glm::dvec3 face_normal(0.0, 1.0, 0.0);
+      if (!has_normals) {
+        const glm::dvec3 p0 = assimp_vec_to_glm(source->mVertices[face.mIndices[0]]);
+        const glm::dvec3 p1 = assimp_vec_to_glm(source->mVertices[face.mIndices[1]]);
+        const glm::dvec3 p2 = assimp_vec_to_glm(source->mVertices[face.mIndices[2]]);
+        face_normal = glm::cross(p1 - p0, p2 - p0);
+        face_normal = safe_normalize(face_normal, glm::dvec3(0.0, 1.0, 0.0));
+      }
+
+      for (unsigned int corner = 0; corner < 3; ++corner) {
+        const unsigned int source_index = face.mIndices[corner];
+        if (source_index >= source->mNumVertices)
+          continue;
+
+        ModelVertex vertex;
+        vertex.position = assimp_vec_to_glm(source->mVertices[source_index]);
+        vertex.normal = has_normals
+                          ? safe_normalize(assimp_vec_to_glm(source->mNormals[source_index]),
+                                           face_normal)
+                          : face_normal;
+        vertex.color = material_color;
+        if (has_vertex_colors) {
+          const aiColor4D &color = source->mColors[0][source_index];
+          vertex.color = clamp_color(glm::vec3(color.r, color.g, color.b));
+        }
+        if (texture_slot >= 0 && has_texcoords) {
+          vertex.texcoord = model_atlas_uv_for_slot(texture_slot,
+                                                    source->mTextureCoords[0][source_index]);
+          vertex.has_texture = true;
+        }
+
+        mesh.indices.push_back(static_cast<unsigned int>(mesh.vertices.size()));
+        mesh.vertices.push_back(vertex);
+      }
+    }
+  }
+
+  mesh.loaded = !mesh.vertices.empty() && !mesh.indices.empty();
+  mesh.failed = !mesh.loaded;
+  if (mesh.failed)
+    mesh.error = "No triangle geometry found";
+  return mesh.loaded;
+}
+
+const ModelMesh *
+model_mesh_for_path(GWorldSceneViewState *state, const std::string &path)
+{
+  if (path.empty())
+    return nullptr;
+
+  auto iter = state->model_meshes.find(path);
+  if (iter == state->model_meshes.end()) {
+    ModelMesh mesh;
+    load_model_mesh_from_file(state, path, mesh);
+    iter = state->model_meshes.emplace(path, std::move(mesh)).first;
+    if (iter->second.failed) {
+      g_warning("Failed to load model '%s': %s",
+                path.c_str(),
+                iter->second.error.empty() ? "unknown error" : iter->second.error.c_str());
+    }
+  }
+
+  return iter->second.loaded ? &iter->second : nullptr;
 }
 
 void
@@ -929,13 +1617,375 @@ append_triangle(std::vector<float> &vertices,
   const glm::vec3 normal(static_cast<float>(n64.x),
                          static_cast<float>(n64.y),
                          static_cast<float>(n64.z));
-  const unsigned int base = static_cast<unsigned int>(vertices.size() / 12);
+  const unsigned int base = static_cast<unsigned int>(vertices.size() / kVertexStride);
   append_vertex(vertices, p0, uv0, normal);
   append_vertex(vertices, p1, uv1, normal);
   append_vertex(vertices, p2, uv2, normal);
   indices.push_back(base);
   indices.push_back(base + 1);
   indices.push_back(base + 2);
+}
+
+glm::dmat3
+node_ned_rotation(const SceneNode &node)
+{
+  glm::dmat4 transform(1.0);
+  transform = glm::rotate(transform, deg_to_rad(node.yaw_deg), glm::dvec3(0.0, 0.0, 1.0));
+  transform = glm::rotate(transform, deg_to_rad(node.pitch_deg), glm::dvec3(0.0, 1.0, 0.0));
+  transform = glm::rotate(transform, deg_to_rad(node.roll_deg), glm::dvec3(1.0, 0.0, 0.0));
+  return glm::dmat3(transform);
+}
+
+glm::dvec3
+node_vertex_position(const SceneNode &node,
+                     const glm::dmat3 &rotation,
+                     const glm::dvec3 &center,
+                     double north,
+                     double east,
+                     double down)
+{
+  const glm::dvec3 scaled(north * node.scale_x, east * node.scale_y, down * node.scale_z);
+  return center + ned_to_scene_vector(rotation * scaled);
+}
+
+void
+append_solid_triangle(std::vector<float> &vertices,
+                      std::vector<unsigned int> &indices,
+                      const glm::dvec3 &p0,
+                      const glm::dvec3 &p1,
+                      const glm::dvec3 &p2,
+                      const glm::vec3 &color)
+{
+  glm::dvec3 n64 = glm::cross(p1 - p0, p2 - p0);
+  if (glm::length(n64) <= 0.000001)
+    n64 = glm::dvec3(0.0, 1.0, 0.0);
+  else
+    n64 = glm::normalize(n64);
+
+  const glm::vec3 normal(static_cast<float>(n64.x),
+                         static_cast<float>(n64.y),
+                         static_cast<float>(n64.z));
+  const TexCoords uv{-1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f};
+  const unsigned int base = static_cast<unsigned int>(vertices.size() / kVertexStride);
+  append_vertex(vertices, p0, uv, normal, color, kMaterialSolidNode);
+  append_vertex(vertices, p1, uv, normal, color, kMaterialSolidNode);
+  append_vertex(vertices, p2, uv, normal, color, kMaterialSolidNode);
+  indices.push_back(base);
+  indices.push_back(base + 1);
+  indices.push_back(base + 2);
+}
+
+void
+append_solid_quad(std::vector<float> &vertices,
+                  std::vector<unsigned int> &indices,
+                  const glm::dvec3 &p0,
+                  const glm::dvec3 &p1,
+                  const glm::dvec3 &p2,
+                  const glm::dvec3 &p3,
+                  const glm::vec3 &color)
+{
+  append_solid_triangle(vertices, indices, p0, p1, p2, color);
+  append_solid_triangle(vertices, indices, p0, p2, p3, color);
+}
+
+void
+append_cube_node(GWorldSceneViewState *state, const SceneNode &node)
+{
+  const glm::dvec3 center = geodetic_to_enu(node.latitude,
+                                            node.longitude,
+                                            node.altitude_amsl,
+                                            state->mesh_origin_latitude,
+                                            state->mesh_origin_longitude,
+                                            0.0);
+  const glm::dmat3 rotation = node_ned_rotation(node);
+  const double n = std::max(0.001, node.depth_m) * 0.5;
+  const double e = std::max(0.001, node.width_m) * 0.5;
+  const double d = std::max(0.001, node.height_m) * 0.5;
+
+  glm::dvec3 p[8];
+  int i = 0;
+  for (double north : {-n, n}) {
+    for (double east : {-e, e}) {
+      for (double down : {-d, d})
+        p[i++] = node_vertex_position(node, rotation, center, north, east, down);
+    }
+  }
+
+  append_solid_quad(state->vertices, state->indices, p[0], p[1], p[3], p[2], node.color);
+  append_solid_quad(state->vertices, state->indices, p[4], p[6], p[7], p[5], node.color);
+  append_solid_quad(state->vertices, state->indices, p[0], p[4], p[5], p[1], node.color);
+  append_solid_quad(state->vertices, state->indices, p[2], p[3], p[7], p[6], node.color);
+  append_solid_quad(state->vertices, state->indices, p[0], p[2], p[6], p[4], node.color);
+  append_solid_quad(state->vertices, state->indices, p[1], p[5], p[7], p[3], node.color);
+}
+
+void
+append_sphere_node(GWorldSceneViewState *state, const SceneNode &node)
+{
+  const glm::dvec3 center = geodetic_to_enu(node.latitude,
+                                            node.longitude,
+                                            node.altitude_amsl,
+                                            state->mesh_origin_latitude,
+                                            state->mesh_origin_longitude,
+                                            0.0);
+  const glm::dmat3 rotation = node_ned_rotation(node);
+  const double radius = std::max(0.001, node.width_m) * 0.5;
+
+  for (int ring = 0; ring < kSphereRings; ++ring) {
+    const double phi0 = -kPi * 0.5 + kPi * static_cast<double>(ring) / kSphereRings;
+    const double phi1 = -kPi * 0.5 + kPi * static_cast<double>(ring + 1) / kSphereRings;
+    for (int seg = 0; seg < kSphereSegments; ++seg) {
+      const double theta0 = 2.0 * kPi * static_cast<double>(seg) / kSphereSegments;
+      const double theta1 = 2.0 * kPi * static_cast<double>(seg + 1) / kSphereSegments;
+      auto point = [&](double phi, double theta) {
+        const double c = std::cos(phi);
+        return node_vertex_position(node,
+                                    rotation,
+                                    center,
+                                    radius * c * std::cos(theta),
+                                    radius * c * std::sin(theta),
+                                    radius * std::sin(phi));
+      };
+      append_solid_quad(state->vertices,
+                        state->indices,
+                        point(phi0, theta0),
+                        point(phi0, theta1),
+                        point(phi1, theta1),
+                        point(phi1, theta0),
+                        node.color);
+    }
+  }
+}
+
+void
+append_cylinder_node(GWorldSceneViewState *state, const SceneNode &node)
+{
+  const glm::dvec3 center = geodetic_to_enu(node.latitude,
+                                            node.longitude,
+                                            node.altitude_amsl,
+                                            state->mesh_origin_latitude,
+                                            state->mesh_origin_longitude,
+                                            0.0);
+  const glm::dmat3 rotation = node_ned_rotation(node);
+  const double radius = std::max(0.001, node.width_m) * 0.5;
+  const double half_height = std::max(0.001, node.height_m) * 0.5;
+  const glm::dvec3 top = node_vertex_position(node, rotation, center, 0.0, 0.0, -half_height);
+  const glm::dvec3 bottom = node_vertex_position(node, rotation, center, 0.0, 0.0, half_height);
+
+  for (int seg = 0; seg < kCylinderSegments; ++seg) {
+    const double theta0 = 2.0 * kPi * static_cast<double>(seg) / kCylinderSegments;
+    const double theta1 = 2.0 * kPi * static_cast<double>(seg + 1) / kCylinderSegments;
+    auto rim = [&](double theta, double down) {
+      return node_vertex_position(node,
+                                  rotation,
+                                  center,
+                                  radius * std::cos(theta),
+                                  radius * std::sin(theta),
+                                  down);
+    };
+    const glm::dvec3 t0 = rim(theta0, -half_height);
+    const glm::dvec3 t1 = rim(theta1, -half_height);
+    const glm::dvec3 b0 = rim(theta0, half_height);
+    const glm::dvec3 b1 = rim(theta1, half_height);
+    append_solid_quad(state->vertices, state->indices, t0, b0, b1, t1, node.color);
+    append_solid_triangle(state->vertices, state->indices, top, t1, t0, node.color);
+    append_solid_triangle(state->vertices, state->indices, bottom, b0, b1, node.color);
+  }
+}
+
+void
+append_model_node(GWorldSceneViewState *state, const SceneNode &node)
+{
+  const ModelMesh *mesh = model_mesh_for_path(state, node.model_path);
+  if (mesh == nullptr)
+    return;
+
+  const glm::dvec3 center = geodetic_to_enu(node.latitude,
+                                            node.longitude,
+                                            node.altitude_amsl,
+                                            state->mesh_origin_latitude,
+                                            state->mesh_origin_longitude,
+                                            0.0);
+  const glm::dmat3 rotation = node_ned_rotation(node);
+
+  for (unsigned int model_index : mesh->indices) {
+    if (model_index >= mesh->vertices.size())
+      continue;
+
+    const ModelVertex &model_vertex = mesh->vertices[model_index];
+
+    const glm::dvec3 &p = model_vertex.position;
+    const glm::dvec3 position =
+      node_vertex_position(node, rotation, center, p.z, p.x, -p.y);
+
+    const glm::dvec3 &n = model_vertex.normal;
+    const glm::dvec3 normal_ned =
+      safe_normalize(glm::dvec3(n.z, n.x, -n.y), glm::dvec3(0.0, 0.0, -1.0));
+    const glm::dvec3 normal_scene =
+      safe_normalize(ned_to_scene_vector(rotation * normal_ned), glm::dvec3(0.0, 1.0, 0.0));
+    const glm::vec3 color = clamp_color(model_vertex.color * node.color);
+    TexCoords uv{-1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f};
+    float material = kMaterialSolidNode;
+    if (model_vertex.has_texture) {
+      uv.detail_u = model_vertex.texcoord.x;
+      uv.detail_v = model_vertex.texcoord.y;
+      material = kMaterialTexturedModel;
+    }
+
+    const unsigned int base = static_cast<unsigned int>(state->vertices.size() / kVertexStride);
+    append_vertex(state->vertices,
+                  position,
+                  uv,
+                  glm::vec3(static_cast<float>(normal_scene.x),
+                            static_cast<float>(normal_scene.y),
+                            static_cast<float>(normal_scene.z)),
+                  color,
+                  material);
+    state->indices.push_back(base);
+  }
+}
+
+void
+append_scene_nodes(GWorldSceneViewState *state)
+{
+  for (const auto &entry : state->scene_nodes) {
+    GWorldSceneNode *scene_node = entry.second;
+    if (!GWORLD_IS_SCENE_NODE(scene_node))
+      continue;
+
+    SceneNode node;
+    node.id = gworld_scene_node_get_id(scene_node);
+    gworld_scene_node_get_position(scene_node,
+                                   &node.latitude,
+                                   &node.longitude,
+                                   &node.altitude_amsl);
+    gworld_scene_node_get_orientation_ned(scene_node,
+                                          &node.yaw_deg,
+                                          &node.pitch_deg,
+                                          &node.roll_deg);
+    gworld_scene_node_get_scale(scene_node,
+                                &node.scale_x,
+                                &node.scale_y,
+                                &node.scale_z);
+    double red = 0.0;
+    double green = 0.0;
+    double blue = 0.0;
+    gworld_scene_node_get_color(scene_node, &red, &green, &blue);
+    node.color = glm::vec3(static_cast<float>(red),
+                           static_cast<float>(green),
+                           static_cast<float>(blue));
+
+    if (GWORLD_IS_SCENE_CUBE_NODE(scene_node)) {
+      gworld_scene_cube_node_get_dimensions(GWORLD_SCENE_CUBE_NODE(scene_node),
+                                            &node.width_m,
+                                            &node.depth_m,
+                                            &node.height_m);
+      append_cube_node(state, node);
+    } else if (GWORLD_IS_SCENE_SPHERE_NODE(scene_node)) {
+      const double diameter = gworld_scene_sphere_node_get_diameter(GWORLD_SCENE_SPHERE_NODE(scene_node));
+      node.width_m = diameter;
+      node.depth_m = diameter;
+      node.height_m = diameter;
+      append_sphere_node(state, node);
+    } else if (GWORLD_IS_SCENE_CYLINDER_NODE(scene_node)) {
+      double diameter = 0.0;
+      gworld_scene_cylinder_node_get_size(GWORLD_SCENE_CYLINDER_NODE(scene_node),
+                                          &diameter,
+                                          &node.height_m);
+      node.width_m = diameter;
+      node.depth_m = diameter;
+      append_cylinder_node(state, node);
+    } else if (GWORLD_IS_SCENE_MODEL_NODE(scene_node)) {
+      const char *model_path = gworld_scene_model_node_get_model_path(GWORLD_SCENE_MODEL_NODE(scene_node));
+      if (model_path != nullptr)
+        node.model_path = model_path;
+      append_model_node(state, node);
+    }
+  }
+}
+
+void
+append_globe_vertex(std::vector<float> &vertices,
+                    const glm::dvec3 &position,
+                    double latitude,
+                    double longitude,
+                    const AtlasRange &range,
+                    const glm::vec3 &normal)
+{
+  TexCoords uv{-1.0f, -1.0f, -1.0f, -1.0f, 0.0f, 0.0f};
+  uv_for_lat_lon(latitude, longitude, range, uv.base_u, uv.base_v);
+  append_vertex(vertices, position, uv, normal, glm::vec3(0.08f, 0.22f, 0.46f), kMaterialGlobe);
+}
+
+void
+rebuild_globe_mesh(GWorldSceneViewState *state, const AtlasRange &range)
+{
+  const std::string key = std::to_string(static_cast<int>(std::llround(state->mesh_origin_latitude * 10000.0))) +
+                          ":" + std::to_string(static_cast<int>(std::llround(state->mesh_origin_longitude * 10000.0))) +
+                          ":" + range.key();
+  if (state->globe_mesh_key == key && !state->globe_vertices.empty())
+    return;
+
+  state->globe_vertices.clear();
+  state->globe_indices.clear();
+  state->globe_vertices.reserve(static_cast<std::size_t>((kGlobeLatSegments + 1) *
+                                                         (kGlobeLonSegments + 1) *
+                                                         kVertexStride));
+  state->globe_indices.reserve(static_cast<std::size_t>(kGlobeLatSegments *
+                                                        kGlobeLonSegments *
+                                                        6));
+
+  for (int lat_i = 0; lat_i <= kGlobeLatSegments; ++lat_i) {
+    const double latitude = 90.0 - 180.0 * static_cast<double>(lat_i) / kGlobeLatSegments;
+    for (int lon_i = 0; lon_i <= kGlobeLonSegments; ++lon_i) {
+      const double longitude = -180.0 + 360.0 * static_cast<double>(lon_i) / kGlobeLonSegments;
+      const glm::dvec3 position = geodetic_to_enu(latitude,
+                                                  longitude,
+                                                  0.0,
+                                                  state->mesh_origin_latitude,
+                                                  state->mesh_origin_longitude,
+                                                  0.0);
+      glm::dvec3 normal64 = geodetic_to_enu(latitude,
+                                            longitude,
+                                            1000.0,
+                                            state->mesh_origin_latitude,
+                                            state->mesh_origin_longitude,
+                                            0.0) -
+                            position;
+      if (glm::length(normal64) <= 0.000001)
+        normal64 = glm::dvec3(0.0, 1.0, 0.0);
+      else
+        normal64 = glm::normalize(normal64);
+
+      append_globe_vertex(state->globe_vertices,
+                          position,
+                          latitude,
+                          longitude,
+                          range,
+                          glm::vec3(static_cast<float>(normal64.x),
+                                    static_cast<float>(normal64.y),
+                                    static_cast<float>(normal64.z)));
+    }
+  }
+
+  const int row_width = kGlobeLonSegments + 1;
+  for (int lat_i = 0; lat_i < kGlobeLatSegments; ++lat_i) {
+    for (int lon_i = 0; lon_i < kGlobeLonSegments; ++lon_i) {
+      const unsigned int p00 = static_cast<unsigned int>(lat_i * row_width + lon_i);
+      const unsigned int p10 = p00 + 1;
+      const unsigned int p01 = static_cast<unsigned int>((lat_i + 1) * row_width + lon_i);
+      const unsigned int p11 = p01 + 1;
+      state->globe_indices.push_back(p00);
+      state->globe_indices.push_back(p01);
+      state->globe_indices.push_back(p10);
+      state->globe_indices.push_back(p10);
+      state->globe_indices.push_back(p01);
+      state->globe_indices.push_back(p11);
+    }
+  }
+
+  state->globe_mesh_key = key;
+  state->globe_mesh_dirty = true;
 }
 
 void
@@ -1126,7 +2176,8 @@ void
 rebuild_world_mesh(GWorldSceneViewState *state,
                    const AtlasRange &detail_range,
                    const AtlasRange &mid_range,
-                   const AtlasRange &base_range)
+                   const AtlasRange &base_range,
+                   bool include_terrain)
 {
   const double radius_m = terrain_build_radius_for_altitude(state->altitude_amsl);
   const int sample_step = terrain_step_for_altitude(state->altitude_amsl);
@@ -1138,7 +2189,9 @@ rebuild_world_mesh(GWorldSceneViewState *state,
                           ":" + detail_range.key() +
                           ":" + mid_range.key() +
                           ":" + base_range.key() +
-                          ":" + std::to_string(state->terrain_tiles.size());
+                          ":" + std::to_string(state->terrain_tiles.size()) +
+                          ":" + std::to_string(state->scene_revision) +
+                          ":" + (include_terrain ? "terrain" : "scene-only");
 
   if (state->mesh_key == key && !state->vertices.empty())
     return;
@@ -1147,14 +2200,20 @@ rebuild_world_mesh(GWorldSceneViewState *state,
   state->mesh_origin_longitude = state->longitude;
   state->vertices.clear();
   state->indices.clear();
+  state->globe_mesh_key.clear();
 
-  for (const auto &entry : state->terrain_tiles)
-    append_terrain_tile_mesh(state, entry.second, detail_range, mid_range, base_range, radius_m, sample_step);
+  if (include_terrain) {
+    for (const auto &entry : state->terrain_tiles)
+      append_terrain_tile_mesh(state, entry.second, detail_range, mid_range, base_range, radius_m, sample_step);
 
-  if (state->vertices.empty())
-    append_flat_mesh(state, detail_range, mid_range, base_range);
+    if (state->vertices.empty())
+      append_flat_mesh(state, detail_range, mid_range, base_range);
+  }
+
+  append_scene_nodes(state);
 
   state->mesh_key = key;
+  state->mesh_includes_terrain = include_terrain;
   state->mesh_atlas_range = detail_range;
   state->mesh_mid_atlas_range = mid_range;
   state->mesh_base_atlas_range = base_range;
@@ -1191,19 +2250,31 @@ layout(location = 1) in vec2 detail_texcoord;
 layout(location = 2) in vec2 mid_texcoord;
 layout(location = 3) in vec2 base_texcoord;
 layout(location = 4) in vec3 normal;
+layout(location = 5) in vec3 vertex_color;
+layout(location = 6) in float material;
 uniform mat4 mvp;
+uniform mat4 light_mvp;
 out vec2 v_detail_texcoord;
 out vec2 v_mid_texcoord;
 out vec2 v_base_texcoord;
 out vec3 v_normal;
+out vec3 v_color;
+out float v_material;
 out float v_height;
+out vec3 v_world_position;
+out vec4 v_light_position;
 void main() {
-  gl_Position = mvp * vec4(position, 1.0);
+  vec4 world_position = vec4(position, 1.0);
+  gl_Position = mvp * world_position;
   v_detail_texcoord = detail_texcoord;
   v_mid_texcoord = mid_texcoord;
   v_base_texcoord = base_texcoord;
   v_normal = normal;
+  v_color = vertex_color;
+  v_material = material;
   v_height = position.y;
+  v_world_position = position;
+  v_light_position = light_mvp * world_position;
 }
 )GLSL";
 
@@ -1213,19 +2284,84 @@ in vec2 v_detail_texcoord;
 in vec2 v_mid_texcoord;
 in vec2 v_base_texcoord;
 in vec3 v_normal;
+in vec3 v_color;
+in float v_material;
 in float v_height;
+in vec3 v_world_position;
+in vec4 v_light_position;
 uniform sampler2D detail_texture;
 uniform sampler2D mid_texture;
 uniform sampler2D base_texture;
+uniform sampler2D shadow_texture;
+uniform sampler2D model_texture;
 uniform bool has_detail_texture;
 uniform bool has_mid_texture;
 uniform bool has_base_texture;
+uniform bool has_shadow_texture;
+uniform bool has_model_texture;
+uniform vec3 sun_direction;
+uniform float ambient_strength;
+uniform float sun_strength;
+uniform vec3 camera_position;
+uniform bool fog_enabled;
+uniform vec3 fog_color;
+uniform float fog_start;
+uniform float fog_end;
+uniform float fog_density;
+uniform float terrain_normal_smoothing;
 out vec4 color;
-void main() {
+
+vec3 lighting_normal() {
   vec3 normal = normalize(v_normal);
-  vec3 light_dir = normalize(vec3(-0.45, 0.76, 0.38));
-  float diffuse = clamp(dot(normal, light_dir), 0.0, 1.0);
-  float shade = 0.58 + diffuse * 0.42;
+  if (v_material < 0.5 && terrain_normal_smoothing > 0.0) {
+    vec3 local_up = vec3(0.0, 1.0, 0.0);
+    float slope = 1.0 - clamp(abs(dot(normal, local_up)), 0.0, 1.0);
+    float smoothing = clamp(terrain_normal_smoothing * (1.0 - slope * 0.28), 0.0, 1.0);
+    normal = normalize(mix(normal, local_up, smoothing));
+  }
+  return normal;
+}
+
+float shadow_visibility(vec3 normal) {
+  if (!has_shadow_texture || (v_material > 1.5 && v_material < 2.5))
+    return 1.0;
+
+  vec3 projected = v_light_position.xyz / v_light_position.w;
+  projected = projected * 0.5 + 0.5;
+  if (projected.z > 1.0 ||
+      projected.x < 0.0 || projected.x > 1.0 ||
+      projected.y < 0.0 || projected.y > 1.0)
+    return 1.0;
+
+  vec2 texel_size = 1.0 / vec2(textureSize(shadow_texture, 0));
+  float bias = max(0.0012 * (1.0 - dot(normal, sun_direction)), 0.00035);
+  float lit = 0.0;
+  for (int y = -1; y <= 1; ++y) {
+    for (int x = -1; x <= 1; ++x) {
+      float depth = texture(shadow_texture, projected.xy + vec2(x, y) * texel_size).r;
+      lit += projected.z - bias <= depth ? 1.0 : 0.0;
+    }
+  }
+
+  return mix(0.42, 1.0, lit / 9.0);
+}
+
+float fog_amount() {
+  if (!fog_enabled)
+    return 0.0;
+
+  float distance_to_camera = length(v_world_position - camera_position);
+  float range = max(fog_end - fog_start, 1.0);
+  float linear_fog = clamp((distance_to_camera - fog_start) / range, 0.0, 1.0);
+  float density_fog = 1.0 - exp(-distance_to_camera * max(fog_density, 0.0));
+  return clamp(max(linear_fog, density_fog), 0.0, 1.0);
+}
+
+void main() {
+  vec3 normal = lighting_normal();
+  float diffuse = clamp(dot(normal, normalize(sun_direction)), 0.0, 1.0);
+  float visibility = shadow_visibility(normal);
+  float shade = ambient_strength + diffuse * sun_strength * visibility;
   vec3 low = vec3(0.26, 0.36, 0.24);
   vec3 high = vec3(0.76, 0.72, 0.62);
   vec3 terrain_tint = mix(low, high, clamp(v_height / 1800.0, 0.0, 1.0));
@@ -1236,8 +2372,17 @@ void main() {
   vec4 mid_texel = (has_mid_texture && in_mid) ? texture(mid_texture, v_mid_texcoord) : vec4(0.0);
   vec4 detail_texel = (has_detail_texture && in_detail) ? texture(detail_texture, v_detail_texcoord) : vec4(0.0);
   vec4 texel = detail_texel.a > 0.01 ? detail_texel : (mid_texel.a > 0.01 ? mid_texel : base_texel);
-  vec3 base = mix(terrain_tint, texel.rgb, texel.a * 0.88);
-  color = vec4(base * shade, 1.0);
+  vec3 terrain_base = mix(terrain_tint, texel.rgb, texel.a * 0.88);
+  vec3 globe_base = texel.a > 0.01 ? texel.rgb : v_color;
+  bool is_globe = v_material > 1.5 && v_material < 2.5;
+  bool is_textured_model = v_material > 2.5;
+  vec4 model_texel = (has_model_texture && is_textured_model) ? texture(model_texture, v_detail_texcoord) : vec4(0.0);
+  vec3 object_base = (is_textured_model && model_texel.a > 0.01)
+                       ? mix(v_color, model_texel.rgb * v_color, model_texel.a)
+                       : v_color;
+  vec3 base = is_globe ? globe_base : (v_material > 0.5 ? object_base : terrain_base);
+  vec3 lit_color = base * clamp(shade, 0.0, 1.35);
+  color = vec4(mix(lit_color, fog_color, fog_amount()), 1.0);
 }
 )GLSL";
 
@@ -1271,6 +2416,162 @@ void main() {
   return program;
 }
 
+GLuint
+create_shadow_program()
+{
+  static const char *vertex_source = R"GLSL(
+#version 330 core
+layout(location = 0) in vec3 position;
+uniform mat4 light_mvp;
+void main() {
+  gl_Position = light_mvp * vec4(position, 1.0);
+}
+)GLSL";
+
+  static const char *fragment_source = R"GLSL(
+#version 330 core
+void main() {
+}
+)GLSL";
+
+  GLuint vertex = compile_shader(GL_VERTEX_SHADER, vertex_source);
+  GLuint fragment = compile_shader(GL_FRAGMENT_SHADER, fragment_source);
+  if (vertex == 0 || fragment == 0) {
+    if (vertex)
+      glDeleteShader(vertex);
+    if (fragment)
+      glDeleteShader(fragment);
+    return 0;
+  }
+
+  GLuint program = glCreateProgram();
+  glAttachShader(program, vertex);
+  glAttachShader(program, fragment);
+  glLinkProgram(program);
+  glDeleteShader(vertex);
+  glDeleteShader(fragment);
+
+  GLint ok = GL_FALSE;
+  glGetProgramiv(program, GL_LINK_STATUS, &ok);
+  if (ok != GL_TRUE) {
+    char log[1024] = {0};
+    glGetProgramInfoLog(program, sizeof log, nullptr, log);
+    g_warning("Shadow program link failed: %s", log);
+    glDeleteProgram(program);
+    return 0;
+  }
+
+  return program;
+}
+
+bool
+ensure_shadow_resources(GWorldSceneViewState *state)
+{
+  if (state->shadow_program == 0)
+    state->shadow_program = create_shadow_program();
+  if (state->shadow_program == 0)
+    return false;
+
+  if (state->shadow_depth_texture == 0) {
+    glGenTextures(1, &state->shadow_depth_texture);
+    glBindTexture(GL_TEXTURE_2D, state->shadow_depth_texture);
+    glTexImage2D(GL_TEXTURE_2D,
+                 0,
+                 GL_DEPTH_COMPONENT24,
+                 kShadowMapSize,
+                 kShadowMapSize,
+                 0,
+                 GL_DEPTH_COMPONENT,
+                 GL_FLOAT,
+                 nullptr);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
+    const float border_color[] = {1.0f, 1.0f, 1.0f, 1.0f};
+    glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, border_color);
+    glBindTexture(GL_TEXTURE_2D, 0);
+  }
+
+  if (state->shadow_fbo == 0) {
+    GLint previous_fbo = 0;
+    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previous_fbo);
+    glGenFramebuffers(1, &state->shadow_fbo);
+    glBindFramebuffer(GL_FRAMEBUFFER, state->shadow_fbo);
+    glFramebufferTexture2D(GL_FRAMEBUFFER,
+                           GL_DEPTH_ATTACHMENT,
+                           GL_TEXTURE_2D,
+                           state->shadow_depth_texture,
+                           0);
+    glDrawBuffer(GL_NONE);
+    glReadBuffer(GL_NONE);
+    const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
+    glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previous_fbo));
+    if (status != GL_FRAMEBUFFER_COMPLETE) {
+      g_warning("Shadow framebuffer is incomplete: 0x%x", status);
+      return false;
+    }
+  }
+
+  return true;
+}
+
+glm::mat4
+shadow_light_matrix(const glm::dvec3 &center,
+                    const glm::vec3 &sun_direction,
+                    double extent_m)
+{
+  const glm::dvec3 light_direction =
+    safe_normalize(glm::dvec3(sun_direction), glm::dvec3(-0.45, 0.76, 0.38));
+  const double extent = std::max(1000.0, extent_m);
+  const double depth = extent * 4.0;
+  glm::dvec3 up(0.0, 1.0, 0.0);
+  if (std::abs(glm::dot(light_direction, up)) > 0.9)
+    up = glm::dvec3(0.0, 0.0, -1.0);
+
+  const glm::dvec3 eye = center + light_direction * depth;
+  const glm::mat4 light_view = glm::lookAt(glm::vec3(eye),
+                                           glm::vec3(center),
+                                           glm::vec3(up));
+  const glm::mat4 light_projection = glm::ortho(static_cast<float>(-extent),
+                                                static_cast<float>(extent),
+                                                static_cast<float>(-extent),
+                                                static_cast<float>(extent),
+                                                1.0f,
+                                                static_cast<float>(depth * 2.0));
+  return light_projection * light_view;
+}
+
+bool
+render_shadow_map(GWorldSceneViewState *state, const glm::mat4 &light_mvp)
+{
+  if (state->index_count == 0 || !ensure_shadow_resources(state))
+    return false;
+
+  GLint previous_fbo = 0;
+  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previous_fbo);
+
+  glViewport(0, 0, kShadowMapSize, kShadowMapSize);
+  glBindFramebuffer(GL_FRAMEBUFFER, state->shadow_fbo);
+  glClear(GL_DEPTH_BUFFER_BIT);
+  glUseProgram(state->shadow_program);
+  glUniformMatrix4fv(glGetUniformLocation(state->shadow_program, "light_mvp"),
+                     1,
+                     GL_FALSE,
+                     glm::value_ptr(light_mvp));
+  glEnable(GL_DEPTH_TEST);
+  glDisable(GL_CULL_FACE);
+  glEnable(GL_POLYGON_OFFSET_FILL);
+  glPolygonOffset(2.0f, 4.0f);
+  glBindVertexArray(state->vao);
+  glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(state->index_count), GL_UNSIGNED_INT, nullptr);
+  glBindVertexArray(0);
+  glDisable(GL_POLYGON_OFFSET_FILL);
+  glUseProgram(0);
+  glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previous_fbo));
+  return true;
+}
+
 void
 delete_gl_resources(GWorldSceneViewState *state)
 {
@@ -1280,6 +2581,20 @@ delete_gl_resources(GWorldSceneViewState *state)
     glDeleteTextures(1, &state->mid_texture);
   if (state->base_texture)
     glDeleteTextures(1, &state->base_texture);
+  if (state->globe_texture)
+    glDeleteTextures(1, &state->globe_texture);
+  if (state->model_texture)
+    glDeleteTextures(1, &state->model_texture);
+  if (state->shadow_depth_texture)
+    glDeleteTextures(1, &state->shadow_depth_texture);
+  if (state->shadow_fbo)
+    glDeleteFramebuffers(1, &state->shadow_fbo);
+  if (state->globe_ebo)
+    glDeleteBuffers(1, &state->globe_ebo);
+  if (state->globe_vbo)
+    glDeleteBuffers(1, &state->globe_vbo);
+  if (state->globe_vao)
+    glDeleteVertexArrays(1, &state->globe_vao);
   if (state->ebo)
     glDeleteBuffers(1, &state->ebo);
   if (state->vbo)
@@ -1288,15 +2603,109 @@ delete_gl_resources(GWorldSceneViewState *state)
     glDeleteVertexArrays(1, &state->vao);
   if (state->program)
     glDeleteProgram(state->program);
+  if (state->shadow_program)
+    glDeleteProgram(state->shadow_program);
 
   state->texture = 0;
   state->mid_texture = 0;
   state->base_texture = 0;
+  state->globe_texture = 0;
+  state->model_texture = 0;
+  state->shadow_depth_texture = 0;
+  state->shadow_fbo = 0;
+  state->globe_ebo = 0;
+  state->globe_vbo = 0;
+  state->globe_vao = 0;
   state->ebo = 0;
   state->vbo = 0;
   state->vao = 0;
   state->program = 0;
+  state->shadow_program = 0;
   state->index_count = 0;
+  state->globe_index_count = 0;
+}
+
+void
+configure_scene_vertex_attributes()
+{
+  glEnableVertexAttribArray(0);
+  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, kVertexStride * sizeof(float), reinterpret_cast<void *>(0));
+  glEnableVertexAttribArray(1);
+  glVertexAttribPointer(1,
+                        2,
+                        GL_FLOAT,
+                        GL_FALSE,
+                        kVertexStride * sizeof(float),
+                        reinterpret_cast<void *>(3 * sizeof(float)));
+  glEnableVertexAttribArray(2);
+  glVertexAttribPointer(2,
+                        2,
+                        GL_FLOAT,
+                        GL_FALSE,
+                        kVertexStride * sizeof(float),
+                        reinterpret_cast<void *>(5 * sizeof(float)));
+  glEnableVertexAttribArray(3);
+  glVertexAttribPointer(3,
+                        2,
+                        GL_FLOAT,
+                        GL_FALSE,
+                        kVertexStride * sizeof(float),
+                        reinterpret_cast<void *>(7 * sizeof(float)));
+  glEnableVertexAttribArray(4);
+  glVertexAttribPointer(4,
+                        3,
+                        GL_FLOAT,
+                        GL_FALSE,
+                        kVertexStride * sizeof(float),
+                        reinterpret_cast<void *>(9 * sizeof(float)));
+  glEnableVertexAttribArray(5);
+  glVertexAttribPointer(5,
+                        3,
+                        GL_FLOAT,
+                        GL_FALSE,
+                        kVertexStride * sizeof(float),
+                        reinterpret_cast<void *>(12 * sizeof(float)));
+  glEnableVertexAttribArray(6);
+  glVertexAttribPointer(6,
+                        1,
+                        GL_FLOAT,
+                        GL_FALSE,
+                        kVertexStride * sizeof(float),
+                        reinterpret_cast<void *>(15 * sizeof(float)));
+}
+
+void
+upload_vertex_index_buffers(GLuint &vao,
+                            GLuint &vbo,
+                            GLuint &ebo,
+                            const std::vector<float> &vertices,
+                            const std::vector<unsigned int> &indices,
+                            std::size_t &index_count)
+{
+  if (vao == 0)
+    glGenVertexArrays(1, &vao);
+  if (vbo == 0)
+    glGenBuffers(1, &vbo);
+  if (ebo == 0)
+    glGenBuffers(1, &ebo);
+
+  glBindVertexArray(vao);
+  glBindBuffer(GL_ARRAY_BUFFER, vbo);
+  glBufferData(GL_ARRAY_BUFFER,
+               static_cast<GLsizeiptr>(vertices.size() * sizeof(float)),
+               vertices.data(),
+               GL_STATIC_DRAW);
+
+  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, ebo);
+  glBufferData(GL_ELEMENT_ARRAY_BUFFER,
+               static_cast<GLsizeiptr>(indices.size() * sizeof(unsigned int)),
+               indices.data(),
+               GL_STATIC_DRAW);
+
+  configure_scene_vertex_attributes();
+
+  glBindVertexArray(0);
+  index_count = indices.size();
 }
 
 void
@@ -1305,64 +2714,33 @@ upload_mesh_if_needed(GWorldSceneViewState *state)
   if (!state->mesh_dirty)
     return;
 
-  if (state->vao == 0)
-    glGenVertexArrays(1, &state->vao);
-  if (state->vbo == 0)
-    glGenBuffers(1, &state->vbo);
-  if (state->ebo == 0)
-    glGenBuffers(1, &state->ebo);
-
-  glBindVertexArray(state->vao);
-  glBindBuffer(GL_ARRAY_BUFFER, state->vbo);
-  glBufferData(GL_ARRAY_BUFFER,
-               static_cast<GLsizeiptr>(state->vertices.size() * sizeof(float)),
-               state->vertices.data(),
-               GL_STATIC_DRAW);
-
-  glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, state->ebo);
-  glBufferData(GL_ELEMENT_ARRAY_BUFFER,
-               static_cast<GLsizeiptr>(state->indices.size() * sizeof(unsigned int)),
-               state->indices.data(),
-               GL_STATIC_DRAW);
-
-  glEnableVertexAttribArray(0);
-  glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 12 * sizeof(float), reinterpret_cast<void *>(0));
-  glEnableVertexAttribArray(1);
-  glVertexAttribPointer(1,
-                        2,
-                        GL_FLOAT,
-                        GL_FALSE,
-                        12 * sizeof(float),
-                        reinterpret_cast<void *>(3 * sizeof(float)));
-  glEnableVertexAttribArray(2);
-  glVertexAttribPointer(2,
-                        2,
-                        GL_FLOAT,
-                        GL_FALSE,
-                        12 * sizeof(float),
-                        reinterpret_cast<void *>(5 * sizeof(float)));
-  glEnableVertexAttribArray(3);
-  glVertexAttribPointer(3,
-                        2,
-                        GL_FLOAT,
-                        GL_FALSE,
-                        12 * sizeof(float),
-                        reinterpret_cast<void *>(7 * sizeof(float)));
-  glEnableVertexAttribArray(4);
-  glVertexAttribPointer(4,
-                        3,
-                        GL_FLOAT,
-                        GL_FALSE,
-                        12 * sizeof(float),
-                        reinterpret_cast<void *>(9 * sizeof(float)));
-
-  glBindVertexArray(0);
-  state->index_count = state->indices.size();
+  upload_vertex_index_buffers(state->vao,
+                              state->vbo,
+                              state->ebo,
+                              state->vertices,
+                              state->indices,
+                              state->index_count);
   state->mesh_dirty = false;
 }
 
 void
+upload_globe_mesh_if_needed(GWorldSceneViewState *state)
+{
+  if (!state->globe_mesh_dirty)
+    return;
+
+  upload_vertex_index_buffers(state->globe_vao,
+                              state->globe_vbo,
+                              state->globe_ebo,
+                              state->globe_vertices,
+                              state->globe_indices,
+                              state->globe_index_count);
+  state->globe_mesh_dirty = false;
+}
+
+void
 upload_texture_buffer_if_needed(GLuint &texture,
+                                const char *label,
                                 const std::vector<unsigned char> &pixels,
                                 int width,
                                 int height,
@@ -1375,7 +2753,21 @@ upload_texture_buffer_if_needed(GLuint &texture,
     if (texture) {
       glDeleteTextures(1, &texture);
       texture = 0;
+      g_debug("Texture upload cleared: layer=%s", label);
     }
+    dirty = false;
+    return;
+  }
+
+  const std::size_t expected_size = static_cast<std::size_t>(width) *
+                                    static_cast<std::size_t>(height) * 4;
+  if (pixels.size() < expected_size) {
+    g_warning("Texture upload skipped: layer=%s size=%dx%d bytes=%zu expected=%zu",
+              label,
+              width,
+              height,
+              pixels.size(),
+              expected_size);
     dirty = false;
     return;
   }
@@ -1398,7 +2790,24 @@ upload_texture_buffer_if_needed(GLuint &texture,
                GL_RGBA,
                GL_UNSIGNED_BYTE,
                pixels.data());
+  const GLenum error = glGetError();
   glBindTexture(GL_TEXTURE_2D, 0);
+
+  if (error != GL_NO_ERROR) {
+    g_warning("Texture upload reported GL error: layer=%s texture=%u size=%dx%d error=0x%x",
+              label,
+              texture,
+              width,
+              height,
+              error);
+  } else {
+    g_debug("Texture uploaded: layer=%s texture=%u size=%dx%d bytes=%zu",
+            label,
+            texture,
+            width,
+            height,
+            pixels.size());
+  }
 
   dirty = false;
 }
@@ -1407,20 +2816,35 @@ void
 upload_textures_if_needed(GWorldSceneViewState *state)
 {
   upload_texture_buffer_if_needed(state->texture,
+                                  "detail",
                                   state->texture_pixels,
                                   state->texture_width,
                                   state->texture_height,
                                   state->texture_dirty);
   upload_texture_buffer_if_needed(state->mid_texture,
+                                  "mid",
                                   state->mid_texture_pixels,
                                   state->mid_texture_width,
                                   state->mid_texture_height,
                                   state->mid_texture_dirty);
   upload_texture_buffer_if_needed(state->base_texture,
+                                  "base",
                                   state->base_texture_pixels,
                                   state->base_texture_width,
                                   state->base_texture_height,
                                   state->base_texture_dirty);
+  upload_texture_buffer_if_needed(state->globe_texture,
+                                  "globe",
+                                  state->globe_texture_pixels,
+                                  state->globe_texture_width,
+                                  state->globe_texture_height,
+                                  state->globe_texture_dirty);
+  upload_texture_buffer_if_needed(state->model_texture,
+                                  "model",
+                                  state->model_texture_pixels,
+                                  state->model_texture_width,
+                                  state->model_texture_height,
+                                  state->model_texture_dirty);
 }
 
 } // namespace
@@ -1523,6 +2947,12 @@ enum {
   PROP_MAP_TILE_URL_TEMPLATE,
   PROP_CACHE_DIRECTORY,
   PROP_CACHE_ENABLED,
+  PROP_SUN_AZIMUTH_DEG,
+  PROP_SUN_ELEVATION_DEG,
+  PROP_SUN_TIME_OF_DAY,
+  PROP_FOG_ENABLED,
+  PROP_SHADOWS_ENABLED,
+  PROP_TERRAIN_NORMAL_SMOOTHING,
   N_PROPS,
 };
 
@@ -1544,6 +2974,7 @@ get_state(GWorldSceneView *self)
 static void queue_scene_requests(GWorldSceneView *self);
 static void schedule_scene_requests(GWorldSceneView *self, guint delay_ms = kSceneUpdateDelayMs);
 static void ensure_scene_requests_scheduled(GWorldSceneView *self, guint delay_ms = kSceneUpdateDelayMs);
+static void on_scene_node_changed(GWorldSceneNode *node, gpointer user_data);
 
 static gboolean
 scheduled_scene_request_cb(gpointer user_data)
@@ -1572,44 +3003,15 @@ ensure_scene_requests_scheduled(GWorldSceneView *self, guint delay_ms)
 }
 
 static bool
-load_image_rgba_256(const std::string &path, std::vector<unsigned char> &pixels)
+load_image_rgba_256(const std::string &path,
+                    std::vector<unsigned char> &pixels,
+                    std::string *error_message = nullptr)
 {
-  g_autoptr(GError) error = nullptr;
-  GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file(path.c_str(), &error);
-  if (pixbuf == nullptr)
-    return false;
-
-  const int width = gdk_pixbuf_get_width(pixbuf);
-  const int height = gdk_pixbuf_get_height(pixbuf);
-  const int rowstride = gdk_pixbuf_get_rowstride(pixbuf);
-  const int channels = gdk_pixbuf_get_n_channels(pixbuf);
-  const bool has_alpha = gdk_pixbuf_get_has_alpha(pixbuf);
-  const auto *source = gdk_pixbuf_get_pixels(pixbuf);
-  if (width <= 0 || height <= 0 || source == nullptr || channels < 3) {
-    g_object_unref(pixbuf);
-    return false;
-  }
-
-  pixels.assign(static_cast<std::size_t>(kAtlasTilePixels * kAtlasTilePixels * 4), 0);
-  for (int y = 0; y < kAtlasTilePixels; ++y) {
-    const int sy = std::clamp(static_cast<int>((static_cast<double>(y) / kAtlasTilePixels) * height),
-                              0,
-                              height - 1);
-    for (int x = 0; x < kAtlasTilePixels; ++x) {
-      const int sx = std::clamp(static_cast<int>((static_cast<double>(x) / kAtlasTilePixels) * width),
-                                0,
-                                width - 1);
-      const std::size_t src = static_cast<std::size_t>(sy * rowstride + sx * channels);
-      const std::size_t dst = static_cast<std::size_t>((y * kAtlasTilePixels + x) * 4);
-      pixels[dst + 0] = source[src + 0];
-      pixels[dst + 1] = source[src + 1];
-      pixels[dst + 2] = source[src + 2];
-      pixels[dst + 3] = has_alpha && channels >= 4 ? source[src + 3] : 255;
-    }
-  }
-
-  g_object_unref(pixbuf);
-  return true;
+  return load_image_rgba_scaled(path,
+                                kAtlasTilePixels,
+                                kAtlasTilePixels,
+                                pixels,
+                                error_message);
 }
 
 static void
@@ -1649,13 +3051,25 @@ texture_atlas_build_thread(GTask *task, gpointer source_object, gpointer task_da
     for (int tx = job->range.x_min; tx <= job->range.x_max; ++tx) {
       TileCoord tile{job->range.z, tx, ty};
       const std::string uri = texture_uri_from_template(job->texture_template, tile);
-      const std::string path = texture_cache_path(job->cache_dir, uri, tile);
-      if (!g_file_test(path.c_str(), G_FILE_TEST_EXISTS))
+      const std::string path = texture_cache_path(job->cache_dir, uri, job->texture_template, tile);
+      if (!g_file_test(path.c_str(), G_FILE_TEST_EXISTS)) {
+        ++result->missing_count;
         continue;
+      }
 
       std::vector<unsigned char> tile_pixels;
-      if (!load_image_rgba_256(path, tile_pixels))
+      std::string load_error;
+      if (!load_image_rgba_256(path, tile_pixels, &load_error)) {
+        ++result->decode_failed_count;
+        g_warning("Texture tile decode failed: layer=%s z=%d x=%d y=%d path=%s error=%s",
+                  texture_layer_name(job->layer),
+                  tile.z,
+                  tile.x,
+                  tile.y,
+                  path.c_str(),
+                  load_error.empty() ? "unknown error" : load_error.c_str());
         continue;
+      }
 
       ++result->loaded_count;
       const int dst_x = (tx - job->range.x_min) * kAtlasTilePixels;
@@ -1669,6 +3083,11 @@ texture_atlas_build_thread(GTask *task, gpointer source_object, gpointer task_da
   }
 
   if (result->loaded_count == 0) {
+    g_debug("Texture atlas build produced no pixels: layer=%s range=%s missing=%d decode_failed=%d",
+            texture_layer_name(job->layer),
+            job->range.key().c_str(),
+            result->missing_count,
+            result->decode_failed_count);
     result->pixels.clear();
     result->width = 0;
     result->height = 0;
@@ -1695,12 +3114,19 @@ texture_atlas_build_done(GObject *source_object, GAsyncResult *result, gpointer 
 
   const std::string range_key = atlas_result->range.key();
   bool applied = false;
+  bool cleared_pending = false;
+  std::string wanted_key_snapshot;
+  guint64 state_revision = 0;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     auto &pending_key = texture_layer_pending_key(state, atlas_result->layer);
-    if (pending_key == atlas_result->pending_key)
+    if (pending_key == atlas_result->pending_key) {
       pending_key.clear();
+      cleared_pending = true;
+    }
     const std::string &wanted_key = texture_layer_wanted_key(state, atlas_result->layer);
+    wanted_key_snapshot = wanted_key;
+    state_revision = state->texture_source_revision;
 
     if (wanted_key == range_key && atlas_result->source_revision == state->texture_source_revision) {
       auto &pixels = texture_layer_pixels(state, atlas_result->layer);
@@ -1719,6 +3145,29 @@ texture_atlas_build_done(GObject *source_object, GAsyncResult *result, gpointer 
       state->mesh_key.clear();
       applied = true;
     }
+  }
+
+  if (applied) {
+    g_debug("Texture atlas applied: layer=%s range=%s loaded=%d missing=%d decode_failed=%d size=%dx%d revision=%" G_GUINT64_FORMAT,
+            texture_layer_name(atlas_result->layer),
+            range_key.c_str(),
+            atlas_result->loaded_count,
+            atlas_result->missing_count,
+            atlas_result->decode_failed_count,
+            atlas_result->width,
+            atlas_result->height,
+            atlas_result->source_revision);
+  } else {
+    g_debug("Texture atlas discarded: layer=%s range=%s wanted=%s loaded=%d missing=%d decode_failed=%d result_revision=%" G_GUINT64_FORMAT " current_revision=%" G_GUINT64_FORMAT " pending_cleared=%s",
+            texture_layer_name(atlas_result->layer),
+            range_key.c_str(),
+            wanted_key_snapshot.c_str(),
+            atlas_result->loaded_count,
+            atlas_result->missing_count,
+            atlas_result->decode_failed_count,
+            atlas_result->source_revision,
+            state_revision,
+            cleared_pending ? "yes" : "no");
   }
 
   texture_atlas_build_result_free(atlas_result);
@@ -1771,11 +3220,28 @@ request_texture_atlas_build(GWorldSceneView *self, const AtlasRange &range, Text
     const std::string &loaded_key = texture_layer_loaded_key(state, layer);
     wanted_key = range_key;
 
-    if (loaded_key == range_key || !pending_layer_key.empty())
+    if (loaded_key == range_key) {
+      g_debug("Texture atlas already loaded: layer=%s range=%s",
+              texture_layer_name(layer),
+              range_key.c_str());
       return;
+    }
+    if (!pending_layer_key.empty()) {
+      g_debug("Texture atlas build already pending: layer=%s wanted=%s pending=%s",
+              texture_layer_name(layer),
+              range_key.c_str(),
+              pending_layer_key.c_str());
+      return;
+    }
 
     pending_layer_key = pending_key;
   }
+
+  g_debug("Texture atlas build queued: layer=%s range=%s pending=%s revision=%" G_GUINT64_FORMAT,
+          texture_layer_name(layer),
+          range_key.c_str(),
+          pending_key.c_str(),
+          source_revision);
 
   auto *job = new TextureAtlasBuildJob;
   job->range = range;
@@ -1795,6 +3261,45 @@ static void
 download_job_free(DownloadJob *job)
 {
   delete job;
+}
+
+gint64
+note_terrain_download_failure_locked(GWorldSceneViewState *state,
+                                     const std::string &key,
+                                     bool unavailable,
+                                     gint64 now_us)
+{
+  if (unavailable) {
+    state->unavailable_terrain_keys.insert(key);
+    state->terrain_failure_counts.erase(key);
+    state->terrain_retry_after_us.erase(key);
+    return 0;
+  }
+
+  unsigned int &failures = state->terrain_failure_counts[key];
+  ++failures;
+  const unsigned int backoff_step = std::min(failures - 1, 5u);
+  const gint64 delay_us = std::min(kTerrainRetryMaxDelayUs,
+                                   kTerrainRetryBaseDelayUs *
+                                     (static_cast<gint64>(1) << backoff_step));
+  state->terrain_retry_after_us[key] = now_us + delay_us;
+  return delay_us;
+}
+
+void
+note_terrain_download_success_locked(GWorldSceneViewState *state, const std::string &key)
+{
+  state->unavailable_terrain_keys.erase(key);
+  state->terrain_failure_counts.erase(key);
+  state->terrain_retry_after_us.erase(key);
+}
+
+void
+clear_terrain_download_state_locked(GWorldSceneViewState *state)
+{
+  state->unavailable_terrain_keys.clear();
+  state->terrain_failure_counts.clear();
+  state->terrain_retry_after_us.clear();
 }
 
 static void
@@ -1825,7 +3330,9 @@ download_thread(GTask *task, gpointer source_object, gpointer task_data, GCancel
     return;
   }
   if (status < 200 || status >= 300) {
-    g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_FAILED, "HTTP %u for %s", status, job->uri.c_str());
+    const GIOErrorEnum code =
+      (status == 404 || status == 410) ? G_IO_ERROR_NOT_FOUND : G_IO_ERROR_FAILED;
+    g_task_return_new_error(task, G_IO_ERROR, code, "HTTP %u for %s", status, job->uri.c_str());
     return;
   }
 
@@ -1858,7 +3365,44 @@ download_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
   }
 
   if (!ok) {
-    g_debug("GWorldScene request failed: %s", error ? error->message : "unknown error");
+    if (job->kind == "texture") {
+      g_warning("Texture download failed: key=%s uri=%s cache=%s error=%s",
+                job->pending_key.c_str(),
+                job->uri.c_str(),
+                job->path.c_str(),
+                error ? error->message : "unknown error");
+    } else {
+      const std::string key = terrain_key(job->terrain_lat, job->terrain_lon);
+      const bool unavailable = error != nullptr &&
+                               error->domain == G_IO_ERROR &&
+                               error->code == G_IO_ERROR_NOT_FOUND;
+      gint64 retry_delay_us = 0;
+      {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        retry_delay_us = note_terrain_download_failure_locked(state,
+                                                              key,
+                                                              unavailable,
+                                                              g_get_monotonic_time());
+      }
+      if (unavailable) {
+        g_debug("Terrain tile unavailable: key=%s uri=%s cache=%s error=%s",
+                job->pending_key.c_str(),
+                job->uri.c_str(),
+                job->path.c_str(),
+                error ? error->message : "unknown error");
+      } else {
+        g_debug("Terrain download failed: key=%s uri=%s cache=%s retry_in_ms=%" G_GINT64_FORMAT " error=%s",
+                job->pending_key.c_str(),
+                job->uri.c_str(),
+                job->path.c_str(),
+                retry_delay_us / 1000,
+                error ? error->message : "unknown error");
+        ensure_scene_requests_scheduled(self,
+                                        static_cast<guint>(std::clamp<gint64>(retry_delay_us / 1000,
+                                                                              1000,
+                                                                              60000)));
+      }
+    }
     return;
   }
 
@@ -1867,15 +3411,22 @@ download_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
     tile.lat = job->terrain_lat;
     tile.lon = job->terrain_lon;
     if (read_hgt_file(job->path, tile.heights, tile.dimension)) {
+      const std::string key = terrain_key(tile.lat, tile.lon);
       std::lock_guard<std::mutex> lock(state->mutex);
-      state->terrain_tiles[terrain_key(tile.lat, tile.lon)] = std::move(tile);
+      state->terrain_tiles[key] = std::move(tile);
+      note_terrain_download_success_locked(state, key);
       state->mesh_key.clear();
     }
   } else if (job->kind == "texture") {
+    g_debug("Texture download finished: key=%s uri=%s cache=%s",
+            job->pending_key.c_str(),
+            job->uri.c_str(),
+            job->path.c_str());
     std::lock_guard<std::mutex> lock(state->mutex);
     state->loaded_texture_key.clear();
     state->loaded_mid_texture_key.clear();
     state->loaded_base_texture_key.clear();
+    state->loaded_globe_texture_key.clear();
   }
 
   schedule_scene_requests(self, 120);
@@ -1894,9 +3445,23 @@ start_download(GWorldSceneView *self,
   auto *state = get_state(self);
   {
     std::lock_guard<std::mutex> lock(state->mutex);
-    if (state->pending.find(pending_key) != state->pending.end())
+    if (state->pending.find(pending_key) != state->pending.end()) {
+      if (kind == "texture") {
+        g_debug("Texture download already pending: key=%s uri=%s cache=%s",
+                pending_key.c_str(),
+                uri.c_str(),
+                path.c_str());
+      }
       return;
+    }
     state->pending.insert(pending_key);
+  }
+
+  if (kind == "texture") {
+    g_debug("Texture download queued: key=%s uri=%s cache=%s",
+            pending_key.c_str(),
+            uri.c_str(),
+            path.c_str());
   }
 
   auto *job = new DownloadJob;
@@ -1977,6 +3542,8 @@ queue_scene_requests(GWorldSceneView *self)
   }
 
   const double radius_m = terrain_build_radius_for_altitude(altitude);
+  const bool render_globe = altitude >= kGlobeRenderAltitudeM;
+  const bool include_terrain = altitude < kTerrainDisableAltitudeM;
   const LatLonBounds terrain_bounds = bounds_around_camera(latitude, longitude, radius_m);
   const LatLonBounds texture_bounds =
     bounds_around_camera(latitude, longitude, texture_radius_for_altitude(altitude));
@@ -1987,93 +3554,127 @@ queue_scene_requests(GWorldSceneView *self)
     select_atlas_range(mid_texture_bounds, mid_texture_zoom_for_altitude(altitude));
   const AtlasRange base_atlas_range =
     select_atlas_range(terrain_bounds, base_texture_zoom_for_altitude(altitude));
+  const AtlasRange globe_range = globe_atlas_range(latitude, longitude, altitude);
 
   if (cache_enabled) {
-    std::unordered_set<std::string> keep_keys;
-    std::vector<TerrainCandidate> candidates;
-    const int lat_min = static_cast<int>(std::floor(terrain_bounds.min_lat));
-    const int lat_max = static_cast<int>(std::floor(terrain_bounds.max_lat));
-    const int lon_min = static_cast<int>(std::floor(terrain_bounds.min_lon));
-    const int lon_max = static_cast<int>(std::floor(terrain_bounds.max_lon));
+    if (include_terrain) {
+      std::unordered_set<std::string> keep_keys;
+      std::vector<TerrainCandidate> candidates;
+      const int lat_min = static_cast<int>(std::floor(terrain_bounds.min_lat));
+      const int lat_max = static_cast<int>(std::floor(terrain_bounds.max_lat));
+      const int lon_min = static_cast<int>(std::floor(terrain_bounds.min_lon));
+      const int lon_max = static_cast<int>(std::floor(terrain_bounds.max_lon));
 
-    for (int lat = lat_min; lat <= lat_max; ++lat) {
-      for (int lon = lon_min; lon <= lon_max; ++lon) {
-        const std::string key = terrain_key(lat, lon);
-        keep_keys.insert(key);
-        const glm::dvec3 center = geodetic_to_enu(static_cast<double>(lat) + 0.5,
-                                                  static_cast<double>(lon) + 0.5,
-                                                  0.0,
-                                                  latitude,
-                                                  longitude,
-                                                  0.0);
-        candidates.push_back({lat, lon, std::hypot(center.x, center.z)});
+      for (int lat = lat_min; lat <= lat_max; ++lat) {
+        for (int lon = lon_min; lon <= lon_max; ++lon) {
+          const std::string key = terrain_key(lat, lon);
+          keep_keys.insert(key);
+          const glm::dvec3 center = geodetic_to_enu(static_cast<double>(lat) + 0.5,
+                                                    static_cast<double>(lon) + 0.5,
+                                                    0.0,
+                                                    latitude,
+                                                    longitude,
+                                                    0.0);
+          candidates.push_back({lat, lon, std::hypot(center.x, center.z)});
+        }
       }
-    }
 
-    std::sort(candidates.begin(), candidates.end(), [](const TerrainCandidate &a, const TerrainCandidate &b) {
-      return a.distance < b.distance;
-    });
+      std::sort(candidates.begin(), candidates.end(), [](const TerrainCandidate &a, const TerrainCandidate &b) {
+        return a.distance < b.distance;
+      });
 
-    int terrain_loads = 0;
-    int terrain_downloads = 0;
-    bool has_more_terrain_work = false;
+      int terrain_loads = 0;
+      int terrain_downloads = 0;
+      bool has_more_terrain_work = false;
+      guint terrain_reschedule_ms = 60000;
 
-    for (const TerrainCandidate &candidate : candidates) {
-      const int lat = candidate.lat;
-      const int lon = candidate.lon;
-      const std::string key = terrain_key(lat, lon);
+      for (const TerrainCandidate &candidate : candidates) {
+        const int lat = candidate.lat;
+        const int lon = candidate.lon;
+        const std::string key = terrain_key(lat, lon);
+        {
+          std::lock_guard<std::mutex> lock(state->mutex);
+          if (state->terrain_tiles.find(key) != state->terrain_tiles.end())
+            continue;
+        }
+
+        const std::string name = hgt_tile_name(lat, lon);
+        const std::string uri = terrain_uri_from_template(terrain_template, name);
+        const std::string path = terrain_cache_path_for_uri(cache_dir, uri, name);
+
+        if (g_file_test(path.c_str(), G_FILE_TEST_EXISTS) ||
+            g_file_test(join_path(join_path(cache_dir, "terrain"), name + ".hgt").c_str(), G_FILE_TEST_EXISTS) ||
+            g_file_test(join_path(join_path(cache_dir, "terrain"), name + ".hgt.zip").c_str(), G_FILE_TEST_EXISTS)) {
+          if (terrain_loads >= kMaxTerrainTileLoadsPerUpdate) {
+            has_more_terrain_work = true;
+            terrain_reschedule_ms = 350;
+            continue;
+          }
+          ++terrain_loads;
+          load_cached_terrain_tile(self, lat, lon, name, path);
+          continue;
+        }
+
+        {
+          std::lock_guard<std::mutex> lock(state->mutex);
+          if (state->unavailable_terrain_keys.find(key) != state->unavailable_terrain_keys.end())
+            continue;
+
+          auto retry_iter = state->terrain_retry_after_us.find(key);
+          if (retry_iter != state->terrain_retry_after_us.end()) {
+            const gint64 now_us = g_get_monotonic_time();
+            if (retry_iter->second > now_us) {
+              has_more_terrain_work = true;
+              const guint retry_delay_ms =
+                static_cast<guint>(std::clamp<gint64>((retry_iter->second - now_us) / 1000,
+                                                      350,
+                                                      60000));
+              terrain_reschedule_ms = std::min(terrain_reschedule_ms, retry_delay_ms);
+              continue;
+            }
+          }
+        }
+
+        if (terrain_downloads >= kMaxTerrainDownloadsPerUpdate) {
+          has_more_terrain_work = true;
+          terrain_reschedule_ms = 350;
+          continue;
+        }
+
+        ++terrain_downloads;
+        start_download(self, "terrain", "terrain:" + key, uri, path, lat, lon);
+      }
+
       {
         std::lock_guard<std::mutex> lock(state->mutex);
-        if (state->terrain_tiles.find(key) != state->terrain_tiles.end())
-          continue;
-      }
-
-      const std::string name = hgt_tile_name(lat, lon);
-      const std::string uri = terrain_uri_from_template(terrain_template, name);
-      const std::string path = terrain_cache_path_for_uri(cache_dir, uri, name);
-
-      if (g_file_test(path.c_str(), G_FILE_TEST_EXISTS) ||
-          g_file_test(join_path(join_path(cache_dir, "terrain"), name + ".hgt").c_str(), G_FILE_TEST_EXISTS) ||
-          g_file_test(join_path(join_path(cache_dir, "terrain"), name + ".hgt.zip").c_str(), G_FILE_TEST_EXISTS)) {
-        if (terrain_loads >= kMaxTerrainTileLoadsPerUpdate) {
-          has_more_terrain_work = true;
-          continue;
-        }
-        ++terrain_loads;
-        load_cached_terrain_tile(self, lat, lon, name, path);
-        continue;
-      }
-
-      if (terrain_downloads >= kMaxTerrainDownloadsPerUpdate) {
-        has_more_terrain_work = true;
-        continue;
-      }
-
-      ++terrain_downloads;
-      start_download(self, "terrain", "terrain:" + key, uri, path, lat, lon);
-    }
-
-    {
-      std::lock_guard<std::mutex> lock(state->mutex);
-      for (const std::string &pending_key : state->pending) {
-        if (pending_key.rfind("terrain:", 0) == 0) {
-          has_more_terrain_work = true;
-          break;
+        for (const std::string &pending_key : state->pending) {
+          if (pending_key.rfind("terrain:", 0) == 0) {
+            has_more_terrain_work = true;
+            terrain_reschedule_ms = 350;
+            break;
+          }
         }
       }
-    }
 
-    if (has_more_terrain_work)
-      schedule_scene_requests(self, 350);
+      if (has_more_terrain_work)
+        schedule_scene_requests(self, terrain_reschedule_ms);
 
-    {
+      {
+        std::lock_guard<std::mutex> lock(state->mutex);
+        state->wanted_terrain_keys = keep_keys;
+        for (auto it = state->terrain_tiles.begin(); it != state->terrain_tiles.end();) {
+          if (keep_keys.find(it->first) == keep_keys.end())
+            it = state->terrain_tiles.erase(it);
+          else
+            ++it;
+        }
+      }
+    } else {
       std::lock_guard<std::mutex> lock(state->mutex);
-      state->wanted_terrain_keys = keep_keys;
-      for (auto it = state->terrain_tiles.begin(); it != state->terrain_tiles.end();) {
-        if (keep_keys.find(it->first) == keep_keys.end())
-          it = state->terrain_tiles.erase(it);
-        else
-          ++it;
+      state->wanted_terrain_keys.clear();
+      if (!state->terrain_tiles.empty()) {
+        state->terrain_tiles.clear();
+        state->mesh_key.clear();
       }
     }
 
@@ -2087,7 +3688,7 @@ queue_scene_requests(GWorldSceneView *self)
         for (int tx = range.x_min; tx <= range.x_max; ++tx) {
           TileCoord tile{range.z, tx, ty};
           const std::string uri = texture_uri_from_template(texture_template, tile);
-          const std::string path = texture_cache_path(cache_dir, uri, tile);
+          const std::string path = texture_cache_path(cache_dir, uri, texture_template, tile);
           if (g_file_test(path.c_str(), G_FILE_TEST_EXISTS))
             continue;
           if (texture_downloads >= kMaxTextureDownloadsPerUpdate) {
@@ -2102,9 +3703,13 @@ queue_scene_requests(GWorldSceneView *self)
       }
     };
 
-    request_texture_range(base_atlas_range);
-    request_texture_range(mid_atlas_range);
-    request_texture_range(atlas_range);
+    if (include_terrain) {
+      request_texture_range(base_atlas_range);
+      request_texture_range(mid_atlas_range);
+      request_texture_range(atlas_range);
+    }
+    if (render_globe)
+      request_texture_range(globe_range);
 
     {
       std::lock_guard<std::mutex> lock(state->mutex);
@@ -2128,12 +3733,20 @@ queue_scene_requests(GWorldSceneView *self)
       state->mid_texture_atlas_range.valid() ? state->mid_texture_atlas_range : mid_atlas_range;
     const AtlasRange mesh_base_atlas_range =
       state->base_texture_atlas_range.valid() ? state->base_texture_atlas_range : base_atlas_range;
-    rebuild_world_mesh(state, mesh_atlas_range, mesh_mid_atlas_range, mesh_base_atlas_range);
+    const AtlasRange mesh_globe_atlas_range =
+      state->globe_texture_atlas_range.valid() ? state->globe_texture_atlas_range : globe_range;
+    rebuild_world_mesh(state, mesh_atlas_range, mesh_mid_atlas_range, mesh_base_atlas_range, include_terrain);
+    if (render_globe)
+      rebuild_globe_mesh(state, mesh_globe_atlas_range);
   }
 
-  request_texture_atlas_build(self, base_atlas_range, TextureLayer::Base);
-  request_texture_atlas_build(self, mid_atlas_range, TextureLayer::Mid);
-  request_texture_atlas_build(self, atlas_range, TextureLayer::Detail);
+  if (include_terrain) {
+    request_texture_atlas_build(self, base_atlas_range, TextureLayer::Base);
+    request_texture_atlas_build(self, mid_atlas_range, TextureLayer::Mid);
+    request_texture_atlas_build(self, atlas_range, TextureLayer::Detail);
+  }
+  if (render_globe)
+    request_texture_atlas_build(self, globe_range, TextureLayer::Globe);
   gtk_widget_queue_draw(GTK_WIDGET(self));
 }
 
@@ -2183,8 +3796,6 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
 
   glEnable(GL_DEPTH_TEST);
   glDisable(GL_CULL_FACE);
-  glClearColor(0.60f, 0.75f, 0.95f, 1.0f);
-  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
   double altitude = 0.0;
   double heading = 0.0;
@@ -2194,6 +3805,20 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
   double longitude = 0.0;
   double mesh_origin_latitude = 0.0;
   double mesh_origin_longitude = 0.0;
+  bool render_globe = false;
+  bool render_terrain = true;
+  bool mesh_includes_terrain = true;
+  double sun_azimuth = 0.0;
+  double sun_elevation = 0.0;
+  double sun_time_of_day = 0.0;
+  double sun_declination = 0.0;
+  bool sun_uses_time_of_day = false;
+  bool fog_enabled = false;
+  double fog_start = 0.0;
+  double fog_end = 0.0;
+  glm::vec3 fog_color(0.60f, 0.72f, 0.86f);
+  bool shadows_enabled = false;
+  double terrain_normal_smoothing = 0.0;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     latitude = state->latitude;
@@ -2204,7 +3829,23 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
     radius_m = terrain_build_radius_for_altitude(state->altitude_amsl);
     mesh_origin_latitude = state->mesh_origin_latitude;
     mesh_origin_longitude = state->mesh_origin_longitude;
+    render_globe = altitude >= kGlobeRenderAltitudeM;
+    render_terrain = altitude < kTerrainDisableAltitudeM;
+    mesh_includes_terrain = state->mesh_includes_terrain;
+    sun_azimuth = state->sun_azimuth_deg;
+    sun_elevation = state->sun_elevation_deg;
+    sun_time_of_day = state->sun_time_of_day;
+    sun_declination = state->sun_declination_deg;
+    sun_uses_time_of_day = state->sun_uses_time_of_day;
+    fog_enabled = state->fog_enabled;
+    fog_start = state->fog_start_m;
+    fog_end = state->fog_end_m;
+    fog_color = state->fog_color;
+    shadows_enabled = state->shadows_enabled;
+    terrain_normal_smoothing = state->terrain_normal_smoothing;
     upload_mesh_if_needed(state);
+    if (render_globe)
+      upload_globe_mesh_if_needed(state);
     upload_textures_if_needed(state);
   }
 
@@ -2212,56 +3853,149 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
   const int height = std::max(1, gtk_widget_get_height(GTK_WIDGET(area)));
   glViewport(0, 0, width, height);
 
-  const float far_plane = static_cast<float>(std::max(100000.0, radius_m * 3.0 + altitude * 4.0));
+  double far_plane_m = std::max(100000.0, radius_m * 3.0 + altitude * 4.0);
+  if (render_globe)
+    far_plane_m = std::max(far_plane_m, altitude + gworld_scene::kWgs84A * 2.4);
+  const float far_plane = static_cast<float>(far_plane_m);
+  const float near_plane = render_globe
+                             ? static_cast<float>(std::clamp(altitude * 0.002, 25.0, 25000.0))
+                             : 2.0f;
   const glm::mat4 projection = glm::perspective(glm::radians(45.0f),
                                                 static_cast<float>(width) / static_cast<float>(height),
-                                                2.0f,
+                                                near_plane,
                                                 far_plane);
 
-  const double heading_rad = deg_to_rad(heading);
-  const double pitch_rad = deg_to_rad(pitch);
-  const glm::dvec3 camera_offset = geodetic_to_enu(latitude,
-                                                   longitude,
-                                                   0.0,
-                                                   mesh_origin_latitude,
-                                                   mesh_origin_longitude,
-                                                   0.0);
-  const glm::dvec3 eye(camera_offset.x, camera_offset.y + altitude, camera_offset.z);
-  const glm::dvec3 forward(std::sin(heading_rad) * std::cos(pitch_rad),
-                           std::sin(pitch_rad),
-                           -std::cos(heading_rad) * std::cos(pitch_rad));
-  const glm::dvec3 center = eye + forward * std::max(altitude * 2.5, 1000.0);
-  const glm::mat4 view = glm::lookAt(glm::vec3(eye), glm::vec3(center), glm::vec3(0.0f, 1.0f, 0.0f));
+  const glm::dvec3 sun_enu =
+    sun_uses_time_of_day
+      ? gworld_scene::sun_direction_from_time(latitude, sun_time_of_day, sun_declination)
+      : gworld_scene::sun_direction_from_position(sun_azimuth, sun_elevation);
+  const glm::vec3 sun_direction = sun_scene_direction_from_enu(sun_enu);
+  const float daylight = static_cast<float>(smoothstep_value(-0.08, 0.18, sun_enu.z));
+  const float ambient_strength = 0.14f + daylight * 0.34f;
+  const float sun_strength = daylight * 0.64f;
+  effective_fog_range(fog_start, fog_end, altitude, render_globe, fog_start, fog_end);
+  const float fog_density =
+    fog_enabled ? static_cast<float>(1.0 / std::max(fog_end * 2.8, 1.0)) : 0.0f;
+
+  const gworld_scene::CameraPose camera_pose =
+    gworld_scene::blended_camera_pose(latitude,
+                                      longitude,
+                                      altitude,
+                                      heading,
+                                      pitch,
+                                      mesh_origin_latitude,
+                                      mesh_origin_longitude);
+  const glm::mat4 view = glm::lookAt(glm::vec3(camera_pose.eye),
+                                     glm::vec3(camera_pose.center),
+                                     glm::vec3(camera_pose.up));
   const glm::mat4 mvp = projection * view;
+  const bool render_world_mesh = state->index_count > 0 && (render_terrain || !mesh_includes_terrain);
+
+  glm::mat4 light_mvp(1.0f);
+  bool shadow_available = false;
+  if (shadows_enabled &&
+      render_world_mesh &&
+      altitude < kShadowMaxAltitudeM &&
+      sun_enu.z > 0.04) {
+    const gworld_scene::LocalFrame frame =
+      gworld_scene::local_frame_at(latitude, longitude, mesh_origin_latitude, mesh_origin_longitude);
+    const double shadow_extent =
+      std::clamp(std::max(terrain_near_radius_for_altitude(altitude, radius_m),
+                          altitude * 4.0),
+                 2500.0,
+                 120000.0);
+    light_mvp = shadow_light_matrix(frame.origin, sun_direction, shadow_extent);
+    shadow_available = render_shadow_map(state, light_mvp);
+  }
+
+  glViewport(0, 0, width, height);
+  glClearColor(fog_color.r, fog_color.g, fog_color.b, 1.0f);
+  glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
   glUseProgram(state->program);
   glUniformMatrix4fv(glGetUniformLocation(state->program, "mvp"),
                      1,
                      GL_FALSE,
                      glm::value_ptr(mvp));
+  glUniformMatrix4fv(glGetUniformLocation(state->program, "light_mvp"),
+                     1,
+                     GL_FALSE,
+                     glm::value_ptr(light_mvp));
   glUniform1i(glGetUniformLocation(state->program, "detail_texture"), 0);
   glUniform1i(glGetUniformLocation(state->program, "mid_texture"), 1);
   glUniform1i(glGetUniformLocation(state->program, "base_texture"), 2);
-  glUniform1i(glGetUniformLocation(state->program, "has_detail_texture"), state->texture != 0);
-  glUniform1i(glGetUniformLocation(state->program, "has_mid_texture"), state->mid_texture != 0);
-  glUniform1i(glGetUniformLocation(state->program, "has_base_texture"), state->base_texture != 0);
+  glUniform1i(glGetUniformLocation(state->program, "shadow_texture"), 3);
+  glUniform1i(glGetUniformLocation(state->program, "model_texture"), 4);
+  glUniform3fv(glGetUniformLocation(state->program, "sun_direction"),
+               1,
+               glm::value_ptr(sun_direction));
+  glUniform1f(glGetUniformLocation(state->program, "ambient_strength"), ambient_strength);
+  glUniform1f(glGetUniformLocation(state->program, "sun_strength"), sun_strength);
+  glUniform3fv(glGetUniformLocation(state->program, "camera_position"),
+               1,
+               glm::value_ptr(glm::vec3(camera_pose.eye)));
+  glUniform1i(glGetUniformLocation(state->program, "fog_enabled"), fog_enabled);
+  glUniform3fv(glGetUniformLocation(state->program, "fog_color"),
+               1,
+               glm::value_ptr(fog_color));
+  glUniform1f(glGetUniformLocation(state->program, "fog_start"), static_cast<float>(fog_start));
+  glUniform1f(glGetUniformLocation(state->program, "fog_end"), static_cast<float>(fog_end));
+  glUniform1f(glGetUniformLocation(state->program, "fog_density"), fog_density);
+  glUniform1f(glGetUniformLocation(state->program, "terrain_normal_smoothing"),
+              static_cast<float>(std::clamp(terrain_normal_smoothing, 0.0, 1.0)));
+  if (shadow_available) {
+    glActiveTexture(GL_TEXTURE3);
+    glBindTexture(GL_TEXTURE_2D, state->shadow_depth_texture);
+  }
 
-  if (state->texture != 0) {
-    glActiveTexture(GL_TEXTURE0);
-    glBindTexture(GL_TEXTURE_2D, state->texture);
-  }
-  if (state->mid_texture != 0) {
-    glActiveTexture(GL_TEXTURE1);
-    glBindTexture(GL_TEXTURE_2D, state->mid_texture);
-  }
-  if (state->base_texture != 0) {
-    glActiveTexture(GL_TEXTURE2);
-    glBindTexture(GL_TEXTURE_2D, state->base_texture);
+  if (render_globe && state->globe_index_count > 0) {
+    glUniform1i(glGetUniformLocation(state->program, "has_detail_texture"), FALSE);
+    glUniform1i(glGetUniformLocation(state->program, "has_mid_texture"), FALSE);
+    glUniform1i(glGetUniformLocation(state->program, "has_base_texture"), state->globe_texture != 0);
+    glUniform1i(glGetUniformLocation(state->program, "has_shadow_texture"), FALSE);
+    glUniform1i(glGetUniformLocation(state->program, "has_model_texture"), FALSE);
+    if (state->globe_texture != 0) {
+      glActiveTexture(GL_TEXTURE2);
+      glBindTexture(GL_TEXTURE_2D, state->globe_texture);
+    }
+    glEnable(GL_CULL_FACE);
+    glCullFace(GL_BACK);
+    glFrontFace(GL_CCW);
+    glBindVertexArray(state->globe_vao);
+    glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(state->globe_index_count), GL_UNSIGNED_INT, nullptr);
+    glBindVertexArray(0);
+    glDisable(GL_CULL_FACE);
   }
 
-  glBindVertexArray(state->vao);
-  glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(state->index_count), GL_UNSIGNED_INT, nullptr);
-  glBindVertexArray(0);
+  if (render_world_mesh) {
+    glDisable(GL_CULL_FACE);
+    glUniform1i(glGetUniformLocation(state->program, "has_detail_texture"), state->texture != 0);
+    glUniform1i(glGetUniformLocation(state->program, "has_mid_texture"), state->mid_texture != 0);
+    glUniform1i(glGetUniformLocation(state->program, "has_base_texture"), state->base_texture != 0);
+    glUniform1i(glGetUniformLocation(state->program, "has_shadow_texture"), shadow_available);
+    glUniform1i(glGetUniformLocation(state->program, "has_model_texture"), state->model_texture != 0);
+
+    if (state->texture != 0) {
+      glActiveTexture(GL_TEXTURE0);
+      glBindTexture(GL_TEXTURE_2D, state->texture);
+    }
+    if (state->mid_texture != 0) {
+      glActiveTexture(GL_TEXTURE1);
+      glBindTexture(GL_TEXTURE_2D, state->mid_texture);
+    }
+    if (state->base_texture != 0) {
+      glActiveTexture(GL_TEXTURE2);
+      glBindTexture(GL_TEXTURE_2D, state->base_texture);
+    }
+    if (state->model_texture != 0) {
+      glActiveTexture(GL_TEXTURE4);
+      glBindTexture(GL_TEXTURE_2D, state->model_texture);
+    }
+
+    glBindVertexArray(state->vao);
+    glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(state->index_count), GL_UNSIGNED_INT, nullptr);
+    glBindVertexArray(0);
+  }
   glUseProgram(0);
 
   return TRUE;
@@ -2273,10 +4007,21 @@ move_camera_by_enu(GWorldSceneView *self, double east_m, double north_m, double 
   auto *state = get_state(self);
   {
     std::lock_guard<std::mutex> lock(state->mutex);
-    const double lon_scale = std::max(0.05, std::cos(deg_to_rad(state->latitude)));
-    state->latitude = std::clamp(state->latitude + north_m / kEarthMetersPerDegree, -90.0, 90.0);
-    state->longitude = std::clamp(state->longitude + east_m / (kEarthMetersPerDegree * lon_scale), -180.0, 180.0);
-    state->altitude_amsl = std::clamp(state->altitude_amsl + up_m, 25.0, 10000000.0);
+    double latitude = 0.0;
+    double longitude = 0.0;
+    double altitude = 0.0;
+    gworld_scene::translate_geodetic_ned(state->latitude,
+                                         state->longitude,
+                                         state->altitude_amsl,
+                                         north_m,
+                                         east_m,
+                                         -up_m,
+                                         &latitude,
+                                         &longitude,
+                                         &altitude);
+    state->latitude = latitude;
+    state->longitude = longitude;
+    state->altitude_amsl = std::clamp(altitude, 25.0, 10000000.0);
     state->mesh_key.clear();
   }
 
@@ -2311,7 +4056,7 @@ on_rotate_drag_begin(GtkGestureDrag *gesture, double start_x, double start_y, gp
   auto *self = GWORLD_SCENE_VIEW(user_data);
   gtk_widget_grab_focus(GTK_WIDGET(self));
   auto *state = get_state(self);
-  std::lock_guard<std::mutex> lock(state->mutex);
+  std::unique_lock<std::mutex> lock(state->mutex);
   state->rotate_drag_last_x = 0.0;
   state->rotate_drag_last_y = 0.0;
 }
@@ -2418,39 +4163,16 @@ on_tick(GtkWidget *widget, GdkFrameClock *frame_clock, gpointer user_data)
     return G_SOURCE_CONTINUE;
 
   dt = std::min(dt, 0.05);
-  const double heading_rad = deg_to_rad(heading);
-  const double forward_east = std::sin(heading_rad);
-  const double forward_north = std::cos(heading_rad);
-  const double right_east = std::cos(heading_rad);
-  const double right_north = -std::sin(heading_rad);
-
-  double east = 0.0;
-  double north = 0.0;
-  if (forward) {
-    east += forward_east;
-    north += forward_north;
-  }
-  if (backward) {
-    east -= forward_east;
-    north -= forward_north;
-  }
-  if (right) {
-    east += right_east;
-    north += right_north;
-  }
-  if (left) {
-    east -= right_east;
-    north -= right_north;
-  }
-
-  const double length = std::hypot(east, north);
-  if (length <= 0.000001)
+  const glm::dvec2 direction =
+    gworld_scene::camera_movement_direction_for_input(altitude, heading, forward, backward, left, right);
+  if (glm::length(direction) <= 0.000001)
     return G_SOURCE_CONTINUE;
 
-  east /= length;
-  north /= length;
-  const double speed_mps = std::clamp(altitude * 0.65, 35.0, 4000.0) * (fast ? 3.0 : 1.0);
-  move_camera_by_enu(self, east * speed_mps * dt, north * speed_mps * dt, 0.0);
+  const double base_speed_mps = altitude >= kGlobeRenderAltitudeM
+                                  ? std::clamp(altitude * 0.75, 1200.0, 250000.0)
+                                  : std::clamp(altitude * 0.65, 35.0, 4000.0);
+  const double speed_mps = base_speed_mps * (fast ? 3.0 : 1.0);
+  move_camera_by_enu(self, direction.x * speed_mps * dt, direction.y * speed_mps * dt, 0.0);
 
   return G_SOURCE_CONTINUE;
 }
@@ -2519,7 +4241,7 @@ on_key_released(GtkEventControllerKey *controller,
   (void)keycode;
   auto *self = GWORLD_SCENE_VIEW(user_data);
   auto *state = get_state(self);
-  std::lock_guard<std::mutex> lock(state->mutex);
+  std::unique_lock<std::mutex> lock(state->mutex);
   set_movement_key(state, keyval, false);
   if ((modifiers & GDK_SHIFT_MASK) == 0 && keyval != GDK_KEY_Shift_L && keyval != GDK_KEY_Shift_R)
     state->move_fast = false;
@@ -2572,6 +4294,32 @@ gworld_scene_view_set_property(GObject *object,
   case PROP_CACHE_ENABLED:
     gworld_scene_view_set_cache_enabled(self, g_value_get_boolean(value));
     break;
+  case PROP_SUN_AZIMUTH_DEG: {
+    double azimuth = 0.0;
+    double elevation = 0.0;
+    gworld_scene_view_get_sun_position(self, &azimuth, &elevation);
+    gworld_scene_view_set_sun_position(self, g_value_get_double(value), elevation);
+    break;
+  }
+  case PROP_SUN_ELEVATION_DEG: {
+    double azimuth = 0.0;
+    double elevation = 0.0;
+    gworld_scene_view_get_sun_position(self, &azimuth, &elevation);
+    gworld_scene_view_set_sun_position(self, azimuth, g_value_get_double(value));
+    break;
+  }
+  case PROP_SUN_TIME_OF_DAY:
+    gworld_scene_view_set_sun_time_of_day(self, g_value_get_double(value));
+    break;
+  case PROP_FOG_ENABLED:
+    gworld_scene_view_set_fog_enabled(self, g_value_get_boolean(value));
+    break;
+  case PROP_SHADOWS_ENABLED:
+    gworld_scene_view_set_shadows_enabled(self, g_value_get_boolean(value));
+    break;
+  case PROP_TERRAIN_NORMAL_SMOOTHING:
+    gworld_scene_view_set_terrain_normal_smoothing(self, g_value_get_double(value));
+    break;
   default:
     G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
     break;
@@ -2610,6 +4358,30 @@ gworld_scene_view_get_property(GObject *object,
   case PROP_CACHE_ENABLED:
     g_value_set_boolean(value, state->cache_enabled);
     break;
+  case PROP_SUN_AZIMUTH_DEG: {
+    const gworld_scene::SunPosition sun_position =
+      gworld_scene::sun_position_from_direction(sun_enu_for_state(state, state->latitude));
+    g_value_set_double(value, sun_position.azimuth_deg);
+    break;
+  }
+  case PROP_SUN_ELEVATION_DEG: {
+    const gworld_scene::SunPosition sun_position =
+      gworld_scene::sun_position_from_direction(sun_enu_for_state(state, state->latitude));
+    g_value_set_double(value, sun_position.elevation_deg);
+    break;
+  }
+  case PROP_SUN_TIME_OF_DAY:
+    g_value_set_double(value, state->sun_time_of_day);
+    break;
+  case PROP_FOG_ENABLED:
+    g_value_set_boolean(value, state->fog_enabled);
+    break;
+  case PROP_SHADOWS_ENABLED:
+    g_value_set_boolean(value, state->shadows_enabled);
+    break;
+  case PROP_TERRAIN_NORMAL_SMOOTHING:
+    g_value_set_double(value, state->terrain_normal_smoothing);
+    break;
   default:
     G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
     break;
@@ -2627,6 +4399,17 @@ gworld_scene_view_finalize(GObject *object)
 {
   auto *priv = static_cast<GWorldSceneViewPrivate *>(
     gworld_scene_view_get_instance_private(GWORLD_SCENE_VIEW(object)));
+  {
+    GWorldSceneViewState &state = priv->backend->state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    for (auto &entry : state.scene_nodes) {
+      g_signal_handlers_disconnect_by_func(entry.second,
+                                           reinterpret_cast<gpointer>(on_scene_node_changed),
+                                           object);
+      g_object_unref(entry.second);
+    }
+    state.scene_nodes.clear();
+  }
   delete priv->backend;
   priv->backend = nullptr;
 
@@ -2690,6 +4473,50 @@ gworld_scene_view_class_init(GWorldSceneViewClass *klass)
                          "Whether terrain and map tiles are cached on disk",
                          TRUE,
                          static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY));
+  properties[PROP_SUN_AZIMUTH_DEG] =
+    g_param_spec_double("sun-azimuth-deg",
+                        "Sun Azimuth",
+                        "Sun azimuth in degrees clockwise from geographic north",
+                        0.0,
+                        360.0,
+                        228.0,
+                        static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY));
+  properties[PROP_SUN_ELEVATION_DEG] =
+    g_param_spec_double("sun-elevation-deg",
+                        "Sun Elevation",
+                        "Sun elevation in degrees above the horizon",
+                        -90.0,
+                        90.0,
+                        50.0,
+                        static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY));
+  properties[PROP_SUN_TIME_OF_DAY] =
+    g_param_spec_double("sun-time-of-day",
+                        "Sun Time Of Day",
+                        "Approximate local solar hour used by time-of-day sun mode",
+                        0.0,
+                        24.0,
+                        14.0,
+                        static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY));
+  properties[PROP_FOG_ENABLED] =
+    g_param_spec_boolean("fog-enabled",
+                         "Fog Enabled",
+                         "Whether distance fog is applied",
+                         TRUE,
+                         static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY));
+  properties[PROP_SHADOWS_ENABLED] =
+    g_param_spec_boolean("shadows-enabled",
+                         "Shadows Enabled",
+                         "Whether the local terrain and scene nodes use the directional shadow map",
+                         TRUE,
+                         static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY));
+  properties[PROP_TERRAIN_NORMAL_SMOOTHING] =
+    g_param_spec_double("terrain-normal-smoothing",
+                        "Terrain Normal Smoothing",
+                        "Shader-side smoothing amount applied to terrain lighting normals",
+                        0.0,
+                        1.0,
+                        0.88,
+                        static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY));
 
   g_object_class_install_properties(object_class, N_PROPS, properties);
 }
@@ -2836,6 +4663,7 @@ gworld_scene_view_set_terrain_server(GWorldSceneView *self, const char *terrain_
     std::lock_guard<std::mutex> lock(state->mutex);
     state->terrain_server = terrain_server ? terrain_server : kDefaultTerrainServer;
     state->terrain_tiles.clear();
+    clear_terrain_download_state_locked(state);
     state->mesh_key.clear();
   }
 
@@ -2874,15 +4702,23 @@ gworld_scene_view_set_map_tile_url_template(GWorldSceneView *self, const char *u
     state->base_texture_width = 0;
     state->base_texture_height = 0;
     state->base_texture_dirty = true;
+    state->loaded_globe_texture_key.clear();
+    state->globe_texture_pixels.clear();
+    state->globe_texture_width = 0;
+    state->globe_texture_height = 0;
+    state->globe_texture_dirty = true;
     state->wanted_texture_key.clear();
     state->wanted_mid_texture_key.clear();
     state->wanted_base_texture_key.clear();
+    state->wanted_globe_texture_key.clear();
     state->pending_texture_build_key.clear();
     state->pending_mid_texture_build_key.clear();
     state->pending_base_texture_build_key.clear();
+    state->pending_globe_texture_build_key.clear();
     state->texture_atlas_range = AtlasRange();
     state->mid_texture_atlas_range = AtlasRange();
     state->base_texture_atlas_range = AtlasRange();
+    state->globe_texture_atlas_range = AtlasRange();
     ++state->texture_source_revision;
     state->mesh_key.clear();
   }
@@ -2908,6 +4744,7 @@ gworld_scene_view_set_cache_directory(GWorldSceneView *self, const char *cache_d
     std::lock_guard<std::mutex> lock(state->mutex);
     state->cache_directory = cache_directory ? cache_directory : default_cache_directory();
     state->terrain_tiles.clear();
+    clear_terrain_download_state_locked(state);
     state->texture_pixels.clear();
     state->texture_width = 0;
     state->texture_height = 0;
@@ -2923,15 +4760,23 @@ gworld_scene_view_set_cache_directory(GWorldSceneView *self, const char *cache_d
     state->base_texture_width = 0;
     state->base_texture_height = 0;
     state->base_texture_dirty = true;
+    state->loaded_globe_texture_key.clear();
+    state->globe_texture_pixels.clear();
+    state->globe_texture_width = 0;
+    state->globe_texture_height = 0;
+    state->globe_texture_dirty = true;
     state->wanted_texture_key.clear();
     state->wanted_mid_texture_key.clear();
     state->wanted_base_texture_key.clear();
+    state->wanted_globe_texture_key.clear();
     state->pending_texture_build_key.clear();
     state->pending_mid_texture_build_key.clear();
     state->pending_base_texture_build_key.clear();
+    state->pending_globe_texture_build_key.clear();
     state->texture_atlas_range = AtlasRange();
     state->mid_texture_atlas_range = AtlasRange();
     state->base_texture_atlas_range = AtlasRange();
+    state->globe_texture_atlas_range = AtlasRange();
     ++state->texture_source_revision;
     state->mesh_key.clear();
   }
@@ -2956,6 +4801,7 @@ gworld_scene_view_set_cache_enabled(GWorldSceneView *self, gboolean cache_enable
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     state->cache_enabled = cache_enabled;
+    clear_terrain_download_state_locked(state);
   }
 
   g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_CACHE_ENABLED]);
@@ -2969,4 +4815,397 @@ gworld_scene_view_get_cache_enabled(GWorldSceneView *self)
   auto *state = get_state(self);
   std::lock_guard<std::mutex> lock(state->mutex);
   return state->cache_enabled;
+}
+
+void
+gworld_scene_view_set_sun_position(GWorldSceneView *self,
+                                   double azimuth_deg,
+                                   double elevation_deg)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+
+  auto *state = get_state(self);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->sun_azimuth_deg = std::fmod(azimuth_deg, 360.0);
+    if (state->sun_azimuth_deg < 0.0)
+      state->sun_azimuth_deg += 360.0;
+    state->sun_elevation_deg = std::clamp(elevation_deg, -90.0, 90.0);
+    state->sun_uses_time_of_day = false;
+  }
+
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_SUN_AZIMUTH_DEG]);
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_SUN_ELEVATION_DEG]);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+void
+gworld_scene_view_get_sun_position(GWorldSceneView *self,
+                                   double *azimuth_deg,
+                                   double *elevation_deg)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+
+  auto *state = get_state(self);
+  std::lock_guard<std::mutex> lock(state->mutex);
+  const gworld_scene::SunPosition sun_position =
+    gworld_scene::sun_position_from_direction(sun_enu_for_state(state, state->latitude));
+  if (azimuth_deg)
+    *azimuth_deg = sun_position.azimuth_deg;
+  if (elevation_deg)
+    *elevation_deg = sun_position.elevation_deg;
+}
+
+void
+gworld_scene_view_set_sun_time_of_day(GWorldSceneView *self,
+                                      double local_solar_hour)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+
+  auto *state = get_state(self);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->sun_time_of_day = std::fmod(local_solar_hour, 24.0);
+    if (state->sun_time_of_day < 0.0)
+      state->sun_time_of_day += 24.0;
+    state->sun_uses_time_of_day = true;
+  }
+
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_SUN_TIME_OF_DAY]);
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_SUN_AZIMUTH_DEG]);
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_SUN_ELEVATION_DEG]);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+double
+gworld_scene_view_get_sun_time_of_day(GWorldSceneView *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), 0.0);
+  auto *state = get_state(self);
+  std::lock_guard<std::mutex> lock(state->mutex);
+  return state->sun_time_of_day;
+}
+
+void
+gworld_scene_view_set_fog_enabled(GWorldSceneView *self, gboolean fog_enabled)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+
+  auto *state = get_state(self);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->fog_enabled = fog_enabled;
+  }
+
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_FOG_ENABLED]);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+gboolean
+gworld_scene_view_get_fog_enabled(GWorldSceneView *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), FALSE);
+  auto *state = get_state(self);
+  std::lock_guard<std::mutex> lock(state->mutex);
+  return state->fog_enabled;
+}
+
+void
+gworld_scene_view_set_fog_range(GWorldSceneView *self, double start_m, double end_m)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+
+  auto *state = get_state(self);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->fog_start_m = std::max(0.0, start_m);
+    state->fog_end_m = std::max(state->fog_start_m + 1.0, end_m);
+  }
+
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+void
+gworld_scene_view_get_fog_range(GWorldSceneView *self, double *start_m, double *end_m)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+
+  auto *state = get_state(self);
+  std::lock_guard<std::mutex> lock(state->mutex);
+  if (start_m)
+    *start_m = state->fog_start_m;
+  if (end_m)
+    *end_m = state->fog_end_m;
+}
+
+void
+gworld_scene_view_set_fog_color(GWorldSceneView *self,
+                                double red,
+                                double green,
+                                double blue)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+
+  auto *state = get_state(self);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->fog_color = glm::vec3(static_cast<float>(std::clamp(red, 0.0, 1.0)),
+                                 static_cast<float>(std::clamp(green, 0.0, 1.0)),
+                                 static_cast<float>(std::clamp(blue, 0.0, 1.0)));
+  }
+
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+void
+gworld_scene_view_get_fog_color(GWorldSceneView *self,
+                                double *red,
+                                double *green,
+                                double *blue)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+
+  auto *state = get_state(self);
+  std::lock_guard<std::mutex> lock(state->mutex);
+  if (red)
+    *red = state->fog_color.r;
+  if (green)
+    *green = state->fog_color.g;
+  if (blue)
+    *blue = state->fog_color.b;
+}
+
+void
+gworld_scene_view_set_shadows_enabled(GWorldSceneView *self, gboolean shadows_enabled)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+
+  auto *state = get_state(self);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->shadows_enabled = shadows_enabled;
+  }
+
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_SHADOWS_ENABLED]);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+gboolean
+gworld_scene_view_get_shadows_enabled(GWorldSceneView *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), FALSE);
+  auto *state = get_state(self);
+  std::lock_guard<std::mutex> lock(state->mutex);
+  return state->shadows_enabled;
+}
+
+void
+gworld_scene_view_set_terrain_normal_smoothing(GWorldSceneView *self, double smoothing)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+
+  auto *state = get_state(self);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->terrain_normal_smoothing = std::clamp(smoothing, 0.0, 1.0);
+  }
+
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_TERRAIN_NORMAL_SMOOTHING]);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+double
+gworld_scene_view_get_terrain_normal_smoothing(GWorldSceneView *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), 0.0);
+  auto *state = get_state(self);
+  std::lock_guard<std::mutex> lock(state->mutex);
+  return state->terrain_normal_smoothing;
+}
+
+static void
+mark_scene_nodes_changed(GWorldSceneView *self, GWorldSceneViewState *state)
+{
+  (void)self;
+  ++state->scene_revision;
+  state->mesh_key.clear();
+}
+
+static void
+schedule_scene_nodes_changed(GWorldSceneView *self)
+{
+  schedule_scene_requests(self, 20);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+static void
+on_scene_node_changed(GWorldSceneNode *node, gpointer user_data)
+{
+  (void)node;
+  auto *self = GWORLD_SCENE_VIEW(user_data);
+  auto *state = get_state(self);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    mark_scene_nodes_changed(self, state);
+  }
+  schedule_scene_nodes_changed(self);
+}
+
+static void
+add_scene_node(GWorldSceneView *self, GWorldSceneNode *node)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+  g_return_if_fail(GWORLD_IS_SCENE_NODE(node));
+
+  auto *state = get_state(self);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    g_signal_connect(node, "changed", G_CALLBACK(on_scene_node_changed), self);
+    state->scene_nodes.emplace(gworld_scene_node_get_id(node), node);
+    mark_scene_nodes_changed(self, state);
+  }
+  schedule_scene_nodes_changed(self);
+}
+
+GWorldSceneCubeNode *
+gworld_scene_view_add_cube(GWorldSceneView *self,
+                           double latitude,
+                           double longitude,
+                           double altitude_amsl,
+                           double width_m,
+                           double depth_m,
+                           double height_m)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), nullptr);
+
+  GWorldSceneCubeNode *node = nullptr;
+  {
+    auto *state = get_state(self);
+    std::lock_guard<std::mutex> lock(state->mutex);
+    node = _gworld_scene_cube_node_new(state->next_node_id++,
+                                       latitude,
+                                       longitude,
+                                       altitude_amsl,
+                                       width_m,
+                                       depth_m,
+                                       height_m);
+  }
+  add_scene_node(self, GWORLD_SCENE_NODE(node));
+  return node;
+}
+
+GWorldSceneSphereNode *
+gworld_scene_view_add_sphere(GWorldSceneView *self,
+                             double latitude,
+                             double longitude,
+                             double altitude_amsl,
+                             double diameter_m)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), nullptr);
+
+  GWorldSceneSphereNode *node = nullptr;
+  {
+    auto *state = get_state(self);
+    std::lock_guard<std::mutex> lock(state->mutex);
+    node = _gworld_scene_sphere_node_new(state->next_node_id++,
+                                         latitude,
+                                         longitude,
+                                         altitude_amsl,
+                                         diameter_m);
+  }
+  add_scene_node(self, GWORLD_SCENE_NODE(node));
+  return node;
+}
+
+GWorldSceneCylinderNode *
+gworld_scene_view_add_cylinder(GWorldSceneView *self,
+                               double latitude,
+                               double longitude,
+                               double altitude_amsl,
+                               double diameter_m,
+                               double height_m)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), nullptr);
+
+  GWorldSceneCylinderNode *node = nullptr;
+  {
+    auto *state = get_state(self);
+    std::lock_guard<std::mutex> lock(state->mutex);
+    node = _gworld_scene_cylinder_node_new(state->next_node_id++,
+                                           latitude,
+                                           longitude,
+                                           altitude_amsl,
+                                           diameter_m,
+                                           height_m);
+  }
+  add_scene_node(self, GWORLD_SCENE_NODE(node));
+  return node;
+}
+
+GWorldSceneModelNode *
+gworld_scene_view_add_model(GWorldSceneView *self,
+                            const char *model_path,
+                            double latitude,
+                            double longitude,
+                            double altitude_amsl)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), nullptr);
+  g_return_val_if_fail(model_path != nullptr && model_path[0] != '\0', nullptr);
+
+  GWorldSceneModelNode *node = nullptr;
+  {
+    auto *state = get_state(self);
+    std::lock_guard<std::mutex> lock(state->mutex);
+    node = _gworld_scene_model_node_new(state->next_node_id++,
+                                        model_path,
+                                        latitude,
+                                        longitude,
+                                        altitude_amsl);
+  }
+  add_scene_node(self, GWORLD_SCENE_NODE(node));
+  return node;
+}
+
+gboolean
+gworld_scene_view_remove_node(GWorldSceneView *self, GWorldSceneNode *node)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), FALSE);
+  g_return_val_if_fail(GWORLD_IS_SCENE_NODE(node), FALSE);
+
+  auto *state = get_state(self);
+  std::unique_lock<std::mutex> lock(state->mutex);
+  const GWorldSceneNodeId node_id = gworld_scene_node_get_id(node);
+  auto iter = state->scene_nodes.find(node_id);
+  if (iter == state->scene_nodes.end() || iter->second != node)
+    return FALSE;
+  g_signal_handlers_disconnect_by_func(iter->second,
+                                       reinterpret_cast<gpointer>(on_scene_node_changed),
+                                       self);
+  g_object_unref(iter->second);
+  state->scene_nodes.erase(iter);
+  mark_scene_nodes_changed(self, state);
+  lock.unlock();
+  schedule_scene_nodes_changed(self);
+  return TRUE;
+}
+
+void
+gworld_scene_view_clear_nodes(GWorldSceneView *self)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+
+  auto *state = get_state(self);
+  std::unique_lock<std::mutex> lock(state->mutex);
+  if (state->scene_nodes.empty())
+    return;
+  for (auto &entry : state->scene_nodes) {
+    g_signal_handlers_disconnect_by_func(entry.second,
+                                         reinterpret_cast<gpointer>(on_scene_node_changed),
+                                         self);
+    g_object_unref(entry.second);
+  }
+  state->scene_nodes.clear();
+  mark_scene_nodes_changed(self, state);
+  lock.unlock();
+  schedule_scene_nodes_changed(self);
 }

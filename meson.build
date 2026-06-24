@@ -14,3 +14,4 @@ pkg = import('pkgconfig')
 
 subdir('src')
 subdir('examples')
+subdir('tests')

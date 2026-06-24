@@ -15,10 +15,21 @@ gworldscene_deps = [
 
 gworldscene_headers = [
   'gworldscene.h',
+  'gworld-scene-node.h',
   'gworld-scene-view.h',
 ]
 
 gworldscene_sources = [
+  'gworld-scene-camera.cpp',
+  'gworld-scene-camera-private.h',
+  'gworld-scene-geo.cpp',
+  'gworld-scene-geo-private.h',
+  'gworld-scene-light.cpp',
+  'gworld-scene-light-private.h',
+  'gworld-scene-lod.cpp',
+  'gworld-scene-lod-private.h',
+  'gworld-scene-node.cpp',
+  'gworld-scene-node-private.h',
   'gworld-scene-view.cpp',
   'gworld-scene-view-private.h',
 ]
@@ -56,7 +67,12 @@ gworldscene_gir = gnome.generate_gir(
   includes: ['Gtk-4.0', 'GObject-2.0'],
   export_packages: 'gworldscene-' + gworldscene_api_version,
   header: 'gworldscene/gworldscene.h',
-  extra_args: ['--c-include=gworldscene/gworldscene.h'],
+  extra_args: [
+    '--c-include=gworldscene/gworldscene.h',
+    '--cflags-begin',
+    '-I' + meson.current_source_dir() / 'gir-compat',
+    '--cflags-end',
+  ],
   install: true,
 )
 
