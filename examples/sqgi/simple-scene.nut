@@ -78,6 +78,7 @@ function add_scene_nodes(view) {
   cylinder.set_color(0.40, 0.78, 0.30)
   W.nodes.append(cylinder)
 
+  /*
   local model_path = find_demo_asset_path("examples/assets/ToyCar/ToyCar.glb")
   if (model_path != null) {
     local model = view.add_model(model_path, -16.8910, 145.7040, 650.0)
@@ -86,6 +87,7 @@ function add_scene_nodes(view) {
     model.set_orientation_ned(120.0, 0.0, 0.0)
     W.nodes.append(model)
   }
+  */
 
   local marker_path = find_demo_asset_path("examples/assets/BillboardMarker/map-symbol-location-02.png")
   if (marker_path != null) {
