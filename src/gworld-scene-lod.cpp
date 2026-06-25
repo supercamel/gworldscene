@@ -71,15 +71,27 @@ slippy_tile_y_for_latitude(double latitude_deg, int zoom)
 int
 globe_texture_zoom_for_altitude(double altitude_amsl)
 {
-  if (altitude_amsl < 100000.0)
+  if (altitude_amsl < 120000.0)
+    return 8;
+  if (altitude_amsl < 300000.0)
     return 7;
-  if (altitude_amsl < 250000.0)
+  if (altitude_amsl < 900000.0)
     return 6;
-  if (altitude_amsl < 750000.0)
+  if (altitude_amsl < 6000000.0)
     return 5;
-  if (altitude_amsl < 2500000.0)
-    return 4;
-  return 3;
+  return 4;
+}
+
+int
+globe_texture_half_span_for_zoom(int zoom)
+{
+  if (zoom >= 8)
+    return 2;
+  if (zoom == 7)
+    return 3;
+  if (zoom == 6)
+    return 5;
+  return 7;
 }
 
 TileRange
@@ -88,7 +100,7 @@ globe_texture_range_for_camera(double latitude,
                                double altitude_amsl)
 {
   const int zoom = globe_texture_zoom_for_altitude(altitude_amsl);
-  if (zoom <= 3)
+  if (zoom <= 4)
     return full_world_range(zoom);
 
   const int tile_count = 1 << zoom;
@@ -98,7 +110,7 @@ globe_texture_range_for_camera(double latitude,
   const int center_y = std::clamp(static_cast<int>(std::floor(slippy_tile_y_for_latitude(latitude, zoom))),
                                   0,
                                   tile_count - 1);
-  const int half_span = zoom >= 6 ? 2 : 3;
+  const int half_span = globe_texture_half_span_for_zoom(zoom);
 
   TileRange range;
   range.z = zoom;

@@ -1,9 +1,9 @@
 using Gtk;
 
 namespace GWorldSceneControls {
-  private const double HOME_LATITUDE = -35.0024;
-  private const double HOME_LONGITUDE = 147.4648;
-  private const double HOME_ALTITUDE_AMSL = 5200.0;
+  private const double HOME_LATITUDE = -16.8878;
+  private const double HOME_LONGITUDE = 145.7048;
+  private const double HOME_ALTITUDE_AMSL = 7800.0;
   private const string DEFAULT_TERRAIN_SERVER = "https://flightops.silvertone.com.au/terrain/data/";
   private const string GOOGLE_LEGACY_SATELLITE =
     "https://mt.google.com/vt/lyrs=s&x={x}&y={y}&z={z}";
@@ -53,7 +53,7 @@ namespace GWorldSceneControls {
       scene.hexpand = true;
       scene.vexpand = true;
       scene.set_camera (HOME_LATITUDE, HOME_LONGITUDE, HOME_ALTITUDE_AMSL);
-      scene.set_camera_orientation (35.0, -32.0);
+      scene.set_camera_orientation (72.0, -32.0);
 
       seed_scene_nodes ();
 
@@ -275,7 +275,7 @@ namespace GWorldSceneControls {
       var reset_camera = new Gtk.Button.with_label ("Reset camera");
       reset_camera.clicked.connect (() => {
         scene.set_camera (HOME_LATITUDE, HOME_LONGITUDE, HOME_ALTITUDE_AMSL);
-        scene.set_camera_orientation (35.0, -32.0);
+        scene.set_camera_orientation (72.0, -32.0);
       });
       add_row (camera_grid, row++, "", reset_camera);
       box.append (camera_grid);
@@ -556,17 +556,17 @@ namespace GWorldSceneControls {
     private void seed_scene_nodes () {
       var cube = scene.add_cube (HOME_LATITUDE,
                                  HOME_LONGITUDE,
-                                 1200.0,
+                                 650.0,
                                  900.0,
                                  900.0,
                                  900.0);
       cube.set_color (1.0, 0.08, 0.02);
       cube.set_orientation_ned (35.0, 0.0, 12.0);
 
-      var sphere = scene.add_sphere (-35.0060, 147.4720, 820.0, 360.0);
+      var sphere = scene.add_sphere (-16.8780, 145.7200, 450.0, 360.0);
       sphere.set_color (0.18, 0.55, 0.95);
 
-      var cylinder = scene.add_cylinder (-34.9980, 147.4560, 760.0, 320.0, 700.0);
+      var cylinder = scene.add_cylinder (-16.9040, 145.6880, 420.0, 320.0, 700.0);
       cylinder.set_color (0.40, 0.78, 0.30);
 
       var route = scene.add_polyline ();
@@ -574,29 +574,29 @@ namespace GWorldSceneControls {
       route.set_width (35.0);
       route.set_opacity (0.92);
       route.set_altitude_mode (GWorld.SceneAltitudeMode.AGL);
-      route.append_point (-35.0105, 147.4480, 90.0);
-      route.append_point (-35.0060, 147.4575, 120.0);
-      route.append_point (-35.0010, 147.4665, 140.0);
-      route.append_point (-34.9960, 147.4785, 110.0);
+      route.append_point (-16.8290, 145.6460, 90.0);
+      route.append_point (-16.8500, 145.6755, 120.0);
+      route.append_point (-16.8800, 145.7170, 90.0);
+      route.append_point (-16.9190, 145.7780, 60.0);
 
       var zone = scene.add_polygon ();
       zone.set_altitude_mode (GWorld.SceneAltitudeMode.AGL);
       zone.set_fill_color (0.05, 0.48, 0.95, 0.24);
       zone.set_outline_color (0.10, 0.75, 1.0, 0.9);
       zone.set_outline_width (22.0);
-      zone.append_point (-35.0100, 147.4700, 18.0);
-      zone.append_point (-35.0040, 147.4820, 18.0);
-      zone.append_point (-35.0140, 147.4910, 18.0);
-      zone.append_point (-35.0200, 147.4770, 18.0);
+      zone.append_point (-16.8650, 145.6795, 1.5);
+      zone.append_point (-16.8505, 145.7040, 1.5);
+      zone.append_point (-16.8845, 145.7310, 1.5);
+      zone.append_point (-16.9060, 145.6950, 1.5);
 
-      var bubble = scene.add_circle (-34.9908, 147.4620, 15.0, 850.0);
+      var bubble = scene.add_circle (-16.8280, 145.6530, 1.5, 850.0);
       bubble.set_altitude_mode (GWorld.SceneAltitudeMode.AGL);
       bubble.set_fill_color (0.18, 0.85, 0.42, 0.18);
       bubble.set_outline_color (0.20, 1.0, 0.45, 0.9);
       bubble.set_outline_width (20.0);
       bubble.set_segments (96);
 
-      var label = scene.add_text_label ("Training zone", -34.9908, 147.4620, 220.0);
+      var label = scene.add_text_label ("Training zone", -16.8280, 145.6530, 220.0);
       label.set_altitude_mode (GWorld.SceneAltitudeMode.AGL);
       label.set_font ("Sans Bold 22");
       label.set_size_limits (54.0, 240.0);
@@ -605,7 +605,7 @@ namespace GWorldSceneControls {
 
       var billboard_path = find_demo_asset_path ("examples/assets/BillboardMarker/map-symbol-location-02.png");
       if (billboard_path != null) {
-        var billboard = scene.add_billboard (billboard_path, -34.9474, 147.5098, 1400.0);
+        var billboard = scene.add_billboard (billboard_path, -16.8840, 145.7510, 500.0);
         billboard.set_altitude_mode (GWorld.SceneAltitudeMode.AGL);
         billboard.set_size_limits (48.0, 180.0);
         billboard.set_reference_size (140.0, 5000.0);
@@ -615,17 +615,17 @@ namespace GWorldSceneControls {
       var overlay_path = find_demo_asset_path ("examples/assets/GroundOverlay/aiga-heliport.png");
       if (overlay_path != null) {
         var ground_overlay = scene.add_ground_overlay (overlay_path,
-                                                       -34.9865, 147.4748,
-                                                       -34.9865, 147.4847,
-                                                       -34.9921, 147.4847,
-                                                       -34.9921, 147.4748);
+                                                       -16.8890, 145.7460,
+                                                       -16.8890, 145.7545,
+                                                       -16.8950, 145.7545,
+                                                       -16.8950, 145.7460);
         ground_overlay.set_opacity (0.78);
         ground_overlay.set_altitude_offset (1.4);
       }
 
       var model_path = find_demo_asset_path ("examples/assets/ToyCar/ToyCar.glb");
       if (model_path != null) {
-        var model = scene.add_model (model_path, -35.0010, 147.4585, 1120.0);
+        var model = scene.add_model (model_path, -16.8910, 145.7040, 650.0);
         model.set_scale (12000.0, 12000.0, 12000.0);
         model.set_color (1.0, 1.0, 1.0);
         model.set_orientation_ned (120.0, 0.0, 0.0);

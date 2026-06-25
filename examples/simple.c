@@ -200,10 +200,10 @@ activate(GtkApplication *app, gpointer user_data)
   gtk_window_set_title(GTK_WINDOW(window), "GWorldScene");
   gtk_window_set_default_size(GTK_WINDOW(window), 1100, 760);
 
-  const double initial_latitude = -35.0024;
-  const double initial_longitude = 147.4648;
-  const double initial_altitude_amsl = 5200.0;
-  const double marker_altitude_amsl = 1200.0;
+  const double initial_latitude = -16.8878;
+  const double initial_longitude = 145.7048;
+  const double initial_altitude_amsl = 7800.0;
+  const double marker_altitude_amsl = 650.0;
 
   GtkWidget *view = gworld_scene_view_new();
   configure_map_tiles(GWORLD_SCENE_VIEW(view));
@@ -211,7 +211,7 @@ activate(GtkApplication *app, gpointer user_data)
                                initial_latitude,
                                initial_longitude,
                                initial_altitude_amsl);
-  gworld_scene_view_set_camera_orientation(GWORLD_SCENE_VIEW(view), 35.0, -68.0);
+  gworld_scene_view_set_camera_orientation(GWORLD_SCENE_VIEW(view), 72.0, -66.0);
   gworld_scene_view_set_sun_time_of_day(GWORLD_SCENE_VIEW(view), 15.25);
   gworld_scene_view_set_fog_range(GWORLD_SCENE_VIEW(view), 9000.0, 90000.0);
   gworld_scene_view_set_shadows_enabled(GWORLD_SCENE_VIEW(view), TRUE);
@@ -227,16 +227,16 @@ activate(GtkApplication *app, gpointer user_data)
   gworld_scene_node_set_orientation_ned(GWORLD_SCENE_NODE(cube), 35.0, 0.0, 12.0);
 
   GWorldSceneSphereNode *sphere = gworld_scene_view_add_sphere(GWORLD_SCENE_VIEW(view),
-                                                               -35.0060,
-                                                               147.4720,
-                                                               820.0,
+                                                               -16.8780,
+                                                               145.7200,
+                                                               450.0,
                                                                360.0);
   gworld_scene_node_set_color(GWORLD_SCENE_NODE(sphere), 0.18, 0.55, 0.95);
 
   GWorldSceneCylinderNode *cylinder = gworld_scene_view_add_cylinder(GWORLD_SCENE_VIEW(view),
-                                                                     -34.9980,
-                                                                     147.4560,
-                                                                     760.0,
+                                                                     -16.9040,
+                                                                     145.6880,
+                                                                     420.0,
                                                                      320.0,
                                                                      700.0);
   gworld_scene_node_set_color(GWORLD_SCENE_NODE(cylinder), 0.40, 0.78, 0.30);
@@ -246,25 +246,25 @@ activate(GtkApplication *app, gpointer user_data)
   gworld_scene_polyline_node_set_width(route, 35.0);
   gworld_scene_polyline_node_set_opacity(route, 0.92);
   gworld_scene_polyline_node_set_altitude_mode(route, GWORLD_SCENE_ALTITUDE_AGL);
-  gworld_scene_polyline_node_append_point(route, -35.0105, 147.4480, 90.0);
-  gworld_scene_polyline_node_append_point(route, -35.0060, 147.4575, 120.0);
-  gworld_scene_polyline_node_append_point(route, -35.0010, 147.4665, 140.0);
-  gworld_scene_polyline_node_append_point(route, -34.9960, 147.4785, 110.0);
+  gworld_scene_polyline_node_append_point(route, -16.8290, 145.6460, 90.0);
+  gworld_scene_polyline_node_append_point(route, -16.8500, 145.6755, 120.0);
+  gworld_scene_polyline_node_append_point(route, -16.8800, 145.7170, 90.0);
+  gworld_scene_polyline_node_append_point(route, -16.9190, 145.7780, 60.0);
 
   GWorldScenePolygonNode *zone = gworld_scene_view_add_polygon(GWORLD_SCENE_VIEW(view));
   gworld_scene_polygon_node_set_altitude_mode(zone, GWORLD_SCENE_ALTITUDE_AGL);
   gworld_scene_polygon_node_set_fill_color(zone, 0.05, 0.48, 0.95, 0.24);
   gworld_scene_polygon_node_set_outline_color(zone, 0.10, 0.75, 1.0, 0.9);
   gworld_scene_polygon_node_set_outline_width(zone, 22.0);
-  gworld_scene_polygon_node_append_point(zone, -35.0100, 147.4700, 18.0);
-  gworld_scene_polygon_node_append_point(zone, -35.0040, 147.4820, 18.0);
-  gworld_scene_polygon_node_append_point(zone, -35.0140, 147.4910, 18.0);
-  gworld_scene_polygon_node_append_point(zone, -35.0200, 147.4770, 18.0);
+  gworld_scene_polygon_node_append_point(zone, -16.8650, 145.6795, 1.5);
+  gworld_scene_polygon_node_append_point(zone, -16.8505, 145.7040, 1.5);
+  gworld_scene_polygon_node_append_point(zone, -16.8845, 145.7310, 1.5);
+  gworld_scene_polygon_node_append_point(zone, -16.9060, 145.6950, 1.5);
 
   GWorldSceneCircleNode *bubble = gworld_scene_view_add_circle(GWORLD_SCENE_VIEW(view),
-                                                               -34.9908,
-                                                               147.4620,
-                                                               15.0,
+                                                               -16.8280,
+                                                               145.6530,
+                                                               1.5,
                                                                850.0);
   gworld_scene_circle_node_set_altitude_mode(bubble, GWORLD_SCENE_ALTITUDE_AGL);
   gworld_scene_circle_node_set_fill_color(bubble, 0.18, 0.85, 0.42, 0.18);
@@ -274,8 +274,8 @@ activate(GtkApplication *app, gpointer user_data)
 
   GWorldSceneTextLabelNode *label = gworld_scene_view_add_text_label(GWORLD_SCENE_VIEW(view),
                                                                      "Training zone",
-                                                                     -34.9908,
-                                                                     147.4620,
+                                                                     -16.8280,
+                                                                     145.6530,
                                                                      220.0);
   gworld_scene_text_label_node_set_altitude_mode(label, GWORLD_SCENE_ALTITUDE_AGL);
   gworld_scene_text_label_node_set_font(label, "Sans Bold 22");
@@ -289,9 +289,9 @@ activate(GtkApplication *app, gpointer user_data)
     GWorldSceneBillboardNode *billboard =
       gworld_scene_view_add_billboard(GWORLD_SCENE_VIEW(view),
                                       billboard_path,
-                                      -34.9924,
-                                      147.4748,
-                                      1800.0);
+                                      -16.8840,
+                                      145.7510,
+                                      500.0);
     gworld_scene_billboard_node_set_altitude_mode(billboard, GWORLD_SCENE_ALTITUDE_AGL);
     gworld_scene_billboard_node_set_size_limits(billboard, 48.0, 180.0);
     gworld_scene_billboard_node_set_reference_size(billboard, 140.0, 5000.0);
@@ -306,14 +306,14 @@ activate(GtkApplication *app, gpointer user_data)
     GWorldSceneGroundOverlayNode *ground_overlay =
       gworld_scene_view_add_ground_overlay(GWORLD_SCENE_VIEW(view),
                                            overlay_path,
-                                           -34.9962,
-                                           147.4660,
-                                           -34.9962,
-                                           147.4729,
-                                           -34.9998,
-                                           147.4729,
-                                           -34.9998,
-                                           147.4660);
+                                           -16.8890,
+                                           145.7460,
+                                           -16.8890,
+                                           145.7545,
+                                           -16.8950,
+                                           145.7545,
+                                           -16.8950,
+                                           145.7460);
     gworld_scene_ground_overlay_node_set_opacity(ground_overlay, 0.78);
     gworld_scene_ground_overlay_node_set_altitude_offset(ground_overlay, 1.4);
   } else {
@@ -325,9 +325,9 @@ activate(GtkApplication *app, gpointer user_data)
   if (model_path != NULL) {
     GWorldSceneModelNode *model = gworld_scene_view_add_model(GWORLD_SCENE_VIEW(view),
                                                               model_path,
-                                                              -35.0010,
-                                                              147.4585,
-                                                              1120.0);
+                                                              -16.8910,
+                                                              145.7040,
+                                                              650.0);
     gworld_scene_node_set_scale(GWORLD_SCENE_NODE(model), 12000.0, 12000.0, 12000.0);
     gworld_scene_node_set_color(GWORLD_SCENE_NODE(model), 1.0, 1.0, 1.0);
     gworld_scene_node_set_orientation_ned(GWORLD_SCENE_NODE(model), 120.0, 0.0, 0.0);
