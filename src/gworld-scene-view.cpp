@@ -8,7 +8,9 @@
 #include "gworld-scene-light-private.h"
 #include "gworld-scene-lod-private.h"
 #include "gworld-scene-node-private.h"
+#include "gworld-scene-picking-private.h"
 #include "gworld-scene-view-private.h"
+#include "gworld-scene-view-shaders-private.h"
 
 #include <assimp/Importer.hpp>
 #include <assimp/material.h>
@@ -58,8 +60,6 @@ constexpr int kMaxPendingTextureDownloads = 48;
 constexpr gint64 kTextureAtlasRefreshMinIntervalUs = 650 * 1000;
 constexpr gint64 kTerrainRetryBaseDelayUs = 5 * G_USEC_PER_SEC;
 constexpr gint64 kTerrainRetryMaxDelayUs = 120 * G_USEC_PER_SEC;
-constexpr double kMinCameraPitchDeg = -89.0;
-constexpr double kMaxCameraPitchDeg = 89.0;
 constexpr double kGlobeRenderAltitudeM = 45000.0;
 constexpr double kTerrainDisableAltitudeM = 180000.0;
 constexpr int kShadowMapSize = 2048;
@@ -216,14 +216,6 @@ struct GroundOverlayVertex {
   double height_amsl = 0.0;
   double u = 0.0;
   double v = 0.0;
-};
-
-struct ScenePickRay {
-  glm::dvec3 origin;
-  glm::dvec3 direction;
-  glm::dmat4 mvp = glm::dmat4(1.0);
-  int viewport_width = 1;
-  int viewport_height = 1;
 };
 
 struct ScenePickResult {
@@ -1333,49 +1325,12 @@ sun_scene_direction_from_enu(const glm::dvec3 &enu)
                    static_cast<float>(scene.z));
 }
 
-double
-normalize_degrees(double degrees)
+gworld_scene::CameraMode
+view_camera_mode(GWorldSceneCameraMode camera_mode)
 {
-  double normalized = std::fmod(degrees, 360.0);
-  if (normalized < 0.0)
-    normalized += 360.0;
-  return normalized;
-}
-
-double
-rad_to_deg(double radians)
-{
-  return radians * 180.0 / kPi;
-}
-
-gworld_scene::CameraPose
-camera_pose_for_mode(GWorldSceneCameraMode camera_mode,
-                     double latitude,
-                     double longitude,
-                     double altitude_amsl,
-                     double heading_deg,
-                     double pitch_deg,
-                     double origin_latitude,
-                     double origin_longitude)
-{
-  const double pitch = std::clamp(pitch_deg, kMinCameraPitchDeg, kMaxCameraPitchDeg);
-  if (camera_mode == GWORLD_SCENE_CAMERA_MODE_FREE) {
-    return gworld_scene::local_camera_pose(latitude,
-                                           longitude,
-                                           altitude_amsl,
-                                           heading_deg,
-                                           pitch,
-                                           origin_latitude,
-                                           origin_longitude);
-  }
-
-  return gworld_scene::blended_camera_pose(latitude,
-                                           longitude,
-                                           altitude_amsl,
-                                           heading_deg,
-                                           pitch,
-                                           origin_latitude,
-                                           origin_longitude);
+  return camera_mode == GWORLD_SCENE_CAMERA_MODE_FREE
+           ? gworld_scene::CameraMode::Free
+           : gworld_scene::CameraMode::Default;
 }
 
 void
@@ -1392,32 +1347,8 @@ set_camera_position_locked(GWorldSceneViewState *state,
 void
 set_camera_orientation_locked(GWorldSceneViewState *state, double heading_deg, double pitch_deg)
 {
-  state->heading_deg = normalize_degrees(heading_deg);
-  state->pitch_deg = std::clamp(pitch_deg, kMinCameraPitchDeg, kMaxCameraPitchDeg);
-}
-
-void
-look_at_scene_position_locked(GWorldSceneViewState *state, const glm::dvec3 &target)
-{
-  const gworld_scene::LocalFrame frame =
-    gworld_scene::local_frame_at(state->latitude,
-                                 state->longitude,
-                                 state->mesh_origin_latitude,
-                                 state->mesh_origin_longitude);
-  const glm::dvec3 eye =
-    geodetic_to_enu(state->latitude,
-                    state->longitude,
-                    state->altitude_amsl,
-                    state->mesh_origin_latitude,
-                    state->mesh_origin_longitude,
-                    0.0);
-  const glm::dvec3 direction = safe_normalize(target - eye, frame.north);
-  const double east = glm::dot(direction, frame.east);
-  const double north = glm::dot(direction, frame.north);
-  const double up = std::clamp(glm::dot(direction, frame.up), -1.0, 1.0);
-  const double heading = rad_to_deg(std::atan2(east, north));
-  const double pitch = rad_to_deg(std::asin(up));
-  set_camera_orientation_locked(state, heading, pitch);
+  state->heading_deg = gworld_scene::normalize_heading_degrees(heading_deg);
+  state->pitch_deg = gworld_scene::clamp_camera_pitch(pitch_deg);
 }
 
 void
@@ -1426,14 +1357,16 @@ look_at_location_locked(GWorldSceneViewState *state,
                         double longitude,
                         double altitude_amsl)
 {
-  const glm::dvec3 target =
-    geodetic_to_enu(latitude,
-                    longitude,
-                    altitude_amsl,
-                    state->mesh_origin_latitude,
-                    state->mesh_origin_longitude,
-                    0.0);
-  look_at_scene_position_locked(state, target);
+  const gworld_scene::CameraOrientation orientation =
+    gworld_scene::camera_orientation_for_geodetic_target(state->latitude,
+                                                         state->longitude,
+                                                         state->altitude_amsl,
+                                                         latitude,
+                                                         longitude,
+                                                         altitude_amsl,
+                                                         state->mesh_origin_latitude,
+                                                         state->mesh_origin_longitude);
+  set_camera_orientation_locked(state, orientation.heading_deg, orientation.pitch_deg);
 }
 
 double
@@ -2276,7 +2209,7 @@ make_pick_ray_locked(GWorldSceneViewState *state,
                      GtkWidget *widget,
                      double widget_x,
                      double widget_y,
-                     ScenePickRay &ray)
+                     gworld_scene::PickRay &ray)
 {
   const int width = std::max(1, gtk_widget_get_width(widget));
   const int height = std::max(1, gtk_widget_get_height(widget));
@@ -2295,98 +2228,21 @@ make_pick_ray_locked(GWorldSceneViewState *state,
                      near_plane,
                      far_plane_m);
   const gworld_scene::CameraPose camera_pose =
-    camera_pose_for_mode(state->camera_mode,
-                         state->latitude,
-                         state->longitude,
-                         altitude,
-                         state->heading_deg,
-                         state->pitch_deg,
-                         state->mesh_origin_latitude,
-                         state->mesh_origin_longitude);
-  const glm::dmat4 view = glm::lookAt(camera_pose.eye, camera_pose.center, camera_pose.up);
-  const glm::dmat4 inverse_mvp = glm::inverse(projection * view);
-
-  const double ndc_x = (widget_x / static_cast<double>(width)) * 2.0 - 1.0;
-  const double ndc_y = 1.0 - (widget_y / static_cast<double>(height)) * 2.0;
-  glm::dvec4 near_world = inverse_mvp * glm::dvec4(ndc_x, ndc_y, -1.0, 1.0);
-  glm::dvec4 far_world = inverse_mvp * glm::dvec4(ndc_x, ndc_y, 1.0, 1.0);
-  if (std::abs(near_world.w) < 1e-12 || std::abs(far_world.w) < 1e-12)
-    return false;
-
-  near_world /= near_world.w;
-  far_world /= far_world.w;
-  const glm::dvec3 direction = glm::dvec3(far_world) - glm::dvec3(near_world);
-  if (glm::length(direction) <= 0.000001)
-    return false;
-
-  ray.origin = camera_pose.eye;
-  ray.direction = glm::normalize(direction);
-  ray.mvp = projection * view;
-  ray.viewport_width = width;
-  ray.viewport_height = height;
-  return true;
-}
-
-bool
-ray_intersects_triangle(const ScenePickRay &ray,
-                        const glm::dvec3 &p0,
-                        const glm::dvec3 &p1,
-                        const glm::dvec3 &p2,
-                        double &distance)
-{
-  constexpr double epsilon = 1e-7;
-  const glm::dvec3 edge1 = p1 - p0;
-  const glm::dvec3 edge2 = p2 - p0;
-  const glm::dvec3 h = glm::cross(ray.direction, edge2);
-  const double a = glm::dot(edge1, h);
-  if (std::abs(a) < epsilon)
-    return false;
-
-  const double f = 1.0 / a;
-  const glm::dvec3 s = ray.origin - p0;
-  const double u = f * glm::dot(s, h);
-  if (u < 0.0 || u > 1.0)
-    return false;
-
-  const glm::dvec3 q = glm::cross(s, edge1);
-  const double v = f * glm::dot(ray.direction, q);
-  if (v < 0.0 || u + v > 1.0)
-    return false;
-
-  const double t = f * glm::dot(edge2, q);
-  if (t <= epsilon)
-    return false;
-
-  distance = t;
-  return true;
-}
-
-bool
-ray_intersects_sphere(const ScenePickRay &ray,
-                      const glm::dvec3 &center,
-                      double radius,
-                      double &distance)
-{
-  radius = std::max(radius, 0.1);
-  const glm::dvec3 oc = ray.origin - center;
-  const double b = glm::dot(oc, ray.direction);
-  const double c = glm::dot(oc, oc) - radius * radius;
-  const double discriminant = b * b - c;
-  if (discriminant < 0.0)
-    return false;
-
-  const double root = std::sqrt(discriminant);
-  const double t0 = -b - root;
-  const double t1 = -b + root;
-  if (t0 > 0.0) {
-    distance = t0;
-    return true;
-  }
-  if (t1 > 0.0) {
-    distance = t1;
-    return true;
-  }
-  return false;
+    gworld_scene::camera_pose_for_mode(view_camera_mode(state->camera_mode),
+                                       state->latitude,
+                                       state->longitude,
+                                       altitude,
+                                       state->heading_deg,
+                                       state->pitch_deg,
+                                       state->mesh_origin_latitude,
+                                       state->mesh_origin_longitude);
+  return gworld_scene::pick_ray_from_widget_point(width,
+                                                  height,
+                                                  widget_x,
+                                                  widget_y,
+                                                  projection,
+                                                  camera_pose,
+                                                  ray);
 }
 
 glm::dvec3
@@ -2438,27 +2294,6 @@ fill_pick_location_from_scene_position_locked(GWorldSceneViewState *state,
     result.altitude_amsl = terrain_height;
   else
     result.altitude_amsl = position.y;
-}
-
-bool
-project_scene_point_to_widget(const ScenePickRay &ray,
-                              const glm::dvec3 &point,
-                              double &x,
-                              double &y,
-                              double &depth)
-{
-  const glm::dvec4 clip = ray.mvp * glm::dvec4(point, 1.0);
-  if (std::abs(clip.w) < 1e-12)
-    return false;
-
-  const glm::dvec3 ndc = glm::dvec3(clip) / clip.w;
-  if (ndc.z < -1.0 || ndc.z > 1.0)
-    return false;
-
-  x = (ndc.x * 0.5 + 0.5) * static_cast<double>(ray.viewport_width);
-  y = (1.0 - (ndc.y * 0.5 + 0.5)) * static_cast<double>(ray.viewport_height);
-  depth = ndc.z;
-  return true;
 }
 
 bool
@@ -2541,7 +2376,7 @@ try_update_pick(ScenePickResult &best,
 bool
 pick_billboard_node_locked(GWorldSceneViewState *state,
                            GWorldSceneNode *scene_node,
-                           const ScenePickRay &ray,
+                           const gworld_scene::PickRay &ray,
                            double widget_x,
                            double widget_y,
                            ScenePickResult &best)
@@ -2575,7 +2410,7 @@ pick_billboard_node_locked(GWorldSceneViewState *state,
   double center_x = 0.0;
   double center_y = 0.0;
   double depth = 0.0;
-  if (!project_scene_point_to_widget(ray, center, center_x, center_y, depth))
+  if (!gworld_scene::project_scene_point_to_widget(ray, center, center_x, center_y, depth))
     return false;
 
   double min_px = 0.0;
@@ -2610,7 +2445,7 @@ bool
 pick_model_node_locked(GWorldSceneViewState *state,
                        GWorldSceneNode *scene_node,
                        const SceneNode &node,
-                       const ScenePickRay &ray,
+                       const gworld_scene::PickRay &ray,
                        ScenePickResult &best)
 {
   if (node.model_path.empty())
@@ -2648,7 +2483,7 @@ pick_model_node_locked(GWorldSceneViewState *state,
     const glm::dvec3 p1 = transform_model_vertex(i1);
     const glm::dvec3 p2 = transform_model_vertex(i2);
     double distance = 0.0;
-    if (!ray_intersects_triangle(ray, p0, p1, p2, distance) || distance >= best_distance)
+    if (!gworld_scene::ray_intersects_triangle(ray, p0, p1, p2, distance) || distance >= best_distance)
       continue;
 
     best_distance = distance;
@@ -2674,7 +2509,7 @@ bool
 pick_bounded_node_locked(GWorldSceneViewState *state,
                          GWorldSceneNode *scene_node,
                          const SceneNode &node,
-                         const ScenePickRay &ray,
+                         const gworld_scene::PickRay &ray,
                          ScenePickResult &best)
 {
   const glm::dvec3 center = geodetic_to_enu(node.latitude,
@@ -2684,7 +2519,7 @@ pick_bounded_node_locked(GWorldSceneViewState *state,
                                             state->mesh_origin_longitude,
                                             0.0);
   double distance = 0.0;
-  if (!ray_intersects_sphere(ray, center, scene_node_bounding_radius(node), distance))
+  if (!gworld_scene::ray_intersects_sphere(ray, center, scene_node_bounding_radius(node), distance))
     return false;
 
   const glm::dvec3 position = ray.origin + ray.direction * distance;
@@ -2701,7 +2536,7 @@ pick_bounded_node_locked(GWorldSceneViewState *state,
 
 bool
 pick_terrain_locked(GWorldSceneViewState *state,
-                    const ScenePickRay &ray,
+                    const gworld_scene::PickRay &ray,
                     ScenePickResult &terrain_pick)
 {
   bool hit = false;
@@ -2724,7 +2559,7 @@ pick_terrain_locked(GWorldSceneViewState *state,
     const glm::dvec3 p1 = mesh_vertex_position(state->vertices, i1);
     const glm::dvec3 p2 = mesh_vertex_position(state->vertices, i2);
     double distance = 0.0;
-    if (!ray_intersects_triangle(ray, p0, p1, p2, distance) || distance >= best_distance)
+    if (!gworld_scene::ray_intersects_triangle(ray, p0, p1, p2, distance) || distance >= best_distance)
       continue;
 
     best_distance = distance;
@@ -2799,7 +2634,7 @@ pick_scene_locked(GWorldSceneViewState *state,
                   double widget_y,
                   ScenePickResult &best)
 {
-  ScenePickRay ray;
+  gworld_scene::PickRay ray;
   if (!make_pick_ray_locked(state, widget, widget_x, widget_y, ray))
     return false;
 
@@ -4087,542 +3922,11 @@ rebuild_world_mesh(GWorldSceneViewState *state,
   return true;
 }
 
-GLuint
-compile_shader(GLenum type, const char *source)
-{
-  GLuint shader = glCreateShader(type);
-  glShaderSource(shader, 1, &source, nullptr);
-  glCompileShader(shader);
-
-  GLint ok = GL_FALSE;
-  glGetShaderiv(shader, GL_COMPILE_STATUS, &ok);
-  if (ok != GL_TRUE) {
-    char log[1024] = {0};
-    glGetShaderInfoLog(shader, sizeof log, nullptr, log);
-    g_warning("Shader compile failed: %s", log);
-    glDeleteShader(shader);
-    return 0;
-  }
-
-  return shader;
-}
-
-GLuint
-create_program()
-{
-	static const char *vertex_source = R"GLSL(
-	#version 330 core
-	layout(location = 0) in vec3 position;
-	layout(location = 1) in vec2 detail_texcoord;
-	layout(location = 2) in vec2 mid_texcoord;
-	layout(location = 3) in vec2 base_texcoord;
-	layout(location = 4) in vec2 ultra_texcoord;
-	layout(location = 5) in vec3 normal;
-	layout(location = 6) in vec3 vertex_color;
-	layout(location = 7) in float material;
-	uniform mat4 mvp;
-	uniform mat4 light_mvp;
-	uniform bool ultra_atlas_valid;
-	uniform vec4 ultra_atlas_range;
-	uniform vec2 ultra_atlas_size;
-	uniform bool detail_atlas_valid;
-	uniform vec4 detail_atlas_range;
-	uniform vec2 detail_atlas_size;
-	uniform bool mid_atlas_valid;
-	uniform vec4 mid_atlas_range;
-	uniform vec2 mid_atlas_size;
-	uniform bool base_atlas_valid;
-	uniform vec4 base_atlas_range;
-	uniform vec2 base_atlas_size;
-	uniform bool globe_atlas_valid;
-	uniform vec4 globe_atlas_range;
-	uniform vec2 globe_atlas_size;
-	out vec2 v_detail_texcoord;
-	out vec2 v_mid_texcoord;
-	out vec2 v_base_texcoord;
-	out vec2 v_ultra_texcoord;
-	out vec3 v_normal;
-out vec3 v_color;
-out float v_material;
-out float v_height;
-out vec3 v_world_position;
-out vec4 v_light_position;
-
-const float MERCATOR_MAX_LATITUDE = 85.05112878;
-const float PI = 3.14159265358979323846;
-
-vec2 atlas_uv_for_lat_lon(vec2 lat_lon, vec4 range, vec2 size) {
-  if (size.x <= 0.0 || size.y <= 0.0)
-    return vec2(-1.0, -1.0);
-
-  float n = exp2(range.x);
-  float latitude = clamp(lat_lon.x, -MERCATOR_MAX_LATITUDE, MERCATOR_MAX_LATITUDE);
-  float lat_rad = radians(latitude);
-  float tile_x = (lat_lon.y + 180.0) / 360.0 * n;
-  float tile_y = (1.0 - log(tan(PI * 0.25 + lat_rad * 0.5)) / PI) * 0.5 * n;
-  return vec2((tile_x - range.y) / size.x,
-              (tile_y - range.z) / size.y);
-}
-
-void main() {
-  vec4 world_position = vec4(position, 1.0);
-  gl_Position = mvp * world_position;
-  bool is_terrain = material < 0.5;
-  bool is_globe = material > 1.5 && material < 2.5;
-  if (is_terrain) {
-    vec2 lat_lon = detail_texcoord;
-    v_detail_texcoord = detail_atlas_valid ? atlas_uv_for_lat_lon(lat_lon, detail_atlas_range, detail_atlas_size) : vec2(-1.0, -1.0);
-    v_mid_texcoord = mid_atlas_valid ? atlas_uv_for_lat_lon(lat_lon, mid_atlas_range, mid_atlas_size) : vec2(-1.0, -1.0);
-    v_base_texcoord = base_atlas_valid ? atlas_uv_for_lat_lon(lat_lon, base_atlas_range, base_atlas_size) : vec2(-1.0, -1.0);
-    v_ultra_texcoord = ultra_atlas_valid ? atlas_uv_for_lat_lon(lat_lon, ultra_atlas_range, ultra_atlas_size) : vec2(-1.0, -1.0);
-  } else if (is_globe) {
-    vec2 lat_lon = detail_texcoord;
-    v_detail_texcoord = vec2(-1.0, -1.0);
-    v_mid_texcoord = vec2(-1.0, -1.0);
-    v_base_texcoord = globe_atlas_valid ? atlas_uv_for_lat_lon(lat_lon, globe_atlas_range, globe_atlas_size) : vec2(-1.0, -1.0);
-    v_ultra_texcoord = vec2(-1.0, -1.0);
-  } else {
-    v_detail_texcoord = detail_texcoord;
-    v_mid_texcoord = mid_texcoord;
-    v_base_texcoord = base_texcoord;
-    v_ultra_texcoord = ultra_texcoord;
-  }
-	  v_normal = normal;
-  v_color = vertex_color;
-  v_material = material;
-  v_height = position.y;
-  v_world_position = position;
-  v_light_position = light_mvp * world_position;
-}
-)GLSL";
-
-  static const char *fragment_source = R"GLSL(
-#version 330 core
-	in vec2 v_detail_texcoord;
-	in vec2 v_mid_texcoord;
-	in vec2 v_base_texcoord;
-	in vec2 v_ultra_texcoord;
-in vec3 v_normal;
-in vec3 v_color;
-in float v_material;
-in float v_height;
-in vec3 v_world_position;
-in vec4 v_light_position;
-	uniform sampler2D ultra_texture;
-	uniform sampler2D detail_texture;
-uniform sampler2D mid_texture;
-uniform sampler2D base_texture;
-uniform sampler2D shadow_texture;
-uniform sampler2D model_texture;
-	uniform bool has_ultra_texture;
-	uniform bool has_detail_texture;
-uniform bool has_mid_texture;
-uniform bool has_base_texture;
-uniform bool has_shadow_texture;
-uniform bool has_model_texture;
-uniform vec3 sun_direction;
-uniform vec3 ambient_color;
-uniform vec3 direct_light_color;
-uniform float ambient_strength;
-uniform float sun_strength;
-		uniform vec3 camera_position;
-		uniform vec3 ultra_texture_center;
-		uniform float ultra_texture_radius;
-	uniform bool fog_enabled;
-uniform vec3 fog_color;
-uniform float fog_start;
-uniform float fog_end;
-uniform float fog_density;
-uniform float terrain_normal_smoothing;
-out vec4 color;
-
-vec3 lighting_normal() {
-  vec3 normal = normalize(v_normal);
-  if (v_material < 0.5 && terrain_normal_smoothing > 0.0) {
-    vec3 local_up = vec3(0.0, 1.0, 0.0);
-    float slope = 1.0 - clamp(abs(dot(normal, local_up)), 0.0, 1.0);
-    float smoothing = clamp(terrain_normal_smoothing * (1.0 - slope * 0.28), 0.0, 1.0);
-    normal = normalize(mix(normal, local_up, smoothing));
-  }
-  return normal;
-}
-
-float shadow_visibility(vec3 normal) {
-  if (!has_shadow_texture || (v_material > 1.5 && v_material < 2.5))
-    return 1.0;
-
-  vec3 projected = v_light_position.xyz / v_light_position.w;
-  projected = projected * 0.5 + 0.5;
-  if (projected.z > 1.0 ||
-      projected.x < 0.0 || projected.x > 1.0 ||
-      projected.y < 0.0 || projected.y > 1.0)
-    return 1.0;
-
-  vec2 texel_size = 1.0 / vec2(textureSize(shadow_texture, 0));
-  float bias = max(0.0012 * (1.0 - dot(normal, sun_direction)), 0.00035);
-  float lit = 0.0;
-  for (int y = -1; y <= 1; ++y) {
-    for (int x = -1; x <= 1; ++x) {
-      float depth = texture(shadow_texture, projected.xy + vec2(x, y) * texel_size).r;
-      lit += projected.z - bias <= depth ? 1.0 : 0.0;
-    }
-  }
-
-  return mix(0.42, 1.0, lit / 9.0);
-}
-
-float fog_amount() {
-  if (!fog_enabled)
-    return 0.0;
-
-  float distance_to_camera = length(v_world_position - camera_position);
-  float range = max(fog_end - fog_start, 1.0);
-  float linear_fog = clamp((distance_to_camera - fog_start) / range, 0.0, 1.0);
-  float density_fog = 1.0 - exp(-distance_to_camera * max(fog_density, 0.0));
-  return clamp(max(linear_fog, density_fog), 0.0, 1.0);
-}
-
-void main() {
-  vec3 normal = lighting_normal();
-  float diffuse = clamp(dot(normal, normalize(sun_direction)), 0.0, 1.0);
-  float visibility = shadow_visibility(normal);
-  vec3 light = ambient_color * ambient_strength +
-               direct_light_color * diffuse * sun_strength * visibility;
-  vec3 low = vec3(0.26, 0.36, 0.24);
-  vec3 high = vec3(0.76, 0.72, 0.62);
-  vec3 terrain_tint = mix(low, high, clamp(v_height / 1800.0, 0.0, 1.0));
-	  bool in_detail = v_detail_texcoord.x >= 0.0 && v_detail_texcoord.x <= 1.0 && v_detail_texcoord.y >= 0.0 && v_detail_texcoord.y <= 1.0;
-	  bool in_mid = v_mid_texcoord.x >= 0.0 && v_mid_texcoord.x <= 1.0 && v_mid_texcoord.y >= 0.0 && v_mid_texcoord.y <= 1.0;
-	  bool in_base = v_base_texcoord.x >= 0.0 && v_base_texcoord.x <= 1.0 && v_base_texcoord.y >= 0.0 && v_base_texcoord.y <= 1.0;
-	  bool in_ultra = v_ultra_texcoord.x >= 0.0 && v_ultra_texcoord.x <= 1.0 && v_ultra_texcoord.y >= 0.0 && v_ultra_texcoord.y <= 1.0;
-	  vec4 base_texel = (has_base_texture && in_base) ? texture(base_texture, v_base_texcoord) : vec4(0.0);
-	  vec4 mid_texel = (has_mid_texture && in_mid) ? texture(mid_texture, v_mid_texcoord) : vec4(0.0);
-	  vec4 detail_texel = (has_detail_texture && in_detail) ? texture(detail_texture, v_detail_texcoord) : vec4(0.0);
-	  vec4 ultra_texel = (has_ultra_texture && in_ultra) ? texture(ultra_texture, v_ultra_texcoord) : vec4(0.0);
-	  vec4 texture_stack = detail_texel.a > 0.01 ? detail_texel : (mid_texel.a > 0.01 ? mid_texel : base_texel);
-		  float ultra_lateral_distance = length((v_world_position - ultra_texture_center).xz);
-	  float ultra_radius = max(ultra_texture_radius, 1.0);
-	  float ultra_fade_width = clamp(ultra_radius * 0.22, 80.0, 220.0);
-	  float ultra_blend = 1.0 - smoothstep(max(0.0, ultra_radius - ultra_fade_width),
-	                                      ultra_radius,
-	                                      ultra_lateral_distance);
-	  ultra_blend *= ultra_texel.a > 0.01 ? 1.0 : 0.0;
-	  vec4 texel = (has_ultra_texture && ultra_texture_radius > 1.0)
-	                 ? mix(texture_stack, ultra_texel, ultra_blend)
-	                 : texture_stack;
-  vec3 terrain_base = mix(terrain_tint, texel.rgb, texel.a * 0.88);
-  vec3 globe_base = texel.a > 0.01 ? texel.rgb : v_color;
-  bool is_globe = v_material > 1.5 && v_material < 2.5;
-  bool is_textured_model = v_material > 2.5;
-  vec4 model_texel = (has_model_texture && is_textured_model) ? texture(model_texture, v_detail_texcoord) : vec4(0.0);
-  vec3 object_base = (is_textured_model && model_texel.a > 0.01)
-                       ? mix(v_color, model_texel.rgb * v_color, model_texel.a)
-                       : v_color;
-  vec3 base = is_globe ? globe_base : (v_material > 0.5 ? object_base : terrain_base);
-  vec3 lit_color = base * clamp(light, vec3(0.0), vec3(1.45));
-  color = vec4(mix(lit_color, fog_color, fog_amount()), 1.0);
-}
-)GLSL";
-
-  GLuint vertex = compile_shader(GL_VERTEX_SHADER, vertex_source);
-  GLuint fragment = compile_shader(GL_FRAGMENT_SHADER, fragment_source);
-  if (vertex == 0 || fragment == 0) {
-    if (vertex)
-      glDeleteShader(vertex);
-    if (fragment)
-      glDeleteShader(fragment);
-    return 0;
-  }
-
-  GLuint program = glCreateProgram();
-  glAttachShader(program, vertex);
-  glAttachShader(program, fragment);
-  glLinkProgram(program);
-  glDeleteShader(vertex);
-  glDeleteShader(fragment);
-
-  GLint ok = GL_FALSE;
-  glGetProgramiv(program, GL_LINK_STATUS, &ok);
-  if (ok != GL_TRUE) {
-    char log[1024] = {0};
-    glGetProgramInfoLog(program, sizeof log, nullptr, log);
-    g_warning("Program link failed: %s", log);
-    glDeleteProgram(program);
-    return 0;
-  }
-
-  return program;
-}
-
-GLuint
-create_shadow_program()
-{
-  static const char *vertex_source = R"GLSL(
-#version 330 core
-layout(location = 0) in vec3 position;
-uniform mat4 light_mvp;
-void main() {
-  gl_Position = light_mvp * vec4(position, 1.0);
-}
-)GLSL";
-
-  static const char *fragment_source = R"GLSL(
-#version 330 core
-void main() {
-}
-)GLSL";
-
-  GLuint vertex = compile_shader(GL_VERTEX_SHADER, vertex_source);
-  GLuint fragment = compile_shader(GL_FRAGMENT_SHADER, fragment_source);
-  if (vertex == 0 || fragment == 0) {
-    if (vertex)
-      glDeleteShader(vertex);
-    if (fragment)
-      glDeleteShader(fragment);
-    return 0;
-  }
-
-  GLuint program = glCreateProgram();
-  glAttachShader(program, vertex);
-  glAttachShader(program, fragment);
-  glLinkProgram(program);
-  glDeleteShader(vertex);
-  glDeleteShader(fragment);
-
-  GLint ok = GL_FALSE;
-  glGetProgramiv(program, GL_LINK_STATUS, &ok);
-  if (ok != GL_TRUE) {
-    char log[1024] = {0};
-    glGetProgramInfoLog(program, sizeof log, nullptr, log);
-    g_warning("Shadow program link failed: %s", log);
-    glDeleteProgram(program);
-    return 0;
-  }
-
-  return program;
-}
-
-GLuint
-create_billboard_program()
-{
-  static const char *vertex_source = R"GLSL(
-#version 330 core
-layout(location = 0) in vec3 position;
-layout(location = 1) in vec2 texcoord;
-uniform mat4 mvp;
-out vec2 v_texcoord;
-void main() {
-  gl_Position = mvp * vec4(position, 1.0);
-  v_texcoord = texcoord;
-}
-)GLSL";
-
-  static const char *fragment_source = R"GLSL(
-#version 330 core
-in vec2 v_texcoord;
-uniform sampler2D billboard_texture;
-uniform float opacity;
-out vec4 color;
-void main() {
-  vec4 texel = texture(billboard_texture, v_texcoord);
-  texel.a *= opacity;
-  if (texel.a < 0.01)
-    discard;
-  color = texel;
-}
-)GLSL";
-
-  GLuint vertex = compile_shader(GL_VERTEX_SHADER, vertex_source);
-  GLuint fragment = compile_shader(GL_FRAGMENT_SHADER, fragment_source);
-  if (vertex == 0 || fragment == 0) {
-    if (vertex)
-      glDeleteShader(vertex);
-    if (fragment)
-      glDeleteShader(fragment);
-    return 0;
-  }
-
-  GLuint program = glCreateProgram();
-  glAttachShader(program, vertex);
-  glAttachShader(program, fragment);
-  glLinkProgram(program);
-  glDeleteShader(vertex);
-  glDeleteShader(fragment);
-
-  GLint ok = GL_FALSE;
-  glGetProgramiv(program, GL_LINK_STATUS, &ok);
-  if (ok != GL_TRUE) {
-    char log[1024] = {0};
-    glGetProgramInfoLog(program, sizeof log, nullptr, log);
-    g_warning("Billboard program link failed: %s", log);
-    glDeleteProgram(program);
-    return 0;
-  }
-
-  return program;
-}
-
-GLuint
-create_sun_program()
-{
-  static const char *vertex_source = R"GLSL(
-#version 330 core
-layout(location = 0) in vec2 position;
-layout(location = 1) in vec2 local_coord;
-out vec2 v_local_coord;
-void main() {
-  v_local_coord = local_coord;
-  gl_Position = vec4(position, 0.0, 1.0);
-}
-)GLSL";
-
-  static const char *fragment_source = R"GLSL(
-#version 330 core
-in vec2 v_local_coord;
-uniform vec3 sun_color;
-uniform float intensity;
-uniform float core_ratio;
-out vec4 color;
-void main() {
-  float distance_from_center = length(v_local_coord);
-  if (distance_from_center > 1.0)
-    discard;
-
-  float core = 1.0 - smoothstep(core_ratio * 0.78, core_ratio, distance_from_center);
-  float inner_glow = 1.0 - smoothstep(core_ratio, min(core_ratio * 2.4, 1.0), distance_from_center);
-  float halo = pow(clamp(1.0 - distance_from_center, 0.0, 1.0), 2.2);
-  float alpha = max(core, max(inner_glow * 0.42, halo * 0.28)) * intensity;
-  vec3 white_hot = vec3(1.0, 0.98, 0.86);
-  vec3 rgb = mix(sun_color, white_hot, clamp(core + inner_glow * 0.35, 0.0, 1.0));
-  color = vec4(rgb, alpha);
-}
-)GLSL";
-
-  GLuint vertex = compile_shader(GL_VERTEX_SHADER, vertex_source);
-  GLuint fragment = compile_shader(GL_FRAGMENT_SHADER, fragment_source);
-  if (vertex == 0 || fragment == 0) {
-    if (vertex)
-      glDeleteShader(vertex);
-    if (fragment)
-      glDeleteShader(fragment);
-    return 0;
-  }
-
-  GLuint program = glCreateProgram();
-  glAttachShader(program, vertex);
-  glAttachShader(program, fragment);
-  glLinkProgram(program);
-  glDeleteShader(vertex);
-  glDeleteShader(fragment);
-
-  GLint ok = GL_FALSE;
-  glGetProgramiv(program, GL_LINK_STATUS, &ok);
-  if (ok != GL_TRUE) {
-    char log[1024] = {0};
-    glGetProgramInfoLog(program, sizeof log, nullptr, log);
-    g_warning("Sun program link failed: %s", log);
-    glDeleteProgram(program);
-    return 0;
-  }
-
-  return program;
-}
-
-GLuint
-create_sky_program()
-{
-  static const char *vertex_source = R"GLSL(
-#version 330 core
-layout(location = 0) in vec2 position;
-out vec2 v_ndc;
-void main() {
-  v_ndc = position;
-  gl_Position = vec4(position, 0.0, 1.0);
-}
-)GLSL";
-
-  static const char *fragment_source = R"GLSL(
-#version 330 core
-in vec2 v_ndc;
-uniform mat4 inverse_mvp;
-uniform vec3 camera_position;
-uniform vec3 sun_direction;
-uniform vec3 day_horizon_color;
-uniform vec3 day_zenith_color;
-uniform vec3 twilight_color;
-uniform vec3 night_color;
-uniform float daylight;
-uniform float twilight;
-uniform float horizon_glow_strength;
-out vec4 color;
-
-void main() {
-  vec4 far_world = inverse_mvp * vec4(v_ndc, 1.0, 1.0);
-  far_world /= far_world.w;
-  vec3 ray = normalize(far_world.xyz - camera_position);
-  float up = ray.y;
-
-  float sky_mix = smoothstep(-0.04, 0.82, up);
-  vec3 day_sky = mix(day_horizon_color, day_zenith_color, sky_mix);
-  vec3 twilight_sky = mix(twilight_color, day_sky, clamp(daylight, 0.0, 1.0));
-  vec3 sky = mix(night_color, twilight_sky, clamp(daylight + twilight * 0.75, 0.0, 1.0));
-
-  vec2 ray_horizontal = ray.xz;
-  vec2 sun_horizontal = sun_direction.xz;
-  float ray_len = length(ray_horizontal);
-  float sun_len = length(sun_horizontal);
-  float azimuth_alignment = 0.0;
-  if (ray_len > 0.0001 && sun_len > 0.0001)
-    azimuth_alignment = clamp(dot(ray_horizontal / ray_len, sun_horizontal / sun_len), 0.0, 1.0);
-
-  float horizon_band = 1.0 - smoothstep(0.00, 0.20, abs(up));
-  float broad_lobe = pow(azimuth_alignment, 5.5);
-  float core_lobe = pow(azimuth_alignment, 22.0);
-  float glow = horizon_band * (broad_lobe * 0.45 + core_lobe * 0.75) * horizon_glow_strength;
-  vec3 amber = vec3(1.00, 0.35, 0.13);
-  vec3 rose = vec3(0.90, 0.18, 0.16);
-  vec3 glow_color = mix(amber, rose, clamp(twilight * 0.65, 0.0, 1.0));
-  sky = mix(sky, glow_color, clamp(glow, 0.0, 0.82));
-
-  color = vec4(sky, 1.0);
-}
-)GLSL";
-
-  GLuint vertex = compile_shader(GL_VERTEX_SHADER, vertex_source);
-  GLuint fragment = compile_shader(GL_FRAGMENT_SHADER, fragment_source);
-  if (vertex == 0 || fragment == 0) {
-    if (vertex)
-      glDeleteShader(vertex);
-    if (fragment)
-      glDeleteShader(fragment);
-    return 0;
-  }
-
-  GLuint program = glCreateProgram();
-  glAttachShader(program, vertex);
-  glAttachShader(program, fragment);
-  glLinkProgram(program);
-  glDeleteShader(vertex);
-  glDeleteShader(fragment);
-
-  GLint ok = GL_FALSE;
-  glGetProgramiv(program, GL_LINK_STATUS, &ok);
-  if (ok != GL_TRUE) {
-    char log[1024] = {0};
-    glGetProgramInfoLog(program, sizeof log, nullptr, log);
-    g_warning("Sky program link failed: %s", log);
-    glDeleteProgram(program);
-    return 0;
-  }
-
-  return program;
-}
-
 bool
 ensure_billboard_resources(GWorldSceneViewState *state)
 {
   if (state->billboard_program == 0)
-    state->billboard_program = create_billboard_program();
+    state->billboard_program = gworld_scene_view_create_billboard_program();
   if (state->billboard_program == 0)
     return false;
 
@@ -4655,7 +3959,7 @@ bool
 ensure_sky_resources(GWorldSceneViewState *state)
 {
   if (state->sky_program == 0)
-    state->sky_program = create_sky_program();
+    state->sky_program = gworld_scene_view_create_sky_program();
   if (state->sky_program == 0)
     return false;
 
@@ -4690,7 +3994,7 @@ bool
 ensure_sun_resources(GWorldSceneViewState *state)
 {
   if (state->sun_program == 0)
-    state->sun_program = create_sun_program();
+    state->sun_program = gworld_scene_view_create_sun_program();
   if (state->sun_program == 0)
     return false;
 
@@ -4723,7 +4027,7 @@ bool
 ensure_ground_overlay_resources(GWorldSceneViewState *state)
 {
   if (state->billboard_program == 0)
-    state->billboard_program = create_billboard_program();
+    state->billboard_program = gworld_scene_view_create_billboard_program();
   if (state->billboard_program == 0)
     return false;
 
@@ -5138,7 +4442,7 @@ bool
 ensure_shadow_resources(GWorldSceneViewState *state)
 {
   if (state->shadow_program == 0)
-    state->shadow_program = create_shadow_program();
+    state->shadow_program = gworld_scene_view_create_shadow_program();
   if (state->shadow_program == 0)
     return false;
 
@@ -7490,7 +6794,7 @@ on_realize(GtkGLArea *area, gpointer user_data)
   if (gtk_gl_area_get_error(area) != nullptr)
     return;
 
-  state->program = create_program();
+  state->program = gworld_scene_view_create_program();
   schedule_scene_requests(self);
   gtk_widget_queue_draw(GTK_WIDGET(self));
 }
@@ -7519,7 +6823,7 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
   const gint64 frame_start_us = perf_now_us();
 
   if (state->program == 0)
-    state->program = create_program();
+    state->program = gworld_scene_view_create_program();
   if (state->program == 0)
     return TRUE;
 
@@ -7590,7 +6894,7 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
     longitude = state->longitude;
     altitude = std::max(25.0, state->altitude_amsl);
     heading = state->heading_deg;
-    pitch = std::clamp(state->pitch_deg, kMinCameraPitchDeg, kMaxCameraPitchDeg);
+    pitch = gworld_scene::clamp_camera_pitch(state->pitch_deg);
     radius_m = terrain_build_radius_for_altitude(state->altitude_amsl);
     mesh_origin_latitude = state->mesh_origin_latitude;
     mesh_origin_longitude = state->mesh_origin_longitude;
@@ -7705,14 +7009,14 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
     fog_enabled ? static_cast<float>(1.0 / std::max(fog_end * 2.8, 1.0)) : 0.0f;
 
   const gworld_scene::CameraPose camera_pose =
-    camera_pose_for_mode(camera_mode,
-                         latitude,
-                         longitude,
-                         altitude,
-                         heading,
-                         pitch,
-                         mesh_origin_latitude,
-                         mesh_origin_longitude);
+    gworld_scene::camera_pose_for_mode(view_camera_mode(camera_mode),
+                                       latitude,
+                                       longitude,
+                                       altitude,
+                                       heading,
+                                       pitch,
+                                       mesh_origin_latitude,
+                                       mesh_origin_longitude);
   const gworld_scene::LocalFrame camera_frame =
     gworld_scene::local_frame_at(latitude, longitude, mesh_origin_latitude, mesh_origin_longitude);
   const glm::vec3 ultra_texture_center = glm::vec3(camera_frame.origin);
@@ -7972,7 +7276,7 @@ rotate_camera_pixels(GWorldSceneView *self, double dx, double dy)
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     heading = state->heading_deg + dx * 0.18;
-    pitch = std::clamp(state->pitch_deg - dy * 0.14, kMinCameraPitchDeg, kMaxCameraPitchDeg);
+    pitch = gworld_scene::clamp_camera_pitch(state->pitch_deg - dy * 0.14);
   }
   gworld_scene_view_set_camera_orientation(self, heading, pitch);
 }
@@ -8148,16 +7452,12 @@ on_key_pressed(GtkEventControllerKey *controller,
   case GDK_KEY_Up:
     gworld_scene_view_set_camera_orientation(self,
                                             heading,
-                                            std::clamp(pitch - 4.0,
-                                                       kMinCameraPitchDeg,
-                                                       kMaxCameraPitchDeg));
+                                            gworld_scene::clamp_camera_pitch(pitch - 4.0));
     return TRUE;
   case GDK_KEY_Down:
     gworld_scene_view_set_camera_orientation(self,
                                             heading,
-                                            std::clamp(pitch + 4.0,
-                                                       kMinCameraPitchDeg,
-                                                       kMaxCameraPitchDeg));
+                                            gworld_scene::clamp_camera_pitch(pitch + 4.0));
     return TRUE;
   default:
     break;

@@ -16,6 +16,8 @@ constexpr double kOrbitHorizontalAnchorAltitudeM = kOrbitCameraFullAltitudeM;
 constexpr double kNadirPitchStartAltitudeM = 300000.0;
 constexpr double kNadirPitchFullAltitudeM = 1000000.0;
 constexpr double kNadirPitchDeg = -88.5;
+constexpr double kMinCameraPitchDeg = -89.0;
+constexpr double kMaxCameraPitchDeg = 89.0;
 
 glm::dvec3
 safe_normalize(const glm::dvec3 &value, const glm::dvec3 &fallback)
@@ -40,6 +42,12 @@ smoothstep(double edge0, double edge1, double value)
 {
   const double t = std::clamp((value - edge0) / (edge1 - edge0), 0.0, 1.0);
   return t * t * (3.0 - 2.0 * t);
+}
+
+double
+rad_to_deg(double radians)
+{
+  return radians * 180.0 / kPi;
 }
 
 double
@@ -115,6 +123,23 @@ local_frame_at(double latitude,
   frame.east = safe_normalize(glm::cross(frame.north, frame.up), glm::dvec3(1.0, 0.0, 0.0));
   frame.north = safe_normalize(glm::cross(frame.up, frame.east), frame.north);
   return frame;
+}
+
+double
+normalize_heading_degrees(double degrees)
+{
+  double normalized = std::fmod(degrees, 360.0);
+  if (normalized < 0.0)
+    normalized += 360.0;
+  if (normalized >= 360.0 - 1e-9)
+    normalized = 0.0;
+  return normalized;
+}
+
+double
+clamp_camera_pitch(double pitch_deg)
+{
+  return std::clamp(pitch_deg, kMinCameraPitchDeg, kMaxCameraPitchDeg);
 }
 
 double
@@ -275,6 +300,89 @@ blended_camera_pose(double latitude,
   pose.center = glm::mix(local.center, orbit.center, blend);
   pose.up = safe_normalize(glm::mix(local.up, orbit.up, blend), orbit.up);
   return pose;
+}
+
+CameraPose
+camera_pose_for_mode(CameraMode mode,
+                     double latitude,
+                     double longitude,
+                     double altitude_amsl,
+                     double heading_deg,
+                     double pitch_deg,
+                     double origin_latitude,
+                     double origin_longitude)
+{
+  const double pitch = clamp_camera_pitch(pitch_deg);
+  if (mode == CameraMode::Free) {
+    return local_camera_pose(latitude,
+                             longitude,
+                             altitude_amsl,
+                             heading_deg,
+                             pitch,
+                             origin_latitude,
+                             origin_longitude);
+  }
+
+  return blended_camera_pose(latitude,
+                             longitude,
+                             altitude_amsl,
+                             heading_deg,
+                             pitch,
+                             origin_latitude,
+                             origin_longitude);
+}
+
+CameraOrientation
+camera_orientation_for_scene_target(double camera_latitude,
+                                    double camera_longitude,
+                                    double camera_altitude_amsl,
+                                    const glm::dvec3 &target,
+                                    double origin_latitude,
+                                    double origin_longitude)
+{
+  const LocalFrame frame =
+    local_frame_at(camera_latitude, camera_longitude, origin_latitude, origin_longitude);
+  const glm::dvec3 eye =
+    geodetic_to_scene(camera_latitude,
+                      camera_longitude,
+                      camera_altitude_amsl,
+                      origin_latitude,
+                      origin_longitude,
+                      0.0);
+  const glm::dvec3 direction = safe_normalize(target - eye, frame.north);
+  const double east = glm::dot(direction, frame.east);
+  const double north = glm::dot(direction, frame.north);
+  const double up = std::clamp(glm::dot(direction, frame.up), -1.0, 1.0);
+
+  CameraOrientation orientation;
+  orientation.heading_deg = normalize_heading_degrees(rad_to_deg(std::atan2(east, north)));
+  orientation.pitch_deg = clamp_camera_pitch(rad_to_deg(std::asin(up)));
+  return orientation;
+}
+
+CameraOrientation
+camera_orientation_for_geodetic_target(double camera_latitude,
+                                       double camera_longitude,
+                                       double camera_altitude_amsl,
+                                       double target_latitude,
+                                       double target_longitude,
+                                       double target_altitude_amsl,
+                                       double origin_latitude,
+                                       double origin_longitude)
+{
+  const glm::dvec3 target =
+    geodetic_to_scene(target_latitude,
+                      target_longitude,
+                      target_altitude_amsl,
+                      origin_latitude,
+                      origin_longitude,
+                      0.0);
+  return camera_orientation_for_scene_target(camera_latitude,
+                                             camera_longitude,
+                                             camera_altitude_amsl,
+                                             target,
+                                             origin_latitude,
+                                             origin_longitude);
 }
 
 } // namespace gworld_scene

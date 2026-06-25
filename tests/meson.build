@@ -38,6 +38,14 @@ light_test = executable(
   dependencies: gworldscene_deps,
 )
 
+picking_test = executable(
+  'gworldscene-picking-test',
+  'picking-test.cpp',
+  include_directories: gworldscene_inc,
+  link_with: gworldscene_lib,
+  dependencies: gworldscene_deps,
+)
+
 view_test = executable(
   'gworldscene-view-test',
   'view-test.cpp',
@@ -51,4 +59,5 @@ test('scene-node', node_test)
 test('lod', lod_test)
 test('camera', camera_test)
 test('light', light_test)
+test('picking', picking_test)
 test('scene-view', view_test)

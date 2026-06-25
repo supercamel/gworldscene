@@ -45,6 +45,15 @@ test_orbit_blend_steps()
 }
 
 void
+test_heading_and_pitch_normalization()
+{
+  assert_near(gworld_scene::normalize_heading_degrees(-10.0), 350.0, 0.001);
+  assert_near(gworld_scene::normalize_heading_degrees(730.0), 10.0, 0.001);
+  assert_near(gworld_scene::clamp_camera_pitch(-120.0), -89.0, 0.001);
+  assert_near(gworld_scene::clamp_camera_pitch(120.0), 89.0, 0.001);
+}
+
+void
 test_nadir_blend_steps()
 {
   assert_near(gworld_scene::orbit_camera_nadir_blend_for_altitude(250000.0), 0.0, 0.001);
@@ -176,6 +185,80 @@ test_blended_camera_matches_orbit_at_high_altitude()
   assert_near(glm::length(blended.center - orbit.center), 0.0, 0.001);
 }
 
+void
+test_camera_pose_mode_selects_free_or_default()
+{
+  const double latitude = -35.0024;
+  const double longitude = 147.4648;
+  const double altitude = 250000.0;
+  const gworld_scene::CameraPose free_pose =
+    gworld_scene::camera_pose_for_mode(gworld_scene::CameraMode::Free,
+                                       latitude,
+                                       longitude,
+                                       altitude,
+                                       35.0,
+                                       -32.0,
+                                       latitude,
+                                       longitude);
+  const gworld_scene::CameraPose local =
+    gworld_scene::local_camera_pose(latitude, longitude, altitude, 35.0, -32.0, latitude, longitude);
+  const gworld_scene::CameraPose default_pose =
+    gworld_scene::camera_pose_for_mode(gworld_scene::CameraMode::Default,
+                                       latitude,
+                                       longitude,
+                                       altitude,
+                                       35.0,
+                                       -32.0,
+                                       latitude,
+                                       longitude);
+  const gworld_scene::CameraPose blended =
+    gworld_scene::blended_camera_pose(latitude, longitude, altitude, 35.0, -32.0, latitude, longitude);
+
+  assert_near(glm::length(free_pose.eye - local.eye), 0.0, 0.001);
+  assert_near(glm::length(free_pose.center - local.center), 0.0, 0.001);
+  assert_near(glm::length(default_pose.eye - blended.eye), 0.0, 0.001);
+  assert_near(glm::length(default_pose.center - blended.center), 0.0, 0.001);
+}
+
+void
+test_camera_orientation_for_scene_target()
+{
+  const double latitude = -35.0024;
+  const double longitude = 147.4648;
+  const double altitude = 1200.0;
+  const gworld_scene::LocalFrame frame =
+    gworld_scene::local_frame_at(latitude, longitude, latitude, longitude);
+  const glm::dvec3 eye = frame.origin + frame.up * altitude;
+
+  const gworld_scene::CameraOrientation north =
+    gworld_scene::camera_orientation_for_scene_target(latitude,
+                                                      longitude,
+                                                      altitude,
+                                                      eye + frame.north * 2000.0,
+                                                      latitude,
+                                                      longitude);
+  const gworld_scene::CameraOrientation east =
+    gworld_scene::camera_orientation_for_scene_target(latitude,
+                                                      longitude,
+                                                      altitude,
+                                                      eye + frame.east * 2000.0,
+                                                      latitude,
+                                                      longitude);
+  const gworld_scene::CameraOrientation up =
+    gworld_scene::camera_orientation_for_scene_target(latitude,
+                                                    longitude,
+                                                    altitude,
+                                                    eye + frame.up * 2000.0,
+                                                    latitude,
+                                                    longitude);
+
+  assert_near(north.heading_deg, 0.0, 0.001);
+  assert_near(north.pitch_deg, 0.0, 0.001);
+  assert_near(east.heading_deg, 90.0, 0.001);
+  assert_near(east.pitch_deg, 0.0, 0.001);
+  assert_near(up.pitch_deg, 89.0, 0.001);
+}
+
 } // namespace
 
 int
@@ -184,6 +267,7 @@ main(int argc, char **argv)
   g_test_init(&argc, &argv, nullptr);
   g_test_add_func("/camera/local-frame-axes", test_local_frame_axes);
   g_test_add_func("/camera/orbit-blend-steps", test_orbit_blend_steps);
+  g_test_add_func("/camera/heading-and-pitch-normalization", test_heading_and_pitch_normalization);
   g_test_add_func("/camera/nadir-blend-steps", test_nadir_blend_steps);
   g_test_add_func("/camera/movement-is-heading-relative-at-low-altitude", test_movement_is_heading_relative_at_low_altitude);
   g_test_add_func("/camera/movement-is-cardinal-at-orbit-altitude", test_movement_is_cardinal_at_orbit_altitude);
@@ -192,5 +276,7 @@ main(int argc, char **argv)
   g_test_add_func("/camera/orbit-camera-zoom-out-lifts-over-focus", test_orbit_camera_zoom_out_lifts_over_focus);
   g_test_add_func("/camera/far-orbit-camera-pulls-toward-nadir", test_far_orbit_camera_pulls_toward_nadir);
   g_test_add_func("/camera/blended-camera-matches-orbit-at-high-altitude", test_blended_camera_matches_orbit_at_high_altitude);
+  g_test_add_func("/camera/camera-pose-mode-selects-free-or-default", test_camera_pose_mode_selects_free_or_default);
+  g_test_add_func("/camera/camera-orientation-for-scene-target", test_camera_orientation_for_scene_target);
   return g_test_run();
 }

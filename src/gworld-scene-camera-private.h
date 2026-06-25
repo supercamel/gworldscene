@@ -18,10 +18,24 @@ struct CameraPose {
   glm::dvec3 up;
 };
 
+struct CameraOrientation {
+  double heading_deg = 0.0;
+  double pitch_deg = 0.0;
+};
+
+enum class CameraMode {
+  Default,
+  Free,
+};
+
 LocalFrame local_frame_at(double latitude,
                           double longitude,
                           double origin_latitude,
                           double origin_longitude);
+
+double normalize_heading_degrees(double degrees);
+
+double clamp_camera_pitch(double pitch_deg);
 
 double orbit_camera_blend_for_altitude(double altitude_amsl);
 
@@ -57,6 +71,31 @@ CameraPose blended_camera_pose(double latitude,
                                double pitch_deg,
                                double origin_latitude,
                                double origin_longitude);
+
+CameraPose camera_pose_for_mode(CameraMode mode,
+                                double latitude,
+                                double longitude,
+                                double altitude_amsl,
+                                double heading_deg,
+                                double pitch_deg,
+                                double origin_latitude,
+                                double origin_longitude);
+
+CameraOrientation camera_orientation_for_scene_target(double camera_latitude,
+                                                      double camera_longitude,
+                                                      double camera_altitude_amsl,
+                                                      const glm::dvec3 &target,
+                                                      double origin_latitude,
+                                                      double origin_longitude);
+
+CameraOrientation camera_orientation_for_geodetic_target(double camera_latitude,
+                                                         double camera_longitude,
+                                                         double camera_altitude_amsl,
+                                                         double target_latitude,
+                                                         double target_longitude,
+                                                         double target_altitude_amsl,
+                                                         double origin_latitude,
+                                                         double origin_longitude);
 
 } // namespace gworld_scene
 

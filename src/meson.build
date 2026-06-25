@@ -30,8 +30,12 @@ gworldscene_sources = [
   'gworld-scene-lod-private.h',
   'gworld-scene-node.cpp',
   'gworld-scene-node-private.h',
+  'gworld-scene-picking.cpp',
+  'gworld-scene-picking-private.h',
   'gworld-scene-view.cpp',
   'gworld-scene-view-private.h',
+  'gworld-scene-view-shaders.cpp',
+  'gworld-scene-view-shaders-private.h',
 ]
 
 gworldscene_inc = include_directories('.')
