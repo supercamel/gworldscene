@@ -163,7 +163,7 @@ function activate() {
   window.present()
 }
 
-app = Gtk.Application.new("au.com.silvertone.GWorldScene.SQGI",
+app = Gtk.Application.new("com.supercamel.GWorldScene.SQGI",
                           Gio.ApplicationFlags.flags_none)
 app.connect("activate", activate)
 

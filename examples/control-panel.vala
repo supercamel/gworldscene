@@ -4,7 +4,7 @@ namespace GWorldSceneControls {
   private const double HOME_LATITUDE = -16.8878;
   private const double HOME_LONGITUDE = 145.7048;
   private const double HOME_ALTITUDE_AMSL = 7800.0;
-  private const string DEFAULT_TERRAIN_SERVER = "https://flightops.silvertone.com.au/terrain/data/";
+  private const string DEFAULT_TERRAIN_SERVER = "https://ooblerg.xyz/terrain/";
   private const string GOOGLE_LEGACY_SATELLITE =
     "https://mt.google.com/vt/lyrs=s&x={x}&y={y}&z={z}";
   private const string OSM_STANDARD =
@@ -155,9 +155,9 @@ namespace GWorldSceneControls {
       row = 0;
 
       terrain_provider = new Gtk.ComboBoxText ();
-      terrain_provider.append ("silvertone", "Silvertone HGT");
+      terrain_provider.append ("supercamel", "Supercamel terrain");
       terrain_provider.append ("custom", "Custom terrain server");
-      terrain_provider.active_id = "silvertone";
+      terrain_provider.active_id = "supercamel";
       terrain_provider.changed.connect (() => update_terrain_field_sensitivity ());
       add_row (terrain_grid, row++, "Provider", terrain_provider);
 
@@ -376,15 +376,15 @@ namespace GWorldSceneControls {
     }
 
     private void update_terrain_field_sensitivity () {
-      var provider = active_id (terrain_provider, "silvertone");
+      var provider = active_id (terrain_provider, "supercamel");
       terrain_entry.sensitive = provider == "custom";
-      if (provider == "silvertone") {
+      if (provider == "supercamel") {
         terrain_entry.text = DEFAULT_TERRAIN_SERVER;
       }
     }
 
     private void apply_terrain_provider () {
-      var provider = active_id (terrain_provider, "silvertone");
+      var provider = active_id (terrain_provider, "supercamel");
       var server = provider == "custom" ? terrain_entry.text.strip () : DEFAULT_TERRAIN_SERVER;
       if (server == "") {
         terrain_status.label = "Terrain server is empty.";
@@ -634,7 +634,7 @@ namespace GWorldSceneControls {
   }
 
   public static int main (string[] args) {
-    var app = new Gtk.Application ("au.com.silvertone.GWorldScene.ValaControls",
+    var app = new Gtk.Application ("com.supercamel.GWorldScene.ValaControls",
                                    GLib.ApplicationFlags.DEFAULT_FLAGS);
     app.activate.connect (() => {
       var window = new ControlPanelWindow (app);

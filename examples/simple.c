@@ -342,7 +342,7 @@ activate(GtkApplication *app, gpointer user_data)
 int
 main(int argc, char **argv)
 {
-  GtkApplication *app = gtk_application_new("au.com.silvertone.GWorldScene.Demo",
+  GtkApplication *app = gtk_application_new("com.supercamel.GWorldScene.Demo",
                                            G_APPLICATION_DEFAULT_FLAGS);
   g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);
 

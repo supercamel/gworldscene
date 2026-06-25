@@ -99,7 +99,7 @@ constexpr float kMaterialSolidNode = 1.0f;
 constexpr float kMaterialGlobe = 2.0f;
 constexpr float kMaterialTexturedModel = 3.0f;
 
-constexpr const char *kDefaultTerrainServer = "https://flightops.silvertone.com.au/terrain/data/";
+constexpr const char *kDefaultTerrainServer = "https://ooblerg.xyz/terrain/";
 constexpr const char *kDefaultMapTileTemplate = "https://tile.openstreetmap.org/{z}/{x}/{y}.png";
 
 using gworld_scene::deg_to_rad;
