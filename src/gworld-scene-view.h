@@ -11,6 +11,11 @@ G_BEGIN_DECLS
 
 G_DECLARE_FINAL_TYPE(GWorldSceneView, gworld_scene_view, GWORLD, SCENE_VIEW, GtkGLArea)
 
+typedef enum {
+  GWORLD_SCENE_CAMERA_MODE_DEFAULT,
+  GWORLD_SCENE_CAMERA_MODE_FREE,
+} GWorldSceneCameraMode;
+
 GtkWidget *gworld_scene_view_new(void);
 
 void gworld_scene_view_set_camera(GWorldSceneView *self,
@@ -30,6 +35,80 @@ void gworld_scene_view_set_camera_orientation(GWorldSceneView *self,
 void gworld_scene_view_get_camera_orientation(GWorldSceneView *self,
                                               double *heading_deg,
                                               double *pitch_deg);
+
+/**
+ * gworld_scene_view_set_camera_mode:
+ * @self: a scene view
+ * @camera_mode: default orbit/blended camera, or free local camera
+ *
+ * Default mode preserves the interactive Google-Earth style orbit blend. Free
+ * mode renders the stored camera position as the actual eye position at all
+ * altitudes.
+ */
+void gworld_scene_view_set_camera_mode(GWorldSceneView *self,
+                                       GWorldSceneCameraMode camera_mode);
+
+GWorldSceneCameraMode gworld_scene_view_get_camera_mode(GWorldSceneView *self);
+
+/**
+ * gworld_scene_view_set_free_camera_position:
+ * @self: a scene view
+ *
+ * Sets the free camera eye position and switches the view to free mode.
+ */
+void gworld_scene_view_set_free_camera_position(GWorldSceneView *self,
+                                                double latitude,
+                                                double longitude,
+                                                double altitude_amsl);
+
+void gworld_scene_view_get_free_camera_position(GWorldSceneView *self,
+                                                double *latitude,
+                                                double *longitude,
+                                                double *altitude_amsl);
+
+/**
+ * gworld_scene_view_set_free_camera_orientation:
+ * @self: a scene view
+ * @azimuth_deg: clockwise from geographic north
+ * @pitch_deg: elevation angle, positive upward
+ *
+ * Sets the free camera orientation and switches the view to free mode.
+ */
+void gworld_scene_view_set_free_camera_orientation(GWorldSceneView *self,
+                                                   double azimuth_deg,
+                                                   double pitch_deg);
+
+void gworld_scene_view_get_free_camera_orientation(GWorldSceneView *self,
+                                                   double *azimuth_deg,
+                                                   double *pitch_deg);
+
+void gworld_scene_view_set_free_camera_azimuth(GWorldSceneView *self,
+                                               double azimuth_deg);
+
+void gworld_scene_view_set_free_camera_pitch(GWorldSceneView *self,
+                                             double pitch_deg);
+
+/**
+ * gworld_scene_view_look_at_location:
+ * @self: a scene view
+ *
+ * Rotates the current camera to face the location and switches to free mode.
+ * The target altitude is interpreted as AMSL.
+ */
+void gworld_scene_view_look_at_location(GWorldSceneView *self,
+                                        double latitude,
+                                        double longitude,
+                                        double altitude_amsl);
+
+/**
+ * gworld_scene_view_look_at_node:
+ * @self: a scene view
+ * @node: a scene node
+ *
+ * Rotates the current camera to face @node and switches to free mode.
+ */
+void gworld_scene_view_look_at_node(GWorldSceneView *self,
+                                    GWorldSceneNode *node);
 
 void gworld_scene_view_set_terrain_server(GWorldSceneView *self,
                                           const char *terrain_server);
@@ -98,6 +177,21 @@ void gworld_scene_view_set_terrain_normal_smoothing(GWorldSceneView *self,
 double gworld_scene_view_get_terrain_normal_smoothing(GWorldSceneView *self);
 
 /**
+ * gworld_scene_view_sample_terrain_altitude:
+ * @self: a scene view
+ * @latitude: latitude in degrees
+ * @longitude: longitude in degrees
+ * @altitude_amsl: (out): terrain altitude above mean sea level in metres
+ *
+ * Samples already-loaded terrain. Returns %FALSE when the corresponding
+ * terrain tile has not loaded yet.
+ */
+gboolean gworld_scene_view_sample_terrain_altitude(GWorldSceneView *self,
+                                                   double latitude,
+                                                   double longitude,
+                                                   double *altitude_amsl);
+
+/**
  * gworld_scene_view_add_cube:
  * @self: a scene view
  *
@@ -152,6 +246,44 @@ GWorldSceneModelNode *gworld_scene_view_add_model(GWorldSceneView *self,
                                                   double latitude,
                                                   double longitude,
                                                   double altitude_amsl);
+
+/**
+ * gworld_scene_view_add_billboard:
+ * @self: a scene view
+ * @image_path: local path to an image file
+ *
+ * Adds a camera-facing image marker at the requested geodetic position. The
+ * altitude is interpreted as AMSL by default; use
+ * gworld_scene_billboard_node_set_altitude_mode() to interpret it as AGL.
+ *
+ * Returns: (transfer none): the view-owned billboard node
+ */
+GWorldSceneBillboardNode *gworld_scene_view_add_billboard(GWorldSceneView *self,
+                                                          const char *image_path,
+                                                          double latitude,
+                                                          double longitude,
+                                                          double altitude);
+
+/**
+ * gworld_scene_view_add_ground_overlay:
+ * @self: a scene view
+ * @image_path: local path to an image file
+ *
+ * Adds an image draped over terrain. Corner coordinates are image-space
+ * corners in top-left, top-right, bottom-right, bottom-left order.
+ *
+ * Returns: (transfer none): the view-owned ground overlay node
+ */
+GWorldSceneGroundOverlayNode *gworld_scene_view_add_ground_overlay(GWorldSceneView *self,
+                                                                   const char *image_path,
+                                                                   double top_left_latitude,
+                                                                   double top_left_longitude,
+                                                                   double top_right_latitude,
+                                                                   double top_right_longitude,
+                                                                   double bottom_right_latitude,
+                                                                   double bottom_right_longitude,
+                                                                   double bottom_left_latitude,
+                                                                   double bottom_left_longitude);
 
 gboolean gworld_scene_view_remove_node(GWorldSceneView *self, GWorldSceneNode *node);
 

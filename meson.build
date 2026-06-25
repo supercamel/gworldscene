@@ -1,6 +1,6 @@
 project(
   'gworldscene',
-  ['c', 'cpp'],
+  ['c', 'cpp', 'vala'],
   version: '0.1.0',
   default_options: [
     'c_std=c11',

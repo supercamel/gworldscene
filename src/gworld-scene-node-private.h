@@ -30,4 +30,21 @@ GWorldSceneModelNode *_gworld_scene_model_node_new(GWorldSceneNodeId id,
                                                    double longitude,
                                                    double altitude_amsl);
 
+GWorldSceneBillboardNode *_gworld_scene_billboard_node_new(GWorldSceneNodeId id,
+                                                           const char *image_path,
+                                                           double latitude,
+                                                           double longitude,
+                                                           double altitude);
+
+GWorldSceneGroundOverlayNode *_gworld_scene_ground_overlay_node_new(GWorldSceneNodeId id,
+                                                                    const char *image_path,
+                                                                    double top_left_latitude,
+                                                                    double top_left_longitude,
+                                                                    double top_right_latitude,
+                                                                    double top_right_longitude,
+                                                                    double bottom_right_latitude,
+                                                                    double bottom_right_longitude,
+                                                                    double bottom_left_latitude,
+                                                                    double bottom_left_longitude);
+
 #endif /* GWORLD_SCENE_NODE_PRIVATE_H */

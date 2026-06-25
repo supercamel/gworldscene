@@ -87,11 +87,35 @@ struct _GWorldSceneModelNode {
   gchar *model_path = nullptr;
 };
 
+struct _GWorldSceneBillboardNode {
+  GWorldSceneNode parent_instance;
+
+  gchar *image_path = nullptr;
+  double min_px = 24.0;
+  double max_px = 96.0;
+  double reference_size_px = 48.0;
+  double reference_distance_m = 1000.0;
+  double max_visible_distance_m = 0.0;
+  GWorldSceneAltitudeMode altitude_mode = GWORLD_SCENE_ALTITUDE_AMSL;
+};
+
+struct _GWorldSceneGroundOverlayNode {
+  GWorldSceneNode parent_instance;
+
+  gchar *image_path = nullptr;
+  double latitude[4] = {0.0, 0.0, 0.0, 0.0};
+  double longitude[4] = {0.0, 0.0, 0.0, 0.0};
+  double opacity = 1.0;
+  double altitude_offset_m = 1.0;
+};
+
 G_DEFINE_TYPE_WITH_PRIVATE(GWorldSceneNode, gworld_scene_node, G_TYPE_OBJECT)
 G_DEFINE_TYPE(GWorldSceneCubeNode, gworld_scene_cube_node, GWORLD_TYPE_SCENE_NODE)
 G_DEFINE_TYPE(GWorldSceneSphereNode, gworld_scene_sphere_node, GWORLD_TYPE_SCENE_NODE)
 G_DEFINE_TYPE(GWorldSceneCylinderNode, gworld_scene_cylinder_node, GWORLD_TYPE_SCENE_NODE)
 G_DEFINE_TYPE(GWorldSceneModelNode, gworld_scene_model_node, GWORLD_TYPE_SCENE_NODE)
+G_DEFINE_TYPE(GWorldSceneBillboardNode, gworld_scene_billboard_node, GWORLD_TYPE_SCENE_NODE)
+G_DEFINE_TYPE(GWorldSceneGroundOverlayNode, gworld_scene_ground_overlay_node, GWORLD_TYPE_SCENE_NODE)
 
 static GWorldScenePrimitive
 primitive_for_node(GWorldSceneNode *self)
@@ -104,6 +128,10 @@ primitive_for_node(GWorldSceneNode *self)
     return GWORLD_SCENE_PRIMITIVE_CYLINDER;
   if (GWORLD_IS_SCENE_MODEL_NODE(self))
     return GWORLD_SCENE_PRIMITIVE_MODEL;
+  if (GWORLD_IS_SCENE_BILLBOARD_NODE(self))
+    return GWORLD_SCENE_PRIMITIVE_BILLBOARD;
+  if (GWORLD_IS_SCENE_GROUND_OVERLAY_NODE(self))
+    return GWORLD_SCENE_PRIMITIVE_GROUND_OVERLAY;
   return GWORLD_SCENE_PRIMITIVE_CUBE;
 }
 
@@ -167,7 +195,7 @@ gworld_scene_node_class_init(GWorldSceneNodeClass *klass)
                       "Primitive",
                       "Scene primitive compatibility kind",
                       GWORLD_SCENE_PRIMITIVE_CUBE,
-                      GWORLD_SCENE_PRIMITIVE_MODEL,
+                      GWORLD_SCENE_PRIMITIVE_GROUND_OVERLAY,
                       GWORLD_SCENE_PRIMITIVE_CUBE,
                       static_cast<GParamFlags>(G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_properties(object_class, N_PROPS, properties);
@@ -267,6 +295,89 @@ gworld_scene_model_node_init(GWorldSceneModelNode *self)
   priv->blue = 1.0;
 }
 
+static void
+gworld_scene_billboard_node_finalize(GObject *object)
+{
+  auto *self = GWORLD_SCENE_BILLBOARD_NODE(object);
+  g_clear_pointer(&self->image_path, g_free);
+  G_OBJECT_CLASS(gworld_scene_billboard_node_parent_class)->finalize(object);
+}
+
+static void
+gworld_scene_billboard_node_class_init(GWorldSceneBillboardNodeClass *klass)
+{
+  GObjectClass *object_class = G_OBJECT_CLASS(klass);
+  object_class->finalize = gworld_scene_billboard_node_finalize;
+}
+
+static void
+gworld_scene_billboard_node_init(GWorldSceneBillboardNode *self)
+{
+  self->image_path = nullptr;
+  self->min_px = 24.0;
+  self->max_px = 96.0;
+  self->reference_size_px = 48.0;
+  self->reference_distance_m = 1000.0;
+  self->max_visible_distance_m = 0.0;
+  self->altitude_mode = GWORLD_SCENE_ALTITUDE_AMSL;
+  auto *priv = node_priv(GWORLD_SCENE_NODE(self));
+  priv->red = 1.0;
+  priv->green = 1.0;
+  priv->blue = 1.0;
+}
+
+static void
+set_ground_overlay_corner_values(GWorldSceneGroundOverlayNode *self,
+                                 double top_left_latitude,
+                                 double top_left_longitude,
+                                 double top_right_latitude,
+                                 double top_right_longitude,
+                                 double bottom_right_latitude,
+                                 double bottom_right_longitude,
+                                 double bottom_left_latitude,
+                                 double bottom_left_longitude)
+{
+  self->latitude[0] = std::clamp(top_left_latitude, -90.0, 90.0);
+  self->longitude[0] = std::clamp(top_left_longitude, -180.0, 180.0);
+  self->latitude[1] = std::clamp(top_right_latitude, -90.0, 90.0);
+  self->longitude[1] = std::clamp(top_right_longitude, -180.0, 180.0);
+  self->latitude[2] = std::clamp(bottom_right_latitude, -90.0, 90.0);
+  self->longitude[2] = std::clamp(bottom_right_longitude, -180.0, 180.0);
+  self->latitude[3] = std::clamp(bottom_left_latitude, -90.0, 90.0);
+  self->longitude[3] = std::clamp(bottom_left_longitude, -180.0, 180.0);
+}
+
+static void
+gworld_scene_ground_overlay_node_finalize(GObject *object)
+{
+  auto *self = GWORLD_SCENE_GROUND_OVERLAY_NODE(object);
+  g_clear_pointer(&self->image_path, g_free);
+  G_OBJECT_CLASS(gworld_scene_ground_overlay_node_parent_class)->finalize(object);
+}
+
+static void
+gworld_scene_ground_overlay_node_class_init(GWorldSceneGroundOverlayNodeClass *klass)
+{
+  GObjectClass *object_class = G_OBJECT_CLASS(klass);
+  object_class->finalize = gworld_scene_ground_overlay_node_finalize;
+}
+
+static void
+gworld_scene_ground_overlay_node_init(GWorldSceneGroundOverlayNode *self)
+{
+  self->image_path = nullptr;
+  self->opacity = 1.0;
+  self->altitude_offset_m = 1.0;
+  for (int i = 0; i < 4; ++i) {
+    self->latitude[i] = 0.0;
+    self->longitude[i] = 0.0;
+  }
+  auto *priv = node_priv(GWORLD_SCENE_NODE(self));
+  priv->red = 1.0;
+  priv->green = 1.0;
+  priv->blue = 1.0;
+}
+
 GWorldSceneCubeNode *
 _gworld_scene_cube_node_new(GWorldSceneNodeId id,
                             double latitude,
@@ -322,6 +433,50 @@ _gworld_scene_model_node_new(GWorldSceneNodeId id,
   auto *node = GWORLD_SCENE_MODEL_NODE(g_object_new(GWORLD_TYPE_SCENE_MODEL_NODE, nullptr));
   initialize_node(GWORLD_SCENE_NODE(node), id, latitude, longitude, altitude_amsl);
   node->model_path = g_strdup(model_path ? model_path : "");
+  return node;
+}
+
+GWorldSceneBillboardNode *
+_gworld_scene_billboard_node_new(GWorldSceneNodeId id,
+                                 const char *image_path,
+                                 double latitude,
+                                 double longitude,
+                                 double altitude)
+{
+  auto *node = GWORLD_SCENE_BILLBOARD_NODE(g_object_new(GWORLD_TYPE_SCENE_BILLBOARD_NODE, nullptr));
+  initialize_node(GWORLD_SCENE_NODE(node), id, latitude, longitude, altitude);
+  node->image_path = g_strdup(image_path ? image_path : "");
+  return node;
+}
+
+GWorldSceneGroundOverlayNode *
+_gworld_scene_ground_overlay_node_new(GWorldSceneNodeId id,
+                                      const char *image_path,
+                                      double top_left_latitude,
+                                      double top_left_longitude,
+                                      double top_right_latitude,
+                                      double top_right_longitude,
+                                      double bottom_right_latitude,
+                                      double bottom_right_longitude,
+                                      double bottom_left_latitude,
+                                      double bottom_left_longitude)
+{
+  auto *node = GWORLD_SCENE_GROUND_OVERLAY_NODE(g_object_new(GWORLD_TYPE_SCENE_GROUND_OVERLAY_NODE, nullptr));
+  const double center_latitude =
+    (top_left_latitude + top_right_latitude + bottom_right_latitude + bottom_left_latitude) * 0.25;
+  const double center_longitude =
+    (top_left_longitude + top_right_longitude + bottom_right_longitude + bottom_left_longitude) * 0.25;
+  initialize_node(GWORLD_SCENE_NODE(node), id, center_latitude, center_longitude, 0.0);
+  node->image_path = g_strdup(image_path ? image_path : "");
+  set_ground_overlay_corner_values(node,
+                                   top_left_latitude,
+                                   top_left_longitude,
+                                   top_right_latitude,
+                                   top_right_longitude,
+                                   bottom_right_latitude,
+                                   bottom_right_longitude,
+                                   bottom_left_latitude,
+                                   bottom_left_longitude);
   return node;
 }
 
@@ -582,6 +737,205 @@ gworld_scene_model_node_get_model_path(GWorldSceneModelNode *self)
 {
   g_return_val_if_fail(GWORLD_IS_SCENE_MODEL_NODE(self), nullptr);
   return self->model_path != nullptr && self->model_path[0] != '\0' ? self->model_path : nullptr;
+}
+
+void
+gworld_scene_billboard_node_set_image_path(GWorldSceneBillboardNode *self, const char *image_path)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_BILLBOARD_NODE(self));
+  g_free(self->image_path);
+  self->image_path = g_strdup(image_path ? image_path : "");
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+const char *
+gworld_scene_billboard_node_get_image_path(GWorldSceneBillboardNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_BILLBOARD_NODE(self), nullptr);
+  return self->image_path != nullptr && self->image_path[0] != '\0' ? self->image_path : nullptr;
+}
+
+void
+gworld_scene_billboard_node_set_size_limits(GWorldSceneBillboardNode *self,
+                                            double min_px,
+                                            double max_px)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_BILLBOARD_NODE(self));
+  self->min_px = std::max(1.0, min_px);
+  self->max_px = std::max(self->min_px, max_px);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+void
+gworld_scene_billboard_node_get_size_limits(GWorldSceneBillboardNode *self,
+                                            double *min_px,
+                                            double *max_px)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_BILLBOARD_NODE(self));
+  if (min_px)
+    *min_px = self->min_px;
+  if (max_px)
+    *max_px = self->max_px;
+}
+
+void
+gworld_scene_billboard_node_set_reference_size(GWorldSceneBillboardNode *self,
+                                               double size_px,
+                                               double distance_m)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_BILLBOARD_NODE(self));
+  self->reference_size_px = std::max(1.0, size_px);
+  self->reference_distance_m = std::max(1.0, distance_m);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+void
+gworld_scene_billboard_node_get_reference_size(GWorldSceneBillboardNode *self,
+                                               double *size_px,
+                                               double *distance_m)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_BILLBOARD_NODE(self));
+  if (size_px)
+    *size_px = self->reference_size_px;
+  if (distance_m)
+    *distance_m = self->reference_distance_m;
+}
+
+void
+gworld_scene_billboard_node_set_max_visible_distance(GWorldSceneBillboardNode *self,
+                                                     double distance_m)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_BILLBOARD_NODE(self));
+  self->max_visible_distance_m = std::max(0.0, distance_m);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+double
+gworld_scene_billboard_node_get_max_visible_distance(GWorldSceneBillboardNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_BILLBOARD_NODE(self), 0.0);
+  return self->max_visible_distance_m;
+}
+
+void
+gworld_scene_billboard_node_set_altitude_mode(GWorldSceneBillboardNode *self,
+                                              GWorldSceneAltitudeMode altitude_mode)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_BILLBOARD_NODE(self));
+  if (altitude_mode != GWORLD_SCENE_ALTITUDE_AGL)
+    altitude_mode = GWORLD_SCENE_ALTITUDE_AMSL;
+  self->altitude_mode = altitude_mode;
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+GWorldSceneAltitudeMode
+gworld_scene_billboard_node_get_altitude_mode(GWorldSceneBillboardNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_BILLBOARD_NODE(self), GWORLD_SCENE_ALTITUDE_AMSL);
+  return self->altitude_mode;
+}
+
+void
+gworld_scene_ground_overlay_node_set_image_path(GWorldSceneGroundOverlayNode *self,
+                                                const char *image_path)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_GROUND_OVERLAY_NODE(self));
+  g_free(self->image_path);
+  self->image_path = g_strdup(image_path ? image_path : "");
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+const char *
+gworld_scene_ground_overlay_node_get_image_path(GWorldSceneGroundOverlayNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_GROUND_OVERLAY_NODE(self), nullptr);
+  return self->image_path != nullptr && self->image_path[0] != '\0' ? self->image_path : nullptr;
+}
+
+void
+gworld_scene_ground_overlay_node_set_corners(GWorldSceneGroundOverlayNode *self,
+                                             double top_left_latitude,
+                                             double top_left_longitude,
+                                             double top_right_latitude,
+                                             double top_right_longitude,
+                                             double bottom_right_latitude,
+                                             double bottom_right_longitude,
+                                             double bottom_left_latitude,
+                                             double bottom_left_longitude)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_GROUND_OVERLAY_NODE(self));
+  set_ground_overlay_corner_values(self,
+                                   top_left_latitude,
+                                   top_left_longitude,
+                                   top_right_latitude,
+                                   top_right_longitude,
+                                   bottom_right_latitude,
+                                   bottom_right_longitude,
+                                   bottom_left_latitude,
+                                   bottom_left_longitude);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+void
+gworld_scene_ground_overlay_node_get_corners(GWorldSceneGroundOverlayNode *self,
+                                             double *top_left_latitude,
+                                             double *top_left_longitude,
+                                             double *top_right_latitude,
+                                             double *top_right_longitude,
+                                             double *bottom_right_latitude,
+                                             double *bottom_right_longitude,
+                                             double *bottom_left_latitude,
+                                             double *bottom_left_longitude)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_GROUND_OVERLAY_NODE(self));
+  if (top_left_latitude)
+    *top_left_latitude = self->latitude[0];
+  if (top_left_longitude)
+    *top_left_longitude = self->longitude[0];
+  if (top_right_latitude)
+    *top_right_latitude = self->latitude[1];
+  if (top_right_longitude)
+    *top_right_longitude = self->longitude[1];
+  if (bottom_right_latitude)
+    *bottom_right_latitude = self->latitude[2];
+  if (bottom_right_longitude)
+    *bottom_right_longitude = self->longitude[2];
+  if (bottom_left_latitude)
+    *bottom_left_latitude = self->latitude[3];
+  if (bottom_left_longitude)
+    *bottom_left_longitude = self->longitude[3];
+}
+
+void
+gworld_scene_ground_overlay_node_set_opacity(GWorldSceneGroundOverlayNode *self,
+                                             double opacity)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_GROUND_OVERLAY_NODE(self));
+  self->opacity = std::clamp(opacity, 0.0, 1.0);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+double
+gworld_scene_ground_overlay_node_get_opacity(GWorldSceneGroundOverlayNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_GROUND_OVERLAY_NODE(self), 0.0);
+  return self->opacity;
+}
+
+void
+gworld_scene_ground_overlay_node_set_altitude_offset(GWorldSceneGroundOverlayNode *self,
+                                                     double altitude_offset_m)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_GROUND_OVERLAY_NODE(self));
+  self->altitude_offset_m = std::clamp(altitude_offset_m, -1000.0, 10000.0);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+double
+gworld_scene_ground_overlay_node_get_altitude_offset(GWorldSceneGroundOverlayNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_GROUND_OVERLAY_NODE(self), 0.0);
+  return self->altitude_offset_m;
 }
 
 void

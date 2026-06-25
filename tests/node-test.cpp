@@ -136,6 +136,113 @@ test_model_node_stores_path_and_uses_white_default_color()
   g_object_unref(node);
 }
 
+void
+test_billboard_node_stores_image_and_size_policy()
+{
+  GWorldSceneBillboardNode *billboard =
+    _gworld_scene_billboard_node_new(12,
+                                     "/tmp/example-marker.png",
+                                     -35.0024,
+                                     147.4648,
+                                     1200.0);
+  GWorldSceneNode *node = GWORLD_SCENE_NODE(billboard);
+
+  g_assert_cmpuint(gworld_scene_node_get_id(node), ==, 12);
+  g_assert_cmpuint(gworld_scene_node_get_primitive(node), ==, GWORLD_SCENE_PRIMITIVE_BILLBOARD);
+  g_assert_true(GWORLD_IS_SCENE_BILLBOARD_NODE(billboard));
+  g_assert_cmpstr(gworld_scene_billboard_node_get_image_path(billboard), ==, "/tmp/example-marker.png");
+
+  double min_px = 0.0;
+  double max_px = 0.0;
+  gworld_scene_billboard_node_get_size_limits(billboard, &min_px, &max_px);
+  assert_near(min_px, 24.0, 0.001);
+  assert_near(max_px, 96.0, 0.001);
+
+  double reference_px = 0.0;
+  double reference_distance = 0.0;
+  gworld_scene_billboard_node_get_reference_size(billboard, &reference_px, &reference_distance);
+  assert_near(reference_px, 48.0, 0.001);
+  assert_near(reference_distance, 1000.0, 0.001);
+  assert_near(gworld_scene_billboard_node_get_max_visible_distance(billboard), 0.0, 0.001);
+  g_assert_cmpuint(gworld_scene_billboard_node_get_altitude_mode(billboard), ==, GWORLD_SCENE_ALTITUDE_AMSL);
+
+  gworld_scene_billboard_node_set_size_limits(billboard, 16.0, 160.0);
+  gworld_scene_billboard_node_set_reference_size(billboard, 80.0, 500.0);
+  gworld_scene_billboard_node_set_max_visible_distance(billboard, 2500.0);
+  gworld_scene_billboard_node_set_altitude_mode(billboard, GWORLD_SCENE_ALTITUDE_AGL);
+
+  gworld_scene_billboard_node_get_size_limits(billboard, &min_px, &max_px);
+  assert_near(min_px, 16.0, 0.001);
+  assert_near(max_px, 160.0, 0.001);
+  gworld_scene_billboard_node_get_reference_size(billboard, &reference_px, &reference_distance);
+  assert_near(reference_px, 80.0, 0.001);
+  assert_near(reference_distance, 500.0, 0.001);
+  assert_near(gworld_scene_billboard_node_get_max_visible_distance(billboard), 2500.0, 0.001);
+  g_assert_cmpuint(gworld_scene_billboard_node_get_altitude_mode(billboard), ==, GWORLD_SCENE_ALTITUDE_AGL);
+
+  g_object_unref(node);
+}
+
+void
+test_ground_overlay_node_stores_image_corners_and_display_policy()
+{
+  GWorldSceneGroundOverlayNode *overlay =
+    _gworld_scene_ground_overlay_node_new(13,
+                                          "/tmp/example-overlay.png",
+                                          -34.99,
+                                          147.45,
+                                          -34.99,
+                                          147.47,
+                                          -35.01,
+                                          147.47,
+                                          -35.01,
+                                          147.45);
+  GWorldSceneNode *node = GWORLD_SCENE_NODE(overlay);
+
+  g_assert_cmpuint(gworld_scene_node_get_id(node), ==, 13);
+  g_assert_cmpuint(gworld_scene_node_get_primitive(node), ==, GWORLD_SCENE_PRIMITIVE_GROUND_OVERLAY);
+  g_assert_true(GWORLD_IS_SCENE_GROUND_OVERLAY_NODE(overlay));
+  g_assert_cmpstr(gworld_scene_ground_overlay_node_get_image_path(overlay), ==, "/tmp/example-overlay.png");
+
+  double top_left_lat = 0.0;
+  double top_left_lon = 0.0;
+  double top_right_lat = 0.0;
+  double top_right_lon = 0.0;
+  double bottom_right_lat = 0.0;
+  double bottom_right_lon = 0.0;
+  double bottom_left_lat = 0.0;
+  double bottom_left_lon = 0.0;
+  gworld_scene_ground_overlay_node_get_corners(overlay,
+                                               &top_left_lat,
+                                               &top_left_lon,
+                                               &top_right_lat,
+                                               &top_right_lon,
+                                               &bottom_right_lat,
+                                               &bottom_right_lon,
+                                               &bottom_left_lat,
+                                               &bottom_left_lon);
+  assert_near(top_left_lat, -34.99, 0.001);
+  assert_near(top_left_lon, 147.45, 0.001);
+  assert_near(top_right_lat, -34.99, 0.001);
+  assert_near(top_right_lon, 147.47, 0.001);
+  assert_near(bottom_right_lat, -35.01, 0.001);
+  assert_near(bottom_right_lon, 147.47, 0.001);
+  assert_near(bottom_left_lat, -35.01, 0.001);
+  assert_near(bottom_left_lon, 147.45, 0.001);
+  assert_near(gworld_scene_ground_overlay_node_get_opacity(overlay), 1.0, 0.001);
+  assert_near(gworld_scene_ground_overlay_node_get_altitude_offset(overlay), 1.0, 0.001);
+
+  gworld_scene_ground_overlay_node_set_opacity(overlay, 0.42);
+  gworld_scene_ground_overlay_node_set_altitude_offset(overlay, 2.5);
+  gworld_scene_ground_overlay_node_set_image_path(overlay, "/tmp/updated-overlay.png");
+
+  assert_near(gworld_scene_ground_overlay_node_get_opacity(overlay), 0.42, 0.001);
+  assert_near(gworld_scene_ground_overlay_node_get_altitude_offset(overlay), 2.5, 0.001);
+  g_assert_cmpstr(gworld_scene_ground_overlay_node_get_image_path(overlay), ==, "/tmp/updated-overlay.png");
+
+  g_object_unref(node);
+}
+
 } // namespace
 
 int
@@ -146,5 +253,7 @@ main(int argc, char **argv)
   g_test_add_func("/scene-node/translate-ned-updates-geodetic-position", test_translate_ned_updates_geodetic_position);
   g_test_add_func("/scene-node/mutations-emit-changed", test_mutations_emit_changed);
   g_test_add_func("/scene-node/model-node-stores-path-and-uses-white-default-color", test_model_node_stores_path_and_uses_white_default_color);
+  g_test_add_func("/scene-node/billboard-node-stores-image-and-size-policy", test_billboard_node_stores_image_and_size_policy);
+  g_test_add_func("/scene-node/ground-overlay-node-stores-image-corners-and-display-policy", test_ground_overlay_node_stores_image_corners_and_display_policy);
   return g_test_run();
 }

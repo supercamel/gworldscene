@@ -12,7 +12,14 @@ typedef enum {
   GWORLD_SCENE_PRIMITIVE_SPHERE,
   GWORLD_SCENE_PRIMITIVE_CYLINDER,
   GWORLD_SCENE_PRIMITIVE_MODEL,
+  GWORLD_SCENE_PRIMITIVE_BILLBOARD,
+  GWORLD_SCENE_PRIMITIVE_GROUND_OVERLAY,
 } GWorldScenePrimitive;
+
+typedef enum {
+  GWORLD_SCENE_ALTITUDE_AMSL,
+  GWORLD_SCENE_ALTITUDE_AGL,
+} GWorldSceneAltitudeMode;
 
 #define GWORLD_TYPE_SCENE_NODE (gworld_scene_node_get_type())
 
@@ -49,6 +56,20 @@ G_DECLARE_FINAL_TYPE(GWorldSceneModelNode,
                      gworld_scene_model_node,
                      GWORLD,
                      SCENE_MODEL_NODE,
+                     GWorldSceneNode)
+
+#define GWORLD_TYPE_SCENE_BILLBOARD_NODE (gworld_scene_billboard_node_get_type())
+G_DECLARE_FINAL_TYPE(GWorldSceneBillboardNode,
+                     gworld_scene_billboard_node,
+                     GWORLD,
+                     SCENE_BILLBOARD_NODE,
+                     GWorldSceneNode)
+
+#define GWORLD_TYPE_SCENE_GROUND_OVERLAY_NODE (gworld_scene_ground_overlay_node_get_type())
+G_DECLARE_FINAL_TYPE(GWorldSceneGroundOverlayNode,
+                     gworld_scene_ground_overlay_node,
+                     GWORLD,
+                     SCENE_GROUND_OVERLAY_NODE,
                      GWorldSceneNode)
 
 GWorldSceneNodeId gworld_scene_node_get_id(GWorldSceneNode *self);
@@ -137,6 +158,72 @@ void gworld_scene_model_node_set_model_path(GWorldSceneModelNode *self,
                                             const char *model_path);
 
 const char *gworld_scene_model_node_get_model_path(GWorldSceneModelNode *self);
+
+void gworld_scene_billboard_node_set_image_path(GWorldSceneBillboardNode *self,
+                                                const char *image_path);
+
+const char *gworld_scene_billboard_node_get_image_path(GWorldSceneBillboardNode *self);
+
+void gworld_scene_billboard_node_set_size_limits(GWorldSceneBillboardNode *self,
+                                                 double min_px,
+                                                 double max_px);
+
+void gworld_scene_billboard_node_get_size_limits(GWorldSceneBillboardNode *self,
+                                                 double *min_px,
+                                                 double *max_px);
+
+void gworld_scene_billboard_node_set_reference_size(GWorldSceneBillboardNode *self,
+                                                    double size_px,
+                                                    double distance_m);
+
+void gworld_scene_billboard_node_get_reference_size(GWorldSceneBillboardNode *self,
+                                                    double *size_px,
+                                                    double *distance_m);
+
+void gworld_scene_billboard_node_set_max_visible_distance(GWorldSceneBillboardNode *self,
+                                                          double distance_m);
+
+double gworld_scene_billboard_node_get_max_visible_distance(GWorldSceneBillboardNode *self);
+
+void gworld_scene_billboard_node_set_altitude_mode(GWorldSceneBillboardNode *self,
+                                                   GWorldSceneAltitudeMode altitude_mode);
+
+GWorldSceneAltitudeMode gworld_scene_billboard_node_get_altitude_mode(GWorldSceneBillboardNode *self);
+
+void gworld_scene_ground_overlay_node_set_image_path(GWorldSceneGroundOverlayNode *self,
+                                                     const char *image_path);
+
+const char *gworld_scene_ground_overlay_node_get_image_path(GWorldSceneGroundOverlayNode *self);
+
+void gworld_scene_ground_overlay_node_set_corners(GWorldSceneGroundOverlayNode *self,
+                                                  double top_left_latitude,
+                                                  double top_left_longitude,
+                                                  double top_right_latitude,
+                                                  double top_right_longitude,
+                                                  double bottom_right_latitude,
+                                                  double bottom_right_longitude,
+                                                  double bottom_left_latitude,
+                                                  double bottom_left_longitude);
+
+void gworld_scene_ground_overlay_node_get_corners(GWorldSceneGroundOverlayNode *self,
+                                                  double *top_left_latitude,
+                                                  double *top_left_longitude,
+                                                  double *top_right_latitude,
+                                                  double *top_right_longitude,
+                                                  double *bottom_right_latitude,
+                                                  double *bottom_right_longitude,
+                                                  double *bottom_left_latitude,
+                                                  double *bottom_left_longitude);
+
+void gworld_scene_ground_overlay_node_set_opacity(GWorldSceneGroundOverlayNode *self,
+                                                  double opacity);
+
+double gworld_scene_ground_overlay_node_get_opacity(GWorldSceneGroundOverlayNode *self);
+
+void gworld_scene_ground_overlay_node_set_altitude_offset(GWorldSceneGroundOverlayNode *self,
+                                                          double altitude_offset_m);
+
+double gworld_scene_ground_overlay_node_get_altitude_offset(GWorldSceneGroundOverlayNode *self);
 
 void gworld_scene_node_set_dimensions(GWorldSceneNode *self,
                                       double width_m,

@@ -76,6 +76,18 @@ gworldscene_gir = gnome.generate_gir(
   install: true,
 )
 
+gworldscene_vapi = gnome.generate_vapi(
+  'GWorldScene-' + gworldscene_api_version,
+  sources: gworldscene_gir[0],
+  metadata_dirs: [meson.current_source_dir()],
+  packages: ['gtk4'],
+  install: true,
+)
+
+gworldscene_vapi_dep = declare_dependency(
+  dependencies: gworldscene_vapi,
+)
+
 pkg.generate(
   gworldscene_lib,
   name: 'GWorldScene',

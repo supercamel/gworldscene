@@ -241,6 +241,43 @@ activate(GtkApplication *app, gpointer user_data)
                                                                      700.0);
   gworld_scene_node_set_color(GWORLD_SCENE_NODE(cylinder), 0.40, 0.78, 0.30);
 
+  g_autofree char *billboard_path =
+    find_demo_asset_path("examples/assets/BillboardMarker/map-symbol-location-02.png");
+  if (billboard_path != NULL) {
+    GWorldSceneBillboardNode *billboard =
+      gworld_scene_view_add_billboard(GWORLD_SCENE_VIEW(view),
+                                      billboard_path,
+                                      -34.9924,
+                                      147.4748,
+                                      1800.0);
+    gworld_scene_billboard_node_set_altitude_mode(billboard, GWORLD_SCENE_ALTITUDE_AGL);
+    gworld_scene_billboard_node_set_size_limits(billboard, 48.0, 180.0);
+    gworld_scene_billboard_node_set_reference_size(billboard, 140.0, 5000.0);
+    gworld_scene_billboard_node_set_max_visible_distance(billboard, 60000.0);
+  } else {
+    g_warning("Billboard marker demo image was not found");
+  }
+
+  g_autofree char *overlay_path =
+    find_demo_asset_path("examples/assets/GroundOverlay/aiga-heliport.png");
+  if (overlay_path != NULL) {
+    GWorldSceneGroundOverlayNode *ground_overlay =
+      gworld_scene_view_add_ground_overlay(GWORLD_SCENE_VIEW(view),
+                                           overlay_path,
+                                           -34.9962,
+                                           147.4660,
+                                           -34.9962,
+                                           147.4729,
+                                           -34.9998,
+                                           147.4729,
+                                           -34.9998,
+                                           147.4660);
+    gworld_scene_ground_overlay_node_set_opacity(ground_overlay, 0.78);
+    gworld_scene_ground_overlay_node_set_altitude_offset(ground_overlay, 1.4);
+  } else {
+    g_warning("Ground overlay demo image was not found");
+  }
+
   g_autofree char *model_path =
     find_demo_asset_path("examples/assets/ToyCar/ToyCar.glb");
   if (model_path != NULL) {
