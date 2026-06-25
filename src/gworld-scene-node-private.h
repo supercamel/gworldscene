@@ -47,4 +47,20 @@ GWorldSceneGroundOverlayNode *_gworld_scene_ground_overlay_node_new(GWorldSceneN
                                                                     double bottom_left_latitude,
                                                                     double bottom_left_longitude);
 
+GWorldScenePolylineNode *_gworld_scene_polyline_node_new(GWorldSceneNodeId id);
+
+GWorldScenePolygonNode *_gworld_scene_polygon_node_new(GWorldSceneNodeId id);
+
+GWorldSceneCircleNode *_gworld_scene_circle_node_new(GWorldSceneNodeId id,
+                                                     double latitude,
+                                                     double longitude,
+                                                     double altitude_amsl,
+                                                     double radius_m);
+
+GWorldSceneTextLabelNode *_gworld_scene_text_label_node_new(GWorldSceneNodeId id,
+                                                            const char *text,
+                                                            double latitude,
+                                                            double longitude,
+                                                            double altitude_amsl);
+
 #endif /* GWORLD_SCENE_NODE_PRIVATE_H */

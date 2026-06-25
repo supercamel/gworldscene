@@ -503,6 +503,14 @@ namespace GWorldSceneControls {
         return "billboard";
       case GWorld.ScenePrimitive.GROUND_OVERLAY:
         return "ground overlay";
+      case GWorld.ScenePrimitive.POLYLINE:
+        return "polyline";
+      case GWorld.ScenePrimitive.POLYGON:
+        return "polygon";
+      case GWorld.ScenePrimitive.CIRCLE:
+        return "circle";
+      case GWorld.ScenePrimitive.TEXT_LABEL:
+        return "text label";
       default:
         return "node";
       }
@@ -560,6 +568,40 @@ namespace GWorldSceneControls {
 
       var cylinder = scene.add_cylinder (-34.9980, 147.4560, 760.0, 320.0, 700.0);
       cylinder.set_color (0.40, 0.78, 0.30);
+
+      var route = scene.add_polyline ();
+      route.set_color (0.95, 0.86, 0.18);
+      route.set_width (35.0);
+      route.set_opacity (0.92);
+      route.set_altitude_mode (GWorld.SceneAltitudeMode.AGL);
+      route.append_point (-35.0105, 147.4480, 90.0);
+      route.append_point (-35.0060, 147.4575, 120.0);
+      route.append_point (-35.0010, 147.4665, 140.0);
+      route.append_point (-34.9960, 147.4785, 110.0);
+
+      var zone = scene.add_polygon ();
+      zone.set_altitude_mode (GWorld.SceneAltitudeMode.AGL);
+      zone.set_fill_color (0.05, 0.48, 0.95, 0.24);
+      zone.set_outline_color (0.10, 0.75, 1.0, 0.9);
+      zone.set_outline_width (22.0);
+      zone.append_point (-35.0100, 147.4700, 18.0);
+      zone.append_point (-35.0040, 147.4820, 18.0);
+      zone.append_point (-35.0140, 147.4910, 18.0);
+      zone.append_point (-35.0200, 147.4770, 18.0);
+
+      var bubble = scene.add_circle (-34.9908, 147.4620, 15.0, 850.0);
+      bubble.set_altitude_mode (GWorld.SceneAltitudeMode.AGL);
+      bubble.set_fill_color (0.18, 0.85, 0.42, 0.18);
+      bubble.set_outline_color (0.20, 1.0, 0.45, 0.9);
+      bubble.set_outline_width (20.0);
+      bubble.set_segments (96);
+
+      var label = scene.add_text_label ("Training zone", -34.9908, 147.4620, 220.0);
+      label.set_altitude_mode (GWorld.SceneAltitudeMode.AGL);
+      label.set_font ("Sans Bold 22");
+      label.set_size_limits (54.0, 240.0);
+      label.set_reference_size (160.0, 4500.0);
+      label.set_max_visible_distance (60000.0);
 
       var billboard_path = find_demo_asset_path ("examples/assets/BillboardMarker/map-symbol-location-02.png");
       if (billboard_path != null) {

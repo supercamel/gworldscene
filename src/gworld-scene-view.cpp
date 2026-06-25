@@ -28,6 +28,7 @@
 #include <glm/gtc/matrix_transform.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <libsoup/soup.h>
+#include <pango/pangocairo.h>
 #include <zlib.h>
 
 #include <algorithm>
@@ -68,7 +69,7 @@ constexpr int kMaxUltraAtlasTilesPerAxis = kMaxAtlasPixels / kAtlasTilePixels;
 constexpr int kMaxUltraAtlasTiles = kMaxUltraAtlasTilesPerAxis * kMaxUltraAtlasTilesPerAxis;
 constexpr int kGlobeLatSegments = 64;
 constexpr int kGlobeLonSegments = 128;
-constexpr int kVertexStride = 18;
+constexpr int kVertexStride = 19;
 constexpr int kSphereSegments = 24;
 constexpr int kSphereRings = 12;
 constexpr int kCylinderSegments = 32;
@@ -86,6 +87,8 @@ constexpr double kDefaultPerfUploadThresholdMs = 3.0;
 constexpr int kMaxSceneImageTexturePixels = 2048;
 constexpr int kGroundOverlayCellMargin = 1;
 constexpr double kGroundOverlayTerrainLoadMarginM = 250.0;
+constexpr double kTerrainPolygonSurfaceOffsetM = 1.0;
+constexpr double kTerrainPolygonOutlineOffsetM = 1.5;
 constexpr double kClickDragThresholdPx = 4.0;
 constexpr double kClickCameraRotationThresholdDeg = 0.01;
 constexpr double kSunAngularRadiusDeg = 0.266;
@@ -187,6 +190,12 @@ struct SceneImageTexture {
 
 struct BillboardRenderItem {
   std::string image_path;
+  std::string text;
+  std::string font;
+  glm::vec4 text_color = glm::vec4(1.0f);
+  glm::vec4 background_color = glm::vec4(0.0f);
+  double padding_px = 0.0;
+  bool generated_text = false;
   double latitude = 0.0;
   double longitude = 0.0;
   double altitude_amsl = 0.0;
@@ -263,7 +272,7 @@ struct SceneNode {
   double scale_x = 1.0;
   double scale_y = 1.0;
   double scale_z = 1.0;
-  glm::vec3 color = glm::vec3(0.96f, 0.54f, 0.20f);
+  glm::vec4 color = glm::vec4(0.96f, 0.54f, 0.20f, 1.0f);
   std::string model_path;
 };
 
@@ -1188,6 +1197,33 @@ ground_overlay_bounds_from_corners(const double latitude[4], const double longit
   return bounds;
 }
 
+LatLonBounds
+geo_point_bounds(const GWorldSceneGeoPoint *points, gsize n_points)
+{
+  LatLonBounds bounds;
+  if (points == nullptr || n_points == 0)
+    return bounds;
+
+  bounds.min_lat = points[0].latitude;
+  bounds.max_lat = points[0].latitude;
+  bounds.min_lon = points[0].longitude;
+  bounds.max_lon = points[0].longitude;
+  for (gsize i = 1; i < n_points; ++i) {
+    bounds.min_lat = std::min(bounds.min_lat, points[i].latitude);
+    bounds.max_lat = std::max(bounds.max_lat, points[i].latitude);
+    bounds.min_lon = std::min(bounds.min_lon, points[i].longitude);
+    bounds.max_lon = std::max(bounds.max_lon, points[i].longitude);
+  }
+  return bounds;
+}
+
+bool
+altitude_mode_uses_terrain(GWorldSceneAltitudeMode altitude_mode)
+{
+  return altitude_mode == GWORLD_SCENE_ALTITUDE_AGL ||
+         altitude_mode == GWORLD_SCENE_ALTITUDE_CLAMP_TO_GROUND;
+}
+
 AtlasRange
 select_ultra_atlas_range(double latitude,
                          double longitude,
@@ -1607,6 +1643,16 @@ terrain_height_at_lat_lon_locked(GWorldSceneViewState *state,
   return true;
 }
 
+glm::vec4 rgba_from_components(double red, double green, double blue, double alpha);
+double altitude_for_mode_locked(GWorldSceneViewState *state,
+                                double latitude,
+                                double longitude,
+                                double altitude_amsl,
+                                GWorldSceneAltitudeMode altitude_mode);
+glm::dvec3 geo_point_position_locked(GWorldSceneViewState *state,
+                                     const GWorldSceneGeoPoint &point,
+                                     GWorldSceneAltitudeMode altitude_mode);
+
 void
 collect_billboards_locked(GWorldSceneViewState *state, std::vector<BillboardRenderItem> &billboards)
 {
@@ -1615,31 +1661,68 @@ collect_billboards_locked(GWorldSceneViewState *state, std::vector<BillboardRend
 
   for (const auto &entry : state->scene_nodes) {
     GWorldSceneNode *scene_node = entry.second;
-    if (!GWORLD_IS_SCENE_BILLBOARD_NODE(scene_node))
-      continue;
 
-    auto *billboard = GWORLD_SCENE_BILLBOARD_NODE(scene_node);
-    const char *image_path = gworld_scene_billboard_node_get_image_path(billboard);
-    if (image_path == nullptr)
-      continue;
+    if (GWORLD_IS_SCENE_TEXT_LABEL_NODE(scene_node)) {
+      auto *label = GWORLD_SCENE_TEXT_LABEL_NODE(scene_node);
+      const char *text = gworld_scene_text_label_node_get_text(label);
+      if (text == nullptr)
+        continue;
 
-    BillboardRenderItem item;
-    item.image_path = image_path;
-    gworld_scene_node_get_position(scene_node,
-                                   &item.latitude,
-                                   &item.longitude,
-                                   &item.altitude_amsl);
-    if (gworld_scene_billboard_node_get_altitude_mode(billboard) == GWORLD_SCENE_ALTITUDE_AGL) {
-      double terrain_height = 0.0;
-      if (terrain_height_at_lat_lon_locked(state, item.latitude, item.longitude, terrain_height))
-        item.altitude_amsl += terrain_height;
+      BillboardRenderItem item;
+      item.generated_text = true;
+      item.text = text;
+      item.font = gworld_scene_text_label_node_get_font(label);
+      item.padding_px = gworld_scene_text_label_node_get_padding(label);
+      double red = 0.0;
+      double green = 0.0;
+      double blue = 0.0;
+      double alpha = 0.0;
+      gworld_scene_text_label_node_get_text_color(label, &red, &green, &blue, &alpha);
+      item.text_color = rgba_from_components(red, green, blue, alpha);
+      gworld_scene_text_label_node_get_background_color(label, &red, &green, &blue, &alpha);
+      item.background_color = rgba_from_components(red, green, blue, alpha);
+      gworld_scene_node_get_position(scene_node,
+                                     &item.latitude,
+                                     &item.longitude,
+                                     &item.altitude_amsl);
+      item.altitude_amsl = altitude_for_mode_locked(state,
+                                                    item.latitude,
+                                                    item.longitude,
+                                                    item.altitude_amsl,
+                                                    gworld_scene_text_label_node_get_altitude_mode(label));
+      gworld_scene_text_label_node_get_size_limits(label, &item.min_px, &item.max_px);
+      gworld_scene_text_label_node_get_reference_size(label,
+                                                      &item.reference_size_px,
+                                                      &item.reference_distance_m);
+      item.max_visible_distance_m = gworld_scene_text_label_node_get_max_visible_distance(label);
+      billboards.push_back(std::move(item));
+      continue;
     }
-    gworld_scene_billboard_node_get_size_limits(billboard, &item.min_px, &item.max_px);
-    gworld_scene_billboard_node_get_reference_size(billboard,
-                                                   &item.reference_size_px,
-                                                   &item.reference_distance_m);
-    item.max_visible_distance_m = gworld_scene_billboard_node_get_max_visible_distance(billboard);
-    billboards.push_back(std::move(item));
+
+    if (GWORLD_IS_SCENE_BILLBOARD_NODE(scene_node)) {
+      auto *billboard = GWORLD_SCENE_BILLBOARD_NODE(scene_node);
+      const char *image_path = gworld_scene_billboard_node_get_image_path(billboard);
+      if (image_path == nullptr)
+        continue;
+
+      BillboardRenderItem item;
+      item.image_path = image_path;
+      gworld_scene_node_get_position(scene_node,
+                                     &item.latitude,
+                                     &item.longitude,
+                                     &item.altitude_amsl);
+      if (gworld_scene_billboard_node_get_altitude_mode(billboard) == GWORLD_SCENE_ALTITUDE_AGL) {
+        double terrain_height = 0.0;
+        if (terrain_height_at_lat_lon_locked(state, item.latitude, item.longitude, terrain_height))
+          item.altitude_amsl += terrain_height;
+      }
+      gworld_scene_billboard_node_get_size_limits(billboard, &item.min_px, &item.max_px);
+      gworld_scene_billboard_node_get_reference_size(billboard,
+                                                     &item.reference_size_px,
+                                                     &item.reference_distance_m);
+      item.max_visible_distance_m = gworld_scene_billboard_node_get_max_visible_distance(billboard);
+      billboards.push_back(std::move(item));
+    }
   }
 }
 
@@ -1686,28 +1769,85 @@ collect_ground_overlay_terrain_bounds_locked(GWorldSceneViewState *state,
   bounds.clear();
   for (const auto &entry : state->scene_nodes) {
     GWorldSceneNode *scene_node = entry.second;
-    if (!GWORLD_IS_SCENE_GROUND_OVERLAY_NODE(scene_node))
-      continue;
 
-    auto *overlay = GWORLD_SCENE_GROUND_OVERLAY_NODE(scene_node);
-    const char *image_path = gworld_scene_ground_overlay_node_get_image_path(overlay);
-    const double opacity = gworld_scene_ground_overlay_node_get_opacity(overlay);
-    if (image_path == nullptr || opacity <= 0.0)
-      continue;
+    if (GWORLD_IS_SCENE_POLYLINE_NODE(scene_node)) {
+      auto *polyline = GWORLD_SCENE_POLYLINE_NODE(scene_node);
+      if (!altitude_mode_uses_terrain(gworld_scene_polyline_node_get_altitude_mode(polyline)))
+        continue;
 
-    double lat[4] = {0.0, 0.0, 0.0, 0.0};
-    double lon[4] = {0.0, 0.0, 0.0, 0.0};
-    gworld_scene_ground_overlay_node_get_corners(overlay,
-                                                 &lat[0],
-                                                 &lon[0],
-                                                 &lat[1],
-                                                 &lon[1],
-                                                 &lat[2],
-                                                 &lon[2],
-                                                 &lat[3],
-                                                 &lon[3]);
-    bounds.push_back(expand_bounds_m(ground_overlay_bounds_from_corners(lat, lon),
-                                     kGroundOverlayTerrainLoadMarginM));
+      gsize n_points = 0;
+      const GWorldSceneGeoPoint *points = gworld_scene_polyline_node_get_points(polyline, &n_points);
+      if (points != nullptr && n_points > 0) {
+        bounds.push_back(expand_bounds_m(geo_point_bounds(points, n_points),
+                                         kGroundOverlayTerrainLoadMarginM));
+      }
+      continue;
+    }
+
+    if (GWORLD_IS_SCENE_POLYGON_NODE(scene_node)) {
+      auto *polygon = GWORLD_SCENE_POLYGON_NODE(scene_node);
+      if (!altitude_mode_uses_terrain(gworld_scene_polygon_node_get_altitude_mode(polygon)))
+        continue;
+
+      gsize n_points = 0;
+      const GWorldSceneGeoPoint *points = gworld_scene_polygon_node_get_points(polygon, &n_points);
+      if (points != nullptr && n_points > 0) {
+        bounds.push_back(expand_bounds_m(geo_point_bounds(points, n_points),
+                                         kGroundOverlayTerrainLoadMarginM));
+      }
+      continue;
+    }
+
+    if (GWORLD_IS_SCENE_CIRCLE_NODE(scene_node)) {
+      auto *circle = GWORLD_SCENE_CIRCLE_NODE(scene_node);
+      if (!altitude_mode_uses_terrain(gworld_scene_circle_node_get_altitude_mode(circle)))
+        continue;
+
+      double latitude = 0.0;
+      double longitude = 0.0;
+      double altitude = 0.0;
+      gworld_scene_node_get_position(scene_node, &latitude, &longitude, &altitude);
+      bounds.push_back(expand_bounds_m(bounds_around_camera(latitude,
+                                                            longitude,
+                                                            gworld_scene_circle_node_get_radius(circle)),
+                                       kGroundOverlayTerrainLoadMarginM));
+      continue;
+    }
+
+    if (GWORLD_IS_SCENE_TEXT_LABEL_NODE(scene_node)) {
+      auto *label = GWORLD_SCENE_TEXT_LABEL_NODE(scene_node);
+      if (!altitude_mode_uses_terrain(gworld_scene_text_label_node_get_altitude_mode(label)))
+        continue;
+
+      double latitude = 0.0;
+      double longitude = 0.0;
+      double altitude = 0.0;
+      gworld_scene_node_get_position(scene_node, &latitude, &longitude, &altitude);
+      bounds.push_back(bounds_around_camera(latitude, longitude, kGroundOverlayTerrainLoadMarginM));
+      continue;
+    }
+
+    if (GWORLD_IS_SCENE_GROUND_OVERLAY_NODE(scene_node)) {
+      auto *overlay = GWORLD_SCENE_GROUND_OVERLAY_NODE(scene_node);
+      const char *image_path = gworld_scene_ground_overlay_node_get_image_path(overlay);
+      const double opacity = gworld_scene_ground_overlay_node_get_opacity(overlay);
+      if (image_path == nullptr || opacity <= 0.0)
+        continue;
+
+      double lat[4] = {0.0, 0.0, 0.0, 0.0};
+      double lon[4] = {0.0, 0.0, 0.0, 0.0};
+      gworld_scene_ground_overlay_node_get_corners(overlay,
+                                                   &lat[0],
+                                                   &lon[0],
+                                                   &lat[1],
+                                                   &lon[1],
+                                                   &lat[2],
+                                                   &lon[2],
+                                                   &lat[3],
+                                                   &lon[3]);
+      bounds.push_back(expand_bounds_m(ground_overlay_bounds_from_corners(lat, lon),
+                                       kGroundOverlayTerrainLoadMarginM));
+    }
   }
 }
 
@@ -2258,7 +2398,7 @@ float
 mesh_vertex_material(const std::vector<float> &vertices, unsigned int vertex_index)
 {
   const std::size_t base = static_cast<std::size_t>(vertex_index) * kVertexStride;
-  return vertices[base + 17];
+  return vertices[base + 18];
 }
 
 void
@@ -2442,6 +2582,67 @@ pick_billboard_node_locked(GWorldSceneViewState *state,
 }
 
 bool
+pick_text_label_node_locked(GWorldSceneViewState *state,
+                            GWorldSceneNode *scene_node,
+                            const gworld_scene::PickRay &ray,
+                            double widget_x,
+                            double widget_y,
+                            ScenePickResult &best)
+{
+  auto *label = GWORLD_SCENE_TEXT_LABEL_NODE(scene_node);
+  const char *text = gworld_scene_text_label_node_get_text(label);
+  if (text == nullptr)
+    return false;
+
+  double latitude = 0.0;
+  double longitude = 0.0;
+  double altitude_amsl = 0.0;
+  gworld_scene_node_get_position(scene_node, &latitude, &longitude, &altitude_amsl);
+  altitude_amsl = altitude_for_mode_locked(state,
+                                           latitude,
+                                           longitude,
+                                           altitude_amsl,
+                                           gworld_scene_text_label_node_get_altitude_mode(label));
+
+  const glm::dvec3 center = geodetic_to_enu(latitude,
+                                            longitude,
+                                            altitude_amsl,
+                                            state->mesh_origin_latitude,
+                                            state->mesh_origin_longitude,
+                                            0.0);
+  const double distance = glm::length(center - ray.origin);
+  const double max_visible_distance = gworld_scene_text_label_node_get_max_visible_distance(label);
+  if (max_visible_distance > 0.0 && distance > max_visible_distance)
+    return false;
+
+  double center_x = 0.0;
+  double center_y = 0.0;
+  double depth = 0.0;
+  if (!gworld_scene::project_scene_point_to_widget(ray, center, center_x, center_y, depth))
+    return false;
+
+  double min_px = 0.0;
+  double max_px = 0.0;
+  double reference_size_px = 0.0;
+  double reference_distance_m = 0.0;
+  gworld_scene_text_label_node_get_size_limits(label, &min_px, &max_px);
+  gworld_scene_text_label_node_get_reference_size(label,
+                                                  &reference_size_px,
+                                                  &reference_distance_m);
+  const double target_width_px =
+    std::clamp(reference_size_px * (reference_distance_m / std::max(distance, 1.0)),
+               min_px,
+               max_px);
+  const double aspect = std::clamp(static_cast<double>(std::strlen(text)) * 0.55 + 1.0, 1.0, 8.0);
+  const double target_height_px = target_width_px / aspect;
+  if (std::abs(widget_x - center_x) > target_width_px * 0.5 ||
+      std::abs(widget_y - center_y) > target_height_px * 0.5)
+    return false;
+
+  return try_update_pick(best, scene_node, distance, latitude, longitude, altitude_amsl, false);
+}
+
+bool
 pick_model_node_locked(GWorldSceneViewState *state,
                        GWorldSceneNode *scene_node,
                        const SceneNode &node,
@@ -2532,6 +2733,241 @@ pick_bounded_node_locked(GWorldSceneViewState *state,
                          candidate.longitude,
                          candidate.altitude_amsl,
                          false);
+}
+
+bool
+try_update_pick_from_scene_position(GWorldSceneViewState *state,
+                                    ScenePickResult &best,
+                                    GWorldSceneNode *scene_node,
+                                    double distance,
+                                    const glm::dvec3 &position)
+{
+  ScenePickResult candidate;
+  fill_pick_location_from_scene_position_locked(state, position, candidate);
+  return try_update_pick(best,
+                         scene_node,
+                         distance,
+                         candidate.latitude,
+                         candidate.longitude,
+                         candidate.altitude_amsl,
+                         false);
+}
+
+bool
+pick_triangle_node_locked(GWorldSceneViewState *state,
+                          GWorldSceneNode *scene_node,
+                          const gworld_scene::PickRay &ray,
+                          const glm::dvec3 &p0,
+                          const glm::dvec3 &p1,
+                          const glm::dvec3 &p2,
+                          ScenePickResult &best)
+{
+  double distance = 0.0;
+  if (!gworld_scene::ray_intersects_triangle(ray, p0, p1, p2, distance))
+    return false;
+  if (distance >= best.distance_m)
+    return false;
+
+  const glm::dvec3 position = ray.origin + ray.direction * distance;
+  return try_update_pick_from_scene_position(state, best, scene_node, distance, position);
+}
+
+bool
+pick_polyline_segment_locked(GWorldSceneViewState *state,
+                             GWorldSceneNode *scene_node,
+                             const gworld_scene::PickRay &ray,
+                             const glm::dvec3 &p0,
+                             const glm::dvec3 &p1,
+                             double width_m,
+                             ScenePickResult &best)
+{
+  if (width_m <= 0.0 || glm::length(p1 - p0) <= 0.000001)
+    return false;
+
+  glm::dvec3 side = glm::cross(glm::normalize(p1 - p0), glm::dvec3(0.0, 1.0, 0.0));
+  if (glm::length(side) <= 0.000001)
+    side = glm::dvec3(1.0, 0.0, 0.0);
+  else
+    side = glm::normalize(side);
+  side *= width_m * 0.5;
+
+  const glm::dvec3 a = p0 - side;
+  const glm::dvec3 b = p1 - side;
+  const glm::dvec3 c = p1 + side;
+  const glm::dvec3 d = p0 + side;
+  return pick_triangle_node_locked(state, scene_node, ray, a, b, c, best) ||
+         pick_triangle_node_locked(state, scene_node, ray, a, c, d, best);
+}
+
+bool
+pick_polyline_points_locked(GWorldSceneViewState *state,
+                            GWorldSceneNode *scene_node,
+                            const gworld_scene::PickRay &ray,
+                            const GWorldSceneGeoPoint *points,
+                            gsize n_points,
+                            bool closed,
+                            double width_m,
+                            GWorldSceneAltitudeMode altitude_mode,
+                            ScenePickResult &best)
+{
+  if (points == nullptr || n_points < 2 || width_m <= 0.0)
+    return false;
+
+  std::vector<glm::dvec3> positions;
+  positions.reserve(n_points);
+  for (gsize i = 0; i < n_points; ++i)
+    positions.push_back(geo_point_position_locked(state, points[i], altitude_mode));
+
+  bool picked = false;
+  for (gsize i = 0; i + 1 < n_points; ++i)
+    picked = pick_polyline_segment_locked(state, scene_node, ray, positions[i], positions[i + 1], width_m, best) ||
+             picked;
+
+  if (closed && n_points > 2)
+    picked = pick_polyline_segment_locked(state, scene_node, ray, positions.back(), positions.front(), width_m, best) ||
+             picked;
+
+  return picked;
+}
+
+bool
+pick_polyline_primitive_locked(GWorldSceneViewState *state,
+                               GWorldSceneNode *scene_node,
+                               const gworld_scene::PickRay &ray,
+                               ScenePickResult &best)
+{
+  auto *polyline = GWORLD_SCENE_POLYLINE_NODE(scene_node);
+  if (gworld_scene_polyline_node_get_opacity(polyline) <= 0.0)
+    return false;
+
+  gsize n_points = 0;
+  const GWorldSceneGeoPoint *points = gworld_scene_polyline_node_get_points(polyline, &n_points);
+  return pick_polyline_points_locked(state,
+                                     scene_node,
+                                     ray,
+                                     points,
+                                     n_points,
+                                     false,
+                                     gworld_scene_polyline_node_get_width(polyline),
+                                     gworld_scene_polyline_node_get_altitude_mode(polyline),
+                                     best);
+}
+
+bool
+pick_polygon_primitive_locked(GWorldSceneViewState *state,
+                              GWorldSceneNode *scene_node,
+                              const gworld_scene::PickRay &ray,
+                              ScenePickResult &best)
+{
+  auto *polygon = GWORLD_SCENE_POLYGON_NODE(scene_node);
+  gsize n_points = 0;
+  const GWorldSceneGeoPoint *points = gworld_scene_polygon_node_get_points(polygon, &n_points);
+  if (points == nullptr || n_points < 3)
+    return false;
+
+  const GWorldSceneAltitudeMode altitude_mode = gworld_scene_polygon_node_get_altitude_mode(polygon);
+  std::vector<glm::dvec3> positions;
+  positions.reserve(n_points);
+  for (gsize i = 0; i < n_points; ++i)
+    positions.push_back(geo_point_position_locked(state, points[i], altitude_mode));
+
+  bool picked = false;
+  double red = 0.0;
+  double green = 0.0;
+  double blue = 0.0;
+  double alpha = 0.0;
+  gworld_scene_polygon_node_get_fill_color(polygon, &red, &green, &blue, &alpha);
+  if (alpha > 0.0) {
+    for (gsize i = 1; i + 1 < n_points; ++i)
+      picked = pick_triangle_node_locked(state,
+                                         scene_node,
+                                         ray,
+                                         positions[0],
+                                         positions[i],
+                                         positions[i + 1],
+                                         best) ||
+               picked;
+  }
+
+  gworld_scene_polygon_node_get_outline_color(polygon, &red, &green, &blue, &alpha);
+  if (alpha > 0.0) {
+    picked = pick_polyline_points_locked(state,
+                                         scene_node,
+                                         ray,
+                                         points,
+                                         n_points,
+                                         true,
+                                         gworld_scene_polygon_node_get_outline_width(polygon),
+                                         altitude_mode,
+                                         best) ||
+             picked;
+  }
+  return picked;
+}
+
+bool
+pick_circle_primitive_locked(GWorldSceneViewState *state,
+                             GWorldSceneNode *scene_node,
+                             const gworld_scene::PickRay &ray,
+                             ScenePickResult &best)
+{
+  auto *circle = GWORLD_SCENE_CIRCLE_NODE(scene_node);
+  double center_latitude = 0.0;
+  double center_longitude = 0.0;
+  double center_altitude = 0.0;
+  gworld_scene_node_get_position(scene_node, &center_latitude, &center_longitude, &center_altitude);
+  const guint segments = std::max(12u, gworld_scene_circle_node_get_segments(circle));
+  const double radius_m = gworld_scene_circle_node_get_radius(circle);
+  const GWorldSceneAltitudeMode altitude_mode = gworld_scene_circle_node_get_altitude_mode(circle);
+  const GWorldSceneGeoPoint center_point{center_latitude, center_longitude, center_altitude};
+  const glm::dvec3 center = geo_point_position_locked(state, center_point, altitude_mode);
+
+  std::vector<GWorldSceneGeoPoint> points;
+  points.reserve(segments);
+  for (guint i = 0; i < segments; ++i) {
+    const double theta = 2.0 * kPi * static_cast<double>(i) / static_cast<double>(segments);
+    double latitude = center_latitude;
+    double longitude = center_longitude;
+    gworld_scene::translate_geodetic_ned(center_latitude,
+                                         center_longitude,
+                                         center_altitude,
+                                         std::cos(theta) * radius_m,
+                                         std::sin(theta) * radius_m,
+                                         0.0,
+                                         &latitude,
+                                         &longitude,
+                                         nullptr);
+    points.push_back({latitude, longitude, center_altitude});
+  }
+
+  bool picked = false;
+  double red = 0.0;
+  double green = 0.0;
+  double blue = 0.0;
+  double alpha = 0.0;
+  gworld_scene_circle_node_get_fill_color(circle, &red, &green, &blue, &alpha);
+  if (alpha > 0.0) {
+    for (guint i = 0; i < segments; ++i) {
+      const glm::dvec3 p0 = geo_point_position_locked(state, points[i], altitude_mode);
+      const glm::dvec3 p1 = geo_point_position_locked(state, points[(i + 1) % segments], altitude_mode);
+      picked = pick_triangle_node_locked(state, scene_node, ray, center, p0, p1, best) || picked;
+    }
+  }
+
+  gworld_scene_circle_node_get_outline_color(circle, &red, &green, &blue, &alpha);
+  if (alpha > 0.0) {
+    picked = pick_polyline_points_locked(state,
+                                         scene_node,
+                                         ray,
+                                         points.data(),
+                                         points.size(),
+                                         true,
+                                         gworld_scene_circle_node_get_outline_width(circle),
+                                         altitude_mode,
+                                         best) ||
+             picked;
+  }
+  return picked;
 }
 
 bool
@@ -2654,6 +3090,22 @@ pick_scene_locked(GWorldSceneViewState *state,
       pick_billboard_node_locked(state, scene_node, ray, widget_x, widget_y, best);
       continue;
     }
+    if (GWORLD_IS_SCENE_TEXT_LABEL_NODE(scene_node)) {
+      pick_text_label_node_locked(state, scene_node, ray, widget_x, widget_y, best);
+      continue;
+    }
+    if (GWORLD_IS_SCENE_POLYLINE_NODE(scene_node)) {
+      pick_polyline_primitive_locked(state, scene_node, ray, best);
+      continue;
+    }
+    if (GWORLD_IS_SCENE_POLYGON_NODE(scene_node)) {
+      pick_polygon_primitive_locked(state, scene_node, ray, best);
+      continue;
+    }
+    if (GWORLD_IS_SCENE_CIRCLE_NODE(scene_node)) {
+      pick_circle_primitive_locked(state, scene_node, ray, best);
+      continue;
+    }
 
     SceneNode node;
     if (!scene_node_snapshot_locked(scene_node, node))
@@ -2675,7 +3127,7 @@ append_vertex(std::vector<float> &vertices,
               const glm::dvec3 &position,
               const TexCoords &uv,
               const glm::vec3 &normal,
-              const glm::vec3 &color = glm::vec3(1.0f),
+              const glm::vec4 &color = glm::vec4(1.0f),
               float material = kMaterialTerrain)
 {
   vertices.push_back(static_cast<float>(position.x));
@@ -2695,6 +3147,7 @@ append_vertex(std::vector<float> &vertices,
   vertices.push_back(color.r);
   vertices.push_back(color.g);
   vertices.push_back(color.b);
+  vertices.push_back(color.a);
   vertices.push_back(material);
 }
 
@@ -2704,6 +3157,15 @@ clamp_color(const glm::vec3 &color)
   return glm::vec3(std::clamp(color.r, 0.0f, 1.0f),
                    std::clamp(color.g, 0.0f, 1.0f),
                    std::clamp(color.b, 0.0f, 1.0f));
+}
+
+glm::vec4
+clamp_color_alpha(const glm::vec4 &color)
+{
+  return glm::vec4(std::clamp(color.r, 0.0f, 1.0f),
+                   std::clamp(color.g, 0.0f, 1.0f),
+                   std::clamp(color.b, 0.0f, 1.0f),
+                   std::clamp(color.a, 0.0f, 1.0f));
 }
 
 bool
@@ -2795,10 +3257,10 @@ load_image_rgba_scaled(const std::string &path,
 
 bool
 load_scene_image_rgba(const std::string &path,
-                          std::vector<unsigned char> &pixels,
-                          int &width,
-                          int &height,
-                          std::string *error_message = nullptr)
+                      std::vector<unsigned char> &pixels,
+                      int &width,
+                      int &height,
+                      std::string *error_message = nullptr)
 {
   g_autoptr(GError) error = nullptr;
   GdkPixbuf *pixbuf = gdk_pixbuf_new_from_file(path.c_str(), &error);
@@ -2827,6 +3289,101 @@ load_scene_image_rgba(const std::string &path,
   const bool result = copy_pixbuf_rgba_scaled(pixbuf, width, height, pixels, error_message);
   g_object_unref(pixbuf);
   return result;
+}
+
+bool
+render_text_label_rgba(const BillboardRenderItem &label,
+                       std::vector<unsigned char> &pixels,
+                       int &width,
+                       int &height,
+                       std::string *error_message = nullptr)
+{
+  const std::string text = label.text.empty() ? " " : label.text;
+  const std::string font = label.font.empty() ? "Sans Bold 18" : label.font;
+  const int padding = std::clamp(static_cast<int>(std::lround(label.padding_px)), 0, 256);
+  const int max_texture_size = kMaxSceneImageTexturePixels;
+
+  cairo_surface_t *measure_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+  cairo_t *measure_cr = cairo_create(measure_surface);
+  PangoLayout *layout = pango_cairo_create_layout(measure_cr);
+  PangoFontDescription *font_desc = pango_font_description_from_string(font.c_str());
+  pango_layout_set_font_description(layout, font_desc);
+  pango_layout_set_text(layout, text.c_str(), -1);
+  pango_layout_set_single_paragraph_mode(layout, TRUE);
+  pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END);
+  pango_layout_set_width(layout, std::max(1, max_texture_size - padding * 2) * PANGO_SCALE);
+
+  int text_width = 0;
+  int text_height = 0;
+  pango_layout_get_pixel_size(layout, &text_width, &text_height);
+  width = std::clamp(text_width + padding * 2, 1, max_texture_size);
+  height = std::clamp(text_height + padding * 2, 1, max_texture_size);
+
+  g_object_unref(layout);
+  pango_font_description_free(font_desc);
+  cairo_destroy(measure_cr);
+  cairo_surface_destroy(measure_surface);
+
+  cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
+  cairo_t *cr = cairo_create(surface);
+  cairo_set_source_rgba(cr,
+                        label.background_color.r,
+                        label.background_color.g,
+                        label.background_color.b,
+                        label.background_color.a);
+  cairo_paint(cr);
+
+  layout = pango_cairo_create_layout(cr);
+  font_desc = pango_font_description_from_string(font.c_str());
+  pango_layout_set_font_description(layout, font_desc);
+  pango_layout_set_text(layout, text.c_str(), -1);
+  pango_layout_set_single_paragraph_mode(layout, TRUE);
+  pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END);
+  pango_layout_set_width(layout, std::max(1, width - padding * 2) * PANGO_SCALE);
+  cairo_set_source_rgba(cr,
+                        label.text_color.r,
+                        label.text_color.g,
+                        label.text_color.b,
+                        label.text_color.a);
+  cairo_move_to(cr, padding, padding);
+  pango_cairo_show_layout(cr, layout);
+  cairo_surface_flush(surface);
+
+  const unsigned char *source = cairo_image_surface_get_data(surface);
+  const int stride = cairo_image_surface_get_stride(surface);
+  if (source == nullptr || stride <= 0) {
+    if (error_message)
+      *error_message = "invalid cairo text surface";
+    g_object_unref(layout);
+    pango_font_description_free(font_desc);
+    cairo_destroy(cr);
+    cairo_surface_destroy(surface);
+    return false;
+  }
+
+  pixels.assign(static_cast<std::size_t>(width * height * 4), 0);
+  for (int y = 0; y < height; ++y) {
+    for (int x = 0; x < width; ++x) {
+      const unsigned char *src = source + static_cast<std::size_t>(y * stride + x * 4);
+      const unsigned char b = src[0];
+      const unsigned char g = src[1];
+      const unsigned char r = src[2];
+      const unsigned char a = src[3];
+      const std::size_t dst = static_cast<std::size_t>((y * width + x) * 4);
+      if (a > 0) {
+        pixels[dst + 0] = static_cast<unsigned char>(std::min(255, (static_cast<int>(r) * 255) / a));
+        pixels[dst + 1] = static_cast<unsigned char>(std::min(255, (static_cast<int>(g) * 255) / a));
+        pixels[dst + 2] = static_cast<unsigned char>(std::min(255, (static_cast<int>(b) * 255) / a));
+      }
+      pixels[dst + 3] = a;
+    }
+  }
+
+  g_object_unref(layout);
+  pango_font_description_free(font_desc);
+  cairo_destroy(cr);
+  cairo_surface_destroy(surface);
+  return true;
 }
 
 bool
@@ -3292,7 +3849,7 @@ append_solid_triangle(std::vector<float> &vertices,
                       const glm::dvec3 &p0,
                       const glm::dvec3 &p1,
                       const glm::dvec3 &p2,
-                      const glm::vec3 &color)
+                      const glm::vec4 &color)
 {
   glm::dvec3 n64 = glm::cross(p1 - p0, p2 - p0);
   if (glm::length(n64) <= 0.000001)
@@ -3320,10 +3877,731 @@ append_solid_quad(std::vector<float> &vertices,
                   const glm::dvec3 &p1,
                   const glm::dvec3 &p2,
                   const glm::dvec3 &p3,
-                  const glm::vec3 &color)
+                  const glm::vec4 &color)
 {
   append_solid_triangle(vertices, indices, p0, p1, p2, color);
   append_solid_triangle(vertices, indices, p0, p2, p3, color);
+}
+
+glm::vec4
+rgba_from_components(double red, double green, double blue, double alpha)
+{
+  return clamp_color_alpha(glm::vec4(static_cast<float>(red),
+                                     static_cast<float>(green),
+                                     static_cast<float>(blue),
+                                     static_cast<float>(alpha)));
+}
+
+double
+altitude_for_mode_locked(GWorldSceneViewState *state,
+                         double latitude,
+                         double longitude,
+                         double altitude_amsl,
+                         GWorldSceneAltitudeMode altitude_mode)
+{
+  if (altitude_mode == GWORLD_SCENE_ALTITUDE_AMSL)
+    return altitude_amsl;
+
+  double terrain_height = 0.0;
+  if (terrain_height_at_lat_lon_locked(state, latitude, longitude, terrain_height)) {
+    if (altitude_mode == GWORLD_SCENE_ALTITUDE_CLAMP_TO_GROUND)
+      return terrain_height;
+    return terrain_height + altitude_amsl;
+  }
+
+  return altitude_amsl;
+}
+
+glm::dvec3
+geo_point_position_locked(GWorldSceneViewState *state,
+                          const GWorldSceneGeoPoint &point,
+                          GWorldSceneAltitudeMode altitude_mode)
+{
+  const double altitude =
+    altitude_for_mode_locked(state, point.latitude, point.longitude, point.altitude_amsl, altitude_mode);
+  return geodetic_to_enu(point.latitude,
+                         point.longitude,
+                         altitude,
+                         state->mesh_origin_latitude,
+                         state->mesh_origin_longitude,
+                         0.0);
+}
+
+void
+append_polyline_segment(std::vector<float> &vertices,
+                        std::vector<unsigned int> &indices,
+                        const glm::dvec3 &p0,
+                        const glm::dvec3 &p1,
+                        double width_m,
+                        const glm::vec4 &color)
+{
+  if (width_m <= 0.0 || color.a <= 0.0)
+    return;
+
+  const glm::dvec3 direction = p1 - p0;
+  if (glm::length(direction) <= 0.000001)
+    return;
+
+  glm::dvec3 side = glm::cross(glm::normalize(direction), glm::dvec3(0.0, 1.0, 0.0));
+  if (glm::length(side) <= 0.000001)
+    side = glm::dvec3(1.0, 0.0, 0.0);
+  else
+    side = glm::normalize(side);
+  side *= width_m * 0.5;
+
+  append_solid_quad(vertices,
+                    indices,
+                    p0 - side,
+                    p1 - side,
+                    p1 + side,
+                    p0 + side,
+                    color);
+}
+
+void
+append_polyline_points(GWorldSceneViewState *state,
+                       const GWorldSceneGeoPoint *points,
+                       gsize n_points,
+                       bool closed,
+                       double width_m,
+                       GWorldSceneAltitudeMode altitude_mode,
+                       const glm::vec4 &color)
+{
+  if (points == nullptr || n_points < 2 || width_m <= 0.0 || color.a <= 0.0)
+    return;
+
+  std::vector<glm::dvec3> positions;
+  positions.reserve(n_points);
+  for (gsize i = 0; i < n_points; ++i)
+    positions.push_back(geo_point_position_locked(state, points[i], altitude_mode));
+
+  for (gsize i = 0; i + 1 < n_points; ++i)
+    append_polyline_segment(state->vertices, state->indices, positions[i], positions[i + 1], width_m, color);
+
+  if (closed && n_points > 2)
+    append_polyline_segment(state->vertices, state->indices, positions.back(), positions.front(), width_m, color);
+}
+
+void
+append_polyline_node(GWorldSceneViewState *state, GWorldScenePolylineNode *polyline)
+{
+  gsize n_points = 0;
+  const GWorldSceneGeoPoint *points = gworld_scene_polyline_node_get_points(polyline, &n_points);
+  double red = 0.0;
+  double green = 0.0;
+  double blue = 0.0;
+  gworld_scene_node_get_color(GWORLD_SCENE_NODE(polyline), &red, &green, &blue);
+  const glm::vec4 color =
+    rgba_from_components(red, green, blue, gworld_scene_polyline_node_get_opacity(polyline));
+  append_polyline_points(state,
+                         points,
+                         n_points,
+                         false,
+                         gworld_scene_polyline_node_get_width(polyline),
+                         gworld_scene_polyline_node_get_altitude_mode(polyline),
+                         color);
+}
+
+struct TerrainPolygonVertex {
+  double latitude = 0.0;
+  double longitude = 0.0;
+  double height_amsl = 0.0;
+  double altitude_offset_m = 0.0;
+};
+
+double
+geo_polygon_signed_area(const GWorldSceneGeoPoint *points, gsize n_points)
+{
+  double area = 0.0;
+  for (gsize i = 0; i < n_points; ++i) {
+    const GWorldSceneGeoPoint &a = points[i];
+    const GWorldSceneGeoPoint &b = points[(i + 1) % n_points];
+    area += a.longitude * b.latitude - b.longitude * a.latitude;
+  }
+  return area * 0.5;
+}
+
+double
+geo_polygon_edge_value(const GWorldSceneGeoPoint &a,
+                       const GWorldSceneGeoPoint &b,
+                       const TerrainPolygonVertex &point)
+{
+  return (b.longitude - a.longitude) * (point.latitude - a.latitude) -
+         (b.latitude - a.latitude) * (point.longitude - a.longitude);
+}
+
+bool
+geo_polygon_is_convex(const GWorldSceneGeoPoint *points, gsize n_points)
+{
+  if (points == nullptr || n_points < 3)
+    return false;
+
+  double sign = 0.0;
+  for (gsize i = 0; i < n_points; ++i) {
+    const GWorldSceneGeoPoint &a = points[i];
+    const GWorldSceneGeoPoint &b = points[(i + 1) % n_points];
+    const GWorldSceneGeoPoint &c = points[(i + 2) % n_points];
+    const double cross = (b.longitude - a.longitude) * (c.latitude - b.latitude) -
+                         (b.latitude - a.latitude) * (c.longitude - b.longitude);
+    if (std::abs(cross) <= 1e-12)
+      continue;
+    if (sign == 0.0)
+      sign = cross;
+    else if ((sign > 0.0) != (cross > 0.0))
+      return false;
+  }
+
+  return true;
+}
+
+bool
+geo_polygon_clip_inside(const TerrainPolygonVertex &point,
+                        const GWorldSceneGeoPoint &a,
+                        const GWorldSceneGeoPoint &b,
+                        double orientation)
+{
+  const double value = geo_polygon_edge_value(a, b, point);
+  return orientation >= 0.0 ? value >= -1e-12 : value <= 1e-12;
+}
+
+TerrainPolygonVertex
+interpolate_terrain_polygon_vertex(const TerrainPolygonVertex &a,
+                                   const TerrainPolygonVertex &b,
+                                   double t)
+{
+  t = std::clamp(t, 0.0, 1.0);
+  TerrainPolygonVertex out;
+  out.latitude = a.latitude + (b.latitude - a.latitude) * t;
+  out.longitude = a.longitude + (b.longitude - a.longitude) * t;
+  out.height_amsl = a.height_amsl + (b.height_amsl - a.height_amsl) * t;
+  out.altitude_offset_m = a.altitude_offset_m + (b.altitude_offset_m - a.altitude_offset_m) * t;
+  return out;
+}
+
+TerrainPolygonVertex
+terrain_polygon_clip_intersection(const TerrainPolygonVertex &a,
+                                  const TerrainPolygonVertex &b,
+                                  const GWorldSceneGeoPoint &edge_start,
+                                  const GWorldSceneGeoPoint &edge_end)
+{
+  const double av = geo_polygon_edge_value(edge_start, edge_end, a);
+  const double bv = geo_polygon_edge_value(edge_start, edge_end, b);
+  const double denom = av - bv;
+  if (std::abs(denom) < 1e-18)
+    return a;
+  return interpolate_terrain_polygon_vertex(a, b, av / denom);
+}
+
+std::vector<TerrainPolygonVertex>
+clip_terrain_triangle_to_convex_geo_polygon(std::vector<TerrainPolygonVertex> polygon,
+                                            const GWorldSceneGeoPoint *clip_points,
+                                            gsize n_clip_points,
+                                            double orientation)
+{
+  std::vector<TerrainPolygonVertex> output;
+  output.reserve(8);
+
+  for (gsize edge = 0; edge < n_clip_points; ++edge) {
+    if (polygon.empty())
+      break;
+
+    const GWorldSceneGeoPoint &edge_start = clip_points[edge];
+    const GWorldSceneGeoPoint &edge_end = clip_points[(edge + 1) % n_clip_points];
+    output.clear();
+    TerrainPolygonVertex previous = polygon.back();
+    bool previous_inside = geo_polygon_clip_inside(previous, edge_start, edge_end, orientation);
+
+    for (const TerrainPolygonVertex &current : polygon) {
+      const bool current_inside = geo_polygon_clip_inside(current, edge_start, edge_end, orientation);
+      if (current_inside) {
+        if (!previous_inside)
+          output.push_back(terrain_polygon_clip_intersection(previous, current, edge_start, edge_end));
+        output.push_back(current);
+      } else if (previous_inside) {
+        output.push_back(terrain_polygon_clip_intersection(previous, current, edge_start, edge_end));
+      }
+      previous = current;
+      previous_inside = current_inside;
+    }
+
+    polygon = output;
+  }
+
+  return polygon;
+}
+
+bool
+lat_lon_inside_geo_polygon(const GWorldSceneGeoPoint *points,
+                           gsize n_points,
+                           double latitude,
+                           double longitude)
+{
+  bool inside = false;
+  for (gsize i = 0, j = n_points - 1; i < n_points; j = i++) {
+    const double yi = points[i].latitude;
+    const double yj = points[j].latitude;
+    const double xi = points[i].longitude;
+    const double xj = points[j].longitude;
+    const bool crosses = ((yi > latitude) != (yj > latitude)) &&
+                         (longitude < (xj - xi) * (latitude - yi) / (yj - yi + 1e-30) + xi);
+    if (crosses)
+      inside = !inside;
+  }
+  return inside;
+}
+
+double
+terrain_polygon_altitude_offset_at(const GWorldSceneGeoPoint *points,
+                                   gsize n_points,
+                                   GWorldSceneAltitudeMode altitude_mode,
+                                   double latitude,
+                                   double longitude)
+{
+  if (altitude_mode == GWORLD_SCENE_ALTITUDE_CLAMP_TO_GROUND)
+    return 0.0;
+
+  double weighted_altitude = 0.0;
+  double total_weight = 0.0;
+  const double lon_scale = std::max(0.05, std::cos(deg_to_rad(latitude)));
+  for (gsize i = 0; i < n_points; ++i) {
+    const double north = (latitude - points[i].latitude) * kEarthMetersPerDegree;
+    const double east = (longitude - points[i].longitude) * kEarthMetersPerDegree * lon_scale;
+    const double distance_sq = north * north + east * east;
+    if (distance_sq < 0.000001)
+      return points[i].altitude_amsl;
+
+    const double weight = 1.0 / distance_sq;
+    weighted_altitude += points[i].altitude_amsl * weight;
+    total_weight += weight;
+  }
+
+  return total_weight > 0.0 ? weighted_altitude / total_weight : 0.0;
+}
+
+TerrainPolygonVertex
+terrain_polygon_hgt_vertex(const TerrainTile &tile,
+                           int sample_x,
+                           int sample_y,
+                           const GWorldSceneGeoPoint *points,
+                           gsize n_points,
+                           GWorldSceneAltitudeMode altitude_mode)
+{
+  TerrainPolygonVertex vertex;
+  sample_to_lat_lon(tile, sample_x, sample_y, vertex.latitude, vertex.longitude);
+  vertex.height_amsl = static_cast<double>(get_safe_height(tile, sample_x, sample_y));
+  vertex.altitude_offset_m = terrain_polygon_altitude_offset_at(points,
+                                                               n_points,
+                                                               altitude_mode,
+                                                               vertex.latitude,
+                                                               vertex.longitude);
+  return vertex;
+}
+
+glm::dvec3
+terrain_polygon_vertex_position(GWorldSceneViewState *state,
+                                const TerrainPolygonVertex &vertex)
+{
+  return geodetic_to_enu(vertex.latitude,
+                         vertex.longitude,
+                         vertex.height_amsl + vertex.altitude_offset_m + kTerrainPolygonSurfaceOffsetM,
+                         state->mesh_origin_latitude,
+                         state->mesh_origin_longitude,
+                         0.0);
+}
+
+void
+append_terrain_polygon_triangle(GWorldSceneViewState *state,
+                                const TerrainPolygonVertex &a,
+                                const TerrainPolygonVertex &b,
+                                const TerrainPolygonVertex &c,
+                                const glm::vec4 &color)
+{
+  const glm::dvec3 p0 = terrain_polygon_vertex_position(state, a);
+  const glm::dvec3 p1 = terrain_polygon_vertex_position(state, b);
+  const glm::dvec3 p2 = terrain_polygon_vertex_position(state, c);
+  if (glm::length(glm::cross(p1 - p0, p2 - p0)) < 0.001)
+    return;
+
+  append_solid_triangle(state->vertices, state->indices, p0, p1, p2, color);
+}
+
+bool
+append_clipped_terrain_polygon_triangle(GWorldSceneViewState *state,
+                                        const TerrainPolygonVertex &a,
+                                        const TerrainPolygonVertex &b,
+                                        const TerrainPolygonVertex &c,
+                                        const GWorldSceneGeoPoint *clip_points,
+                                        gsize n_clip_points,
+                                        double orientation,
+                                        bool convex,
+                                        const glm::vec4 &color)
+{
+  if (convex) {
+    std::vector<TerrainPolygonVertex> polygon =
+      clip_terrain_triangle_to_convex_geo_polygon({a, b, c}, clip_points, n_clip_points, orientation);
+    if (polygon.size() < 3)
+      return false;
+
+    bool appended = false;
+    for (std::size_t i = 1; i + 1 < polygon.size(); ++i) {
+      const std::size_t before = state->indices.size();
+      append_terrain_polygon_triangle(state, polygon[0], polygon[i], polygon[i + 1], color);
+      appended = appended || state->indices.size() != before;
+    }
+    return appended;
+  }
+
+  const double center_latitude = (a.latitude + b.latitude + c.latitude) / 3.0;
+  const double center_longitude = (a.longitude + b.longitude + c.longitude) / 3.0;
+  if (!lat_lon_inside_geo_polygon(clip_points, n_clip_points, center_latitude, center_longitude))
+    return false;
+
+  const std::size_t before = state->indices.size();
+  append_terrain_polygon_triangle(state, a, b, c, color);
+  return state->indices.size() != before;
+}
+
+bool
+append_terrain_polygon_tile_ring(GWorldSceneViewState *state,
+                                 const TerrainTile &tile,
+                                 const GWorldSceneGeoPoint *points,
+                                 gsize n_points,
+                                 const LatLonBounds &bounds,
+                                 GWorldSceneAltitudeMode altitude_mode,
+                                 double inner_radius_m,
+                                 double outer_radius_m,
+                                 int sample_step,
+                                 double orientation,
+                                 bool convex,
+                                 const glm::vec4 &color)
+{
+  if (tile.dimension <= 1 || tile.heights.empty())
+    return false;
+
+  LatLonBounds tile_bounds;
+  tile_bounds.min_lat = static_cast<double>(tile.lat);
+  tile_bounds.max_lat = static_cast<double>(tile.lat + 1);
+  tile_bounds.min_lon = static_cast<double>(tile.lon);
+  tile_bounds.max_lon = static_cast<double>(tile.lon + 1);
+  if (!bounds_intersect(tile_bounds, bounds))
+    return false;
+
+  const double tile_center_lat = static_cast<double>(tile.lat) + 0.5;
+  const double tile_center_lon = static_cast<double>(tile.lon) + 0.5;
+  const glm::dvec3 tile_center = geodetic_to_enu(tile_center_lat,
+                                                 tile_center_lon,
+                                                 0.0,
+                                                 state->mesh_origin_latitude,
+                                                 state->mesh_origin_longitude,
+                                                 0.0);
+  const double tile_half_diag = 0.5 * std::sqrt(std::pow(kEarthMetersPerDegree, 2.0) +
+                                               std::pow(kEarthMetersPerDegree *
+                                                          std::cos(deg_to_rad(tile_center_lat)),
+                                                        2.0));
+  const double tile_distance = std::hypot(tile_center.x, tile_center.z);
+  if (tile_distance > outer_radius_m + tile_half_diag ||
+      tile_distance + tile_half_diag < inner_radius_m)
+    return false;
+
+  sample_step = std::clamp(sample_step, 1, tile.dimension - 1);
+
+  int x_min = 0;
+  int x_max = 0;
+  int y_min = 0;
+  int y_max = 0;
+  if (!ground_overlay_tile_cell_range(tile, bounds, x_min, x_max, y_min, y_max))
+    return false;
+
+  const int x_start = aligned_sample_start(x_min, sample_step);
+  const int y_start = aligned_sample_start(y_min, sample_step);
+  bool appended = false;
+
+  for (int sy = y_start; sy < y_max; sy += sample_step) {
+    const int sy1 = std::min(tile.dimension - 1, sy + sample_step);
+    if (sy1 <= sy)
+      continue;
+
+    for (int sx = x_start; sx < x_max; sx += sample_step) {
+      const int sx1 = std::min(tile.dimension - 1, sx + sample_step);
+      if (sx1 <= sx)
+        continue;
+
+      double lat00 = 0.0;
+      double lon00 = 0.0;
+      double lat10 = 0.0;
+      double lon10 = 0.0;
+      double lat01 = 0.0;
+      double lon01 = 0.0;
+      double lat11 = 0.0;
+      double lon11 = 0.0;
+      sample_to_lat_lon(tile, sx, sy, lat00, lon00);
+      sample_to_lat_lon(tile, sx1, sy, lat10, lon10);
+      sample_to_lat_lon(tile, sx, sy1, lat01, lon01);
+      sample_to_lat_lon(tile, sx1, sy1, lat11, lon11);
+
+      LatLonBounds cell_bounds;
+      cell_bounds.min_lat = std::min(std::min(lat00, lat10), std::min(lat01, lat11));
+      cell_bounds.max_lat = std::max(std::max(lat00, lat10), std::max(lat01, lat11));
+      cell_bounds.min_lon = std::min(std::min(lon00, lon10), std::min(lon01, lon11));
+      cell_bounds.max_lon = std::max(std::max(lon00, lon10), std::max(lon01, lon11));
+      if (!bounds_intersect(cell_bounds, bounds))
+        continue;
+
+      const double center_lat = (lat00 + lat10 + lat01 + lat11) * 0.25;
+      const double center_lon = (lon00 + lon10 + lon01 + lon11) * 0.25;
+      const glm::dvec3 center = geodetic_to_enu(center_lat,
+                                               center_lon,
+                                               0.0,
+                                               state->mesh_origin_latitude,
+                                               state->mesh_origin_longitude,
+                                               0.0);
+      const double center_distance = std::hypot(center.x, center.z);
+      if (center_distance <= inner_radius_m || center_distance > outer_radius_m + 2000.0)
+        continue;
+
+      const TerrainPolygonVertex v00 = terrain_polygon_hgt_vertex(tile, sx, sy, points, n_points, altitude_mode);
+      const TerrainPolygonVertex v10 = terrain_polygon_hgt_vertex(tile, sx1, sy, points, n_points, altitude_mode);
+      const TerrainPolygonVertex v01 = terrain_polygon_hgt_vertex(tile, sx, sy1, points, n_points, altitude_mode);
+      const TerrainPolygonVertex v11 = terrain_polygon_hgt_vertex(tile, sx1, sy1, points, n_points, altitude_mode);
+
+      appended = append_clipped_terrain_polygon_triangle(state,
+                                                         v00,
+                                                         v10,
+                                                         v01,
+                                                         points,
+                                                         n_points,
+                                                         orientation,
+                                                         convex,
+                                                         color) ||
+                 appended;
+      appended = append_clipped_terrain_polygon_triangle(state,
+                                                         v10,
+                                                         v11,
+                                                         v01,
+                                                         points,
+                                                         n_points,
+                                                         orientation,
+                                                         convex,
+                                                         color) ||
+                 appended;
+    }
+  }
+
+  return appended;
+}
+
+bool
+append_terrain_conforming_polygon_fill(GWorldSceneViewState *state,
+                                       const GWorldSceneGeoPoint *points,
+                                       gsize n_points,
+                                       GWorldSceneAltitudeMode altitude_mode,
+                                       const glm::vec4 &color)
+{
+  if (points == nullptr || n_points < 3 || color.a <= 0.0)
+    return false;
+
+  const LatLonBounds bounds = geo_point_bounds(points, n_points);
+  const double orientation = geo_polygon_signed_area(points, n_points);
+  if (std::abs(orientation) <= 1e-18)
+    return false;
+
+  const double lod_altitude =
+    state->mesh_radius_m > 0.0 ? state->mesh_lod_altitude_amsl : state->altitude_amsl;
+  const double radius_m =
+    state->mesh_radius_m > 0.0 ? state->mesh_radius_m : terrain_build_radius_for_altitude(lod_altitude);
+  const int base_sample_step =
+    state->mesh_sample_step > 0 ? state->mesh_sample_step : terrain_step_for_altitude(lod_altitude);
+  const double near_radius = terrain_near_radius_for_altitude(lod_altitude, radius_m);
+  const double mid_radius = terrain_mid_radius_for_altitude(lod_altitude, radius_m);
+  const double far_radius = terrain_far_radius_for_altitude(lod_altitude, radius_m);
+  const bool convex = geo_polygon_is_convex(points, n_points);
+  bool appended = false;
+
+  for (const auto &tile_entry : state->terrain_tiles) {
+    const TerrainTile &tile = *tile_entry.second;
+    appended = append_terrain_polygon_tile_ring(state,
+                                                tile,
+                                                points,
+                                                n_points,
+                                                bounds,
+                                                altitude_mode,
+                                                0.0,
+                                                near_radius,
+                                                terrain_lod_step(base_sample_step, 0),
+                                                orientation,
+                                                convex,
+                                                color) ||
+               appended;
+    if (mid_radius > near_radius) {
+      appended = append_terrain_polygon_tile_ring(state,
+                                                  tile,
+                                                  points,
+                                                  n_points,
+                                                  bounds,
+                                                  altitude_mode,
+                                                  near_radius,
+                                                  mid_radius,
+                                                  terrain_lod_step(base_sample_step, 1),
+                                                  orientation,
+                                                  convex,
+                                                  color) ||
+                 appended;
+    }
+    if (far_radius > mid_radius) {
+      appended = append_terrain_polygon_tile_ring(state,
+                                                  tile,
+                                                  points,
+                                                  n_points,
+                                                  bounds,
+                                                  altitude_mode,
+                                                  mid_radius,
+                                                  far_radius,
+                                                  terrain_lod_step(base_sample_step, 2),
+                                                  orientation,
+                                                  convex,
+                                                  color) ||
+                 appended;
+    }
+    if (radius_m > far_radius) {
+      appended = append_terrain_polygon_tile_ring(state,
+                                                  tile,
+                                                  points,
+                                                  n_points,
+                                                  bounds,
+                                                  altitude_mode,
+                                                  far_radius,
+                                                  radius_m,
+                                                  terrain_lod_step(base_sample_step, 3),
+                                                  orientation,
+                                                  convex,
+                                                  color) ||
+                 appended;
+    }
+  }
+
+  return appended;
+}
+
+void
+append_polygon_node(GWorldSceneViewState *state, GWorldScenePolygonNode *polygon)
+{
+  gsize n_points = 0;
+  const GWorldSceneGeoPoint *points = gworld_scene_polygon_node_get_points(polygon, &n_points);
+  if (points == nullptr || n_points < 3)
+    return;
+
+  const GWorldSceneAltitudeMode altitude_mode = gworld_scene_polygon_node_get_altitude_mode(polygon);
+  std::vector<glm::dvec3> positions;
+  positions.reserve(n_points);
+  for (gsize i = 0; i < n_points; ++i)
+    positions.push_back(geo_point_position_locked(state, points[i], altitude_mode));
+
+  double red = 0.0;
+  double green = 0.0;
+  double blue = 0.0;
+  double alpha = 0.0;
+  gworld_scene_polygon_node_get_fill_color(polygon, &red, &green, &blue, &alpha);
+  const glm::vec4 fill_color = rgba_from_components(red, green, blue, alpha);
+  if (fill_color.a > 0.0) {
+    bool terrain_fill_appended = false;
+    if (altitude_mode_uses_terrain(altitude_mode)) {
+      terrain_fill_appended =
+        append_terrain_conforming_polygon_fill(state, points, n_points, altitude_mode, fill_color);
+    }
+
+    if (!terrain_fill_appended) {
+      for (gsize i = 1; i + 1 < n_points; ++i) {
+        append_solid_triangle(state->vertices,
+                              state->indices,
+                              positions[0],
+                              positions[i],
+                              positions[i + 1],
+                              fill_color);
+      }
+    }
+  }
+
+  gworld_scene_polygon_node_get_outline_color(polygon, &red, &green, &blue, &alpha);
+  const GWorldSceneGeoPoint *outline_points = points;
+  GWorldSceneAltitudeMode outline_altitude_mode = altitude_mode;
+  std::vector<GWorldSceneGeoPoint> lifted_outline_points;
+  if (altitude_mode_uses_terrain(altitude_mode)) {
+    lifted_outline_points.assign(points, points + n_points);
+    for (GWorldSceneGeoPoint &point : lifted_outline_points) {
+      if (altitude_mode == GWORLD_SCENE_ALTITUDE_CLAMP_TO_GROUND)
+        point.altitude_amsl = kTerrainPolygonOutlineOffsetM;
+      else
+        point.altitude_amsl += kTerrainPolygonOutlineOffsetM;
+    }
+    outline_points = lifted_outline_points.data();
+    outline_altitude_mode = GWORLD_SCENE_ALTITUDE_AGL;
+  }
+  append_polyline_points(state,
+                         outline_points,
+                         n_points,
+                         true,
+                         gworld_scene_polygon_node_get_outline_width(polygon),
+                         outline_altitude_mode,
+                         rgba_from_components(red, green, blue, alpha));
+}
+
+void
+append_circle_node(GWorldSceneViewState *state, GWorldSceneCircleNode *circle)
+{
+  double center_latitude = 0.0;
+  double center_longitude = 0.0;
+  double center_altitude = 0.0;
+  gworld_scene_node_get_position(GWORLD_SCENE_NODE(circle),
+                                 &center_latitude,
+                                 &center_longitude,
+                                 &center_altitude);
+
+  const guint segments = std::max(12u, gworld_scene_circle_node_get_segments(circle));
+  const double radius_m = gworld_scene_circle_node_get_radius(circle);
+  const GWorldSceneAltitudeMode altitude_mode = gworld_scene_circle_node_get_altitude_mode(circle);
+
+  std::vector<GWorldSceneGeoPoint> points;
+  points.reserve(segments);
+  for (guint i = 0; i < segments; ++i) {
+    const double theta = 2.0 * kPi * static_cast<double>(i) / static_cast<double>(segments);
+    double latitude = center_latitude;
+    double longitude = center_longitude;
+    gworld_scene::translate_geodetic_ned(center_latitude,
+                                         center_longitude,
+                                         center_altitude,
+                                         std::cos(theta) * radius_m,
+                                         std::sin(theta) * radius_m,
+                                         0.0,
+                                         &latitude,
+                                         &longitude,
+                                         nullptr);
+    points.push_back({latitude, longitude, center_altitude});
+  }
+
+  double red = 0.0;
+  double green = 0.0;
+  double blue = 0.0;
+  double alpha = 0.0;
+  gworld_scene_circle_node_get_fill_color(circle, &red, &green, &blue, &alpha);
+  const glm::vec4 fill_color = rgba_from_components(red, green, blue, alpha);
+  if (fill_color.a > 0.0) {
+    const GWorldSceneGeoPoint center_point{center_latitude, center_longitude, center_altitude};
+    const glm::dvec3 center = geo_point_position_locked(state, center_point, altitude_mode);
+    for (guint i = 0; i < segments; ++i) {
+      const glm::dvec3 p0 = geo_point_position_locked(state, points[i], altitude_mode);
+      const glm::dvec3 p1 = geo_point_position_locked(state, points[(i + 1) % segments], altitude_mode);
+      append_solid_triangle(state->vertices, state->indices, center, p0, p1, fill_color);
+    }
+  }
+
+  gworld_scene_circle_node_get_outline_color(circle, &red, &green, &blue, &alpha);
+  append_polyline_points(state,
+                         points.data(),
+                         points.size(),
+                         true,
+                         gworld_scene_circle_node_get_outline_width(circle),
+                         altitude_mode,
+                         rgba_from_components(red, green, blue, alpha));
 }
 
 void
@@ -3461,7 +4739,7 @@ append_model_node(GWorldSceneViewState *state, const SceneNode &node)
       safe_normalize(glm::dvec3(n.z, n.x, -n.y), glm::dvec3(0.0, 0.0, -1.0));
     const glm::dvec3 normal_scene =
       safe_normalize(ned_to_scene_vector(rotation * normal_ned), glm::dvec3(0.0, 1.0, 0.0));
-    const glm::vec3 color = clamp_color(model_vertex.color * node.color);
+    const glm::vec3 color = clamp_color(model_vertex.color * glm::vec3(node.color));
     TexCoords uv{-1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f};
     float material = kMaterialSolidNode;
     if (model_vertex.has_texture) {
@@ -3477,7 +4755,7 @@ append_model_node(GWorldSceneViewState *state, const SceneNode &node)
                   glm::vec3(static_cast<float>(normal_scene.x),
                             static_cast<float>(normal_scene.y),
                             static_cast<float>(normal_scene.z)),
-                  color,
+                  glm::vec4(color, node.color.a),
                   material);
     state->indices.push_back(base);
   }
@@ -3494,6 +4772,21 @@ append_scene_nodes(GWorldSceneViewState *state)
       continue;
     if (GWORLD_IS_SCENE_GROUND_OVERLAY_NODE(scene_node))
       continue;
+    if (GWORLD_IS_SCENE_TEXT_LABEL_NODE(scene_node))
+      continue;
+
+    if (GWORLD_IS_SCENE_POLYLINE_NODE(scene_node)) {
+      append_polyline_node(state, GWORLD_SCENE_POLYLINE_NODE(scene_node));
+      continue;
+    }
+    if (GWORLD_IS_SCENE_POLYGON_NODE(scene_node)) {
+      append_polygon_node(state, GWORLD_SCENE_POLYGON_NODE(scene_node));
+      continue;
+    }
+    if (GWORLD_IS_SCENE_CIRCLE_NODE(scene_node)) {
+      append_circle_node(state, GWORLD_SCENE_CIRCLE_NODE(scene_node));
+      continue;
+    }
 
     SceneNode node;
     node.id = gworld_scene_node_get_id(scene_node);
@@ -3513,9 +4806,10 @@ append_scene_nodes(GWorldSceneViewState *state)
     double green = 0.0;
     double blue = 0.0;
     gworld_scene_node_get_color(scene_node, &red, &green, &blue);
-    node.color = glm::vec3(static_cast<float>(red),
+    node.color = glm::vec4(static_cast<float>(red),
                            static_cast<float>(green),
-                           static_cast<float>(blue));
+                           static_cast<float>(blue),
+                           1.0f);
 
     if (GWORLD_IS_SCENE_CUBE_NODE(scene_node)) {
       gworld_scene_cube_node_get_dimensions(GWORLD_SCENE_CUBE_NODE(scene_node),
@@ -3564,7 +4858,7 @@ append_globe_vertex(std::vector<float> &vertices,
   uv.base_v = -1.0f;
   uv.ultra_u = -1.0f;
   uv.ultra_v = -1.0f;
-  append_vertex(vertices, position, uv, normal, glm::vec3(0.08f, 0.22f, 0.46f), kMaterialGlobe);
+  append_vertex(vertices, position, uv, normal, glm::vec4(0.08f, 0.22f, 0.46f, 1.0f), kMaterialGlobe);
 }
 
 bool
@@ -4062,27 +5356,20 @@ ensure_ground_overlay_resources(GWorldSceneViewState *state)
 }
 
 SceneImageTexture *
-ensure_scene_image_texture(GWorldSceneViewState *state, const std::string &path)
+upload_scene_texture(GWorldSceneViewState *state,
+                     const std::string &key,
+                     const std::vector<unsigned char> &pixels,
+                     int width,
+                     int height)
 {
-  if (path.empty())
+  if (key.empty() || pixels.empty() || width <= 0 || height <= 0)
     return nullptr;
 
-  SceneImageTexture &texture = state->scene_image_textures[path];
+  SceneImageTexture &texture = state->scene_image_textures[key];
   if (texture.texture != 0)
     return &texture;
   if (texture.failed)
     return nullptr;
-
-  std::vector<unsigned char> pixels;
-  std::string error_message;
-  int width = 0;
-  int height = 0;
-  if (!load_scene_image_rgba(path, pixels, width, height, &error_message)) {
-    texture.failed = true;
-    texture.error = error_message;
-    g_warning("Scene image load failed: %s: %s", path.c_str(), error_message.c_str());
-    return nullptr;
-  }
 
   glGenTextures(1, &texture.texture);
   glBindTexture(GL_TEXTURE_2D, texture.texture);
@@ -4105,7 +5392,7 @@ ensure_scene_image_texture(GWorldSceneViewState *state, const std::string &path)
 
   if (error != GL_NO_ERROR) {
     g_warning("Scene image texture upload failed: %s size=%dx%d error=0x%x",
-              path.c_str(),
+              key.c_str(),
               width,
               height,
               error);
@@ -4119,6 +5406,77 @@ ensure_scene_image_texture(GWorldSceneViewState *state, const std::string &path)
   texture.width = width;
   texture.height = height;
   return &texture;
+}
+
+SceneImageTexture *
+ensure_scene_image_texture(GWorldSceneViewState *state, const std::string &path)
+{
+  if (path.empty())
+    return nullptr;
+
+  auto iter = state->scene_image_textures.find(path);
+  if (iter != state->scene_image_textures.end()) {
+    if (iter->second.texture != 0)
+      return &iter->second;
+    if (iter->second.failed)
+      return nullptr;
+  }
+
+  std::vector<unsigned char> pixels;
+  std::string error_message;
+  int width = 0;
+  int height = 0;
+  if (!load_scene_image_rgba(path, pixels, width, height, &error_message)) {
+    SceneImageTexture &texture = state->scene_image_textures[path];
+    texture.failed = true;
+    texture.error = error_message;
+    g_warning("Scene image load failed: %s: %s", path.c_str(), error_message.c_str());
+    return nullptr;
+  }
+
+  return upload_scene_texture(state, path, pixels, width, height);
+}
+
+std::string
+text_label_texture_key(const BillboardRenderItem &label)
+{
+  return "text-label|" + label.text + "|" + label.font + "|" +
+         std::to_string(label.padding_px) + "|" +
+         std::to_string(label.text_color.r) + "," +
+         std::to_string(label.text_color.g) + "," +
+         std::to_string(label.text_color.b) + "," +
+         std::to_string(label.text_color.a) + "|" +
+         std::to_string(label.background_color.r) + "," +
+         std::to_string(label.background_color.g) + "," +
+         std::to_string(label.background_color.b) + "," +
+         std::to_string(label.background_color.a);
+}
+
+SceneImageTexture *
+ensure_scene_text_texture(GWorldSceneViewState *state, const BillboardRenderItem &label)
+{
+  const std::string key = text_label_texture_key(label);
+  auto iter = state->scene_image_textures.find(key);
+  if (iter != state->scene_image_textures.end()) {
+    if (iter->second.texture != 0)
+      return &iter->second;
+    if (iter->second.failed)
+      return nullptr;
+  }
+
+  std::vector<unsigned char> pixels;
+  std::string error_message;
+  int width = 0;
+  int height = 0;
+  if (!render_text_label_rgba(label, pixels, width, height, &error_message)) {
+    SceneImageTexture &texture = state->scene_image_textures[key];
+    texture.failed = true;
+    texture.error = error_message;
+    g_warning("Scene text label render failed: %s", error_message.c_str());
+    return nullptr;
+  }
+
+  return upload_scene_texture(state, key, pixels, width, height);
 }
 
 void
@@ -4313,7 +5671,9 @@ render_billboards(GWorldSceneViewState *state,
 
   constexpr double vertical_fov_rad = 45.0 * kPi / 180.0;
   for (const BillboardRenderItem &billboard : billboards) {
-    SceneImageTexture *texture = ensure_scene_image_texture(state, billboard.image_path);
+    SceneImageTexture *texture = billboard.generated_text
+                                    ? ensure_scene_text_texture(state, billboard)
+                                    : ensure_scene_image_texture(state, billboard.image_path);
     if (texture == nullptr || texture->texture == 0 || texture->width <= 0 || texture->height <= 0)
       continue;
 
@@ -4685,7 +6045,7 @@ configure_scene_vertex_attributes()
                         reinterpret_cast<void *>(11 * sizeof(float)));
   glEnableVertexAttribArray(6);
   glVertexAttribPointer(6,
-                        3,
+                        4,
                         GL_FLOAT,
                         GL_FALSE,
                         kVertexStride * sizeof(float),
@@ -4696,7 +6056,7 @@ configure_scene_vertex_attributes()
                         GL_FLOAT,
                         GL_FALSE,
                         kVertexStride * sizeof(float),
-                        reinterpret_cast<void *>(17 * sizeof(float)));
+                        reinterpret_cast<void *>(18 * sizeof(float)));
 }
 
 void
@@ -7140,6 +8500,8 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
 
   if (render_world_mesh) {
     glDisable(GL_CULL_FACE);
+    glEnable(GL_BLEND);
+    glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
     glUniform1i(glGetUniformLocation(state->program, "has_ultra_texture"), state->ultra_texture != 0);
     glUniform1i(glGetUniformLocation(state->program, "has_detail_texture"), state->texture != 0);
     glUniform1i(glGetUniformLocation(state->program, "has_mid_texture"), state->mid_texture != 0);
@@ -7171,6 +8533,7 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
     glBindVertexArray(state->vao);
     glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(state->index_count), GL_UNSIGNED_INT, nullptr);
     glBindVertexArray(0);
+    glDisable(GL_BLEND);
   }
   glUseProgram(0);
   render_ground_overlays(state, ground_overlays, mvp);
@@ -8611,7 +9974,8 @@ static bool
 scene_node_requires_mesh_rebuild(GWorldSceneNode *node)
 {
   return !GWORLD_IS_SCENE_BILLBOARD_NODE(node) &&
-         !GWORLD_IS_SCENE_GROUND_OVERLAY_NODE(node);
+         !GWORLD_IS_SCENE_GROUND_OVERLAY_NODE(node) &&
+         !GWORLD_IS_SCENE_TEXT_LABEL_NODE(node);
 }
 
 static void
@@ -8810,6 +10174,83 @@ gworld_scene_view_add_ground_overlay(GWorldSceneView *self,
                                                  bottom_right_longitude,
                                                  bottom_left_latitude,
                                                  bottom_left_longitude);
+  }
+  add_scene_node(self, GWORLD_SCENE_NODE(node));
+  return node;
+}
+
+GWorldScenePolylineNode *
+gworld_scene_view_add_polyline(GWorldSceneView *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), nullptr);
+
+  GWorldScenePolylineNode *node = nullptr;
+  {
+    auto *state = get_state(self);
+    std::lock_guard<std::mutex> lock(state->mutex);
+    node = _gworld_scene_polyline_node_new(state->next_node_id++);
+  }
+  add_scene_node(self, GWORLD_SCENE_NODE(node));
+  return node;
+}
+
+GWorldScenePolygonNode *
+gworld_scene_view_add_polygon(GWorldSceneView *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), nullptr);
+
+  GWorldScenePolygonNode *node = nullptr;
+  {
+    auto *state = get_state(self);
+    std::lock_guard<std::mutex> lock(state->mutex);
+    node = _gworld_scene_polygon_node_new(state->next_node_id++);
+  }
+  add_scene_node(self, GWORLD_SCENE_NODE(node));
+  return node;
+}
+
+GWorldSceneCircleNode *
+gworld_scene_view_add_circle(GWorldSceneView *self,
+                             double latitude,
+                             double longitude,
+                             double altitude_amsl,
+                             double radius_m)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), nullptr);
+
+  GWorldSceneCircleNode *node = nullptr;
+  {
+    auto *state = get_state(self);
+    std::lock_guard<std::mutex> lock(state->mutex);
+    node = _gworld_scene_circle_node_new(state->next_node_id++,
+                                         latitude,
+                                         longitude,
+                                         altitude_amsl,
+                                         radius_m);
+  }
+  add_scene_node(self, GWORLD_SCENE_NODE(node));
+  return node;
+}
+
+GWorldSceneTextLabelNode *
+gworld_scene_view_add_text_label(GWorldSceneView *self,
+                                 const char *text,
+                                 double latitude,
+                                 double longitude,
+                                 double altitude_amsl)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), nullptr);
+  g_return_val_if_fail(text != nullptr && text[0] != '\0', nullptr);
+
+  GWorldSceneTextLabelNode *node = nullptr;
+  {
+    auto *state = get_state(self);
+    std::lock_guard<std::mutex> lock(state->mutex);
+    node = _gworld_scene_text_label_node_new(state->next_node_id++,
+                                             text,
+                                             latitude,
+                                             longitude,
+                                             altitude_amsl);
   }
   add_scene_node(self, GWORLD_SCENE_NODE(node));
   return node;

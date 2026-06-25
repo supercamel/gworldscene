@@ -74,7 +74,7 @@ layout(location = 2) in vec2 mid_texcoord;
 layout(location = 3) in vec2 base_texcoord;
 layout(location = 4) in vec2 ultra_texcoord;
 layout(location = 5) in vec3 normal;
-layout(location = 6) in vec3 vertex_color;
+layout(location = 6) in vec4 vertex_color;
 layout(location = 7) in float material;
 uniform mat4 mvp;
 uniform mat4 light_mvp;
@@ -98,7 +98,7 @@ out vec2 v_mid_texcoord;
 out vec2 v_base_texcoord;
 out vec2 v_ultra_texcoord;
 out vec3 v_normal;
-out vec3 v_color;
+out vec4 v_color;
 out float v_material;
 out float v_height;
 out vec3 v_world_position;
@@ -159,7 +159,7 @@ in vec2 v_mid_texcoord;
 in vec2 v_base_texcoord;
 in vec2 v_ultra_texcoord;
 in vec3 v_normal;
-in vec3 v_color;
+in vec4 v_color;
 in float v_material;
 in float v_height;
 in vec3 v_world_position;
@@ -267,16 +267,17 @@ void main() {
                  ? mix(texture_stack, ultra_texel, ultra_blend)
                  : texture_stack;
   vec3 terrain_base = mix(terrain_tint, texel.rgb, texel.a * 0.88);
-  vec3 globe_base = texel.a > 0.01 ? texel.rgb : v_color;
+  vec3 globe_base = texel.a > 0.01 ? texel.rgb : v_color.rgb;
   bool is_globe = v_material > 1.5 && v_material < 2.5;
   bool is_textured_model = v_material > 2.5;
   vec4 model_texel = (has_model_texture && is_textured_model) ? texture(model_texture, v_detail_texcoord) : vec4(0.0);
   vec3 object_base = (is_textured_model && model_texel.a > 0.01)
-                       ? mix(v_color, model_texel.rgb * v_color, model_texel.a)
-                       : v_color;
+                       ? mix(v_color.rgb, model_texel.rgb * v_color.rgb, model_texel.a)
+                       : v_color.rgb;
   vec3 base = is_globe ? globe_base : (v_material > 0.5 ? object_base : terrain_base);
   vec3 lit_color = base * clamp(light, vec3(0.0), vec3(1.45));
-  color = vec4(mix(lit_color, fog_color, fog_amount()), 1.0);
+  float alpha = (v_material > 0.5 && !is_globe) ? v_color.a : 1.0;
+  color = vec4(mix(lit_color, fog_color, fog_amount()), alpha);
 }
 )GLSL";
 

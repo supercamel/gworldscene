@@ -285,6 +285,56 @@ GWorldSceneGroundOverlayNode *gworld_scene_view_add_ground_overlay(GWorldSceneVi
                                                                    double bottom_left_latitude,
                                                                    double bottom_left_longitude);
 
+/**
+ * gworld_scene_view_add_polyline:
+ * @self: a scene view
+ *
+ * Adds an initially-empty geospatial polyline. Add points with
+ * gworld_scene_polyline_node_append_point().
+ *
+ * Returns: (transfer none): the view-owned polyline node
+ */
+GWorldScenePolylineNode *gworld_scene_view_add_polyline(GWorldSceneView *self);
+
+/**
+ * gworld_scene_view_add_polygon:
+ * @self: a scene view
+ *
+ * Adds an initially-empty geospatial polygon. Add points with
+ * gworld_scene_polygon_node_append_point().
+ *
+ * Returns: (transfer none): the view-owned polygon node
+ */
+GWorldScenePolygonNode *gworld_scene_view_add_polygon(GWorldSceneView *self);
+
+/**
+ * gworld_scene_view_add_circle:
+ * @self: a scene view
+ *
+ * Adds a geospatial circle centered at @latitude/@longitude.
+ *
+ * Returns: (transfer none): the view-owned circle node
+ */
+GWorldSceneCircleNode *gworld_scene_view_add_circle(GWorldSceneView *self,
+                                                    double latitude,
+                                                    double longitude,
+                                                    double altitude_amsl,
+                                                    double radius_m);
+
+/**
+ * gworld_scene_view_add_text_label:
+ * @self: a scene view
+ *
+ * Adds a camera-facing text label at the requested geodetic position.
+ *
+ * Returns: (transfer none): the view-owned text label node
+ */
+GWorldSceneTextLabelNode *gworld_scene_view_add_text_label(GWorldSceneView *self,
+                                                           const char *text,
+                                                           double latitude,
+                                                           double longitude,
+                                                           double altitude_amsl);
+
 gboolean gworld_scene_view_remove_node(GWorldSceneView *self, GWorldSceneNode *node);
 
 void gworld_scene_view_clear_nodes(GWorldSceneView *self);

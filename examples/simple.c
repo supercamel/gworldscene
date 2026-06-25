@@ -241,6 +241,48 @@ activate(GtkApplication *app, gpointer user_data)
                                                                      700.0);
   gworld_scene_node_set_color(GWORLD_SCENE_NODE(cylinder), 0.40, 0.78, 0.30);
 
+  GWorldScenePolylineNode *route = gworld_scene_view_add_polyline(GWORLD_SCENE_VIEW(view));
+  gworld_scene_node_set_color(GWORLD_SCENE_NODE(route), 0.95, 0.86, 0.18);
+  gworld_scene_polyline_node_set_width(route, 35.0);
+  gworld_scene_polyline_node_set_opacity(route, 0.92);
+  gworld_scene_polyline_node_set_altitude_mode(route, GWORLD_SCENE_ALTITUDE_AGL);
+  gworld_scene_polyline_node_append_point(route, -35.0105, 147.4480, 90.0);
+  gworld_scene_polyline_node_append_point(route, -35.0060, 147.4575, 120.0);
+  gworld_scene_polyline_node_append_point(route, -35.0010, 147.4665, 140.0);
+  gworld_scene_polyline_node_append_point(route, -34.9960, 147.4785, 110.0);
+
+  GWorldScenePolygonNode *zone = gworld_scene_view_add_polygon(GWORLD_SCENE_VIEW(view));
+  gworld_scene_polygon_node_set_altitude_mode(zone, GWORLD_SCENE_ALTITUDE_AGL);
+  gworld_scene_polygon_node_set_fill_color(zone, 0.05, 0.48, 0.95, 0.24);
+  gworld_scene_polygon_node_set_outline_color(zone, 0.10, 0.75, 1.0, 0.9);
+  gworld_scene_polygon_node_set_outline_width(zone, 22.0);
+  gworld_scene_polygon_node_append_point(zone, -35.0100, 147.4700, 18.0);
+  gworld_scene_polygon_node_append_point(zone, -35.0040, 147.4820, 18.0);
+  gworld_scene_polygon_node_append_point(zone, -35.0140, 147.4910, 18.0);
+  gworld_scene_polygon_node_append_point(zone, -35.0200, 147.4770, 18.0);
+
+  GWorldSceneCircleNode *bubble = gworld_scene_view_add_circle(GWORLD_SCENE_VIEW(view),
+                                                               -34.9908,
+                                                               147.4620,
+                                                               15.0,
+                                                               850.0);
+  gworld_scene_circle_node_set_altitude_mode(bubble, GWORLD_SCENE_ALTITUDE_AGL);
+  gworld_scene_circle_node_set_fill_color(bubble, 0.18, 0.85, 0.42, 0.18);
+  gworld_scene_circle_node_set_outline_color(bubble, 0.20, 1.0, 0.45, 0.9);
+  gworld_scene_circle_node_set_outline_width(bubble, 20.0);
+  gworld_scene_circle_node_set_segments(bubble, 96);
+
+  GWorldSceneTextLabelNode *label = gworld_scene_view_add_text_label(GWORLD_SCENE_VIEW(view),
+                                                                     "Training zone",
+                                                                     -34.9908,
+                                                                     147.4620,
+                                                                     220.0);
+  gworld_scene_text_label_node_set_altitude_mode(label, GWORLD_SCENE_ALTITUDE_AGL);
+  gworld_scene_text_label_node_set_font(label, "Sans Bold 22");
+  gworld_scene_text_label_node_set_size_limits(label, 54.0, 240.0);
+  gworld_scene_text_label_node_set_reference_size(label, 160.0, 4500.0);
+  gworld_scene_text_label_node_set_max_visible_distance(label, 60000.0);
+
   g_autofree char *billboard_path =
     find_demo_asset_path("examples/assets/BillboardMarker/map-symbol-location-02.png");
   if (billboard_path != NULL) {

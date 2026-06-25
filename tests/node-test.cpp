@@ -243,6 +243,161 @@ test_ground_overlay_node_stores_image_corners_and_display_policy()
   g_object_unref(node);
 }
 
+void
+test_polyline_node_stores_points_and_style()
+{
+  GWorldScenePolylineNode *polyline = _gworld_scene_polyline_node_new(14);
+  GWorldSceneNode *node = GWORLD_SCENE_NODE(polyline);
+
+  g_assert_cmpuint(gworld_scene_node_get_id(node), ==, 14);
+  g_assert_cmpuint(gworld_scene_node_get_primitive(node), ==, GWORLD_SCENE_PRIMITIVE_POLYLINE);
+  g_assert_true(GWORLD_IS_SCENE_POLYLINE_NODE(polyline));
+
+  gworld_scene_polyline_node_append_point(polyline, -35.0, 147.0, 10.0);
+  gworld_scene_polyline_node_append_point(polyline, -35.1, 147.2, 20.0);
+  gsize n_points = 0;
+  const GWorldSceneGeoPoint *points = gworld_scene_polyline_node_get_points(polyline, &n_points);
+  g_assert_cmpuint(n_points, ==, 2);
+  assert_near(points[0].latitude, -35.0, 0.001);
+  assert_near(points[1].longitude, 147.2, 0.001);
+
+  gworld_scene_polyline_node_set_width(polyline, 12.0);
+  gworld_scene_polyline_node_set_opacity(polyline, 0.45);
+  gworld_scene_polyline_node_set_altitude_mode(polyline, GWORLD_SCENE_ALTITUDE_CLAMP_TO_GROUND);
+  assert_near(gworld_scene_polyline_node_get_width(polyline), 12.0, 0.001);
+  assert_near(gworld_scene_polyline_node_get_opacity(polyline), 0.45, 0.001);
+  g_assert_cmpuint(gworld_scene_polyline_node_get_altitude_mode(polyline), ==, GWORLD_SCENE_ALTITUDE_CLAMP_TO_GROUND);
+
+  gworld_scene_polyline_node_clear_points(polyline);
+  points = gworld_scene_polyline_node_get_points(polyline, &n_points);
+  g_assert_null(points);
+  g_assert_cmpuint(n_points, ==, 0);
+  g_object_unref(node);
+}
+
+void
+test_polygon_node_stores_points_and_style()
+{
+  GWorldScenePolygonNode *polygon = _gworld_scene_polygon_node_new(15);
+  GWorldSceneNode *node = GWORLD_SCENE_NODE(polygon);
+
+  g_assert_cmpuint(gworld_scene_node_get_id(node), ==, 15);
+  g_assert_cmpuint(gworld_scene_node_get_primitive(node), ==, GWORLD_SCENE_PRIMITIVE_POLYGON);
+  g_assert_true(GWORLD_IS_SCENE_POLYGON_NODE(polygon));
+
+  const GWorldSceneGeoPoint points[] = {
+    {-35.0, 147.0, 5.0},
+    {-35.0, 147.1, 5.0},
+    {-35.1, 147.1, 5.0},
+  };
+  gworld_scene_polygon_node_set_points(polygon, points, G_N_ELEMENTS(points));
+
+  gsize n_points = 0;
+  const GWorldSceneGeoPoint *stored = gworld_scene_polygon_node_get_points(polygon, &n_points);
+  g_assert_cmpuint(n_points, ==, 3);
+  assert_near(stored[2].latitude, -35.1, 0.001);
+
+  gworld_scene_polygon_node_set_fill_color(polygon, 0.2, 0.3, 0.4, 0.5);
+  gworld_scene_polygon_node_set_outline_color(polygon, 0.6, 0.7, 0.8, 0.9);
+  gworld_scene_polygon_node_set_outline_width(polygon, 18.0);
+  gworld_scene_polygon_node_set_altitude_mode(polygon, GWORLD_SCENE_ALTITUDE_AGL);
+
+  double red = 0.0;
+  double green = 0.0;
+  double blue = 0.0;
+  double alpha = 0.0;
+  gworld_scene_polygon_node_get_fill_color(polygon, &red, &green, &blue, &alpha);
+  assert_near(red, 0.2, 0.001);
+  assert_near(alpha, 0.5, 0.001);
+  gworld_scene_polygon_node_get_outline_color(polygon, &red, &green, &blue, &alpha);
+  assert_near(blue, 0.8, 0.001);
+  assert_near(alpha, 0.9, 0.001);
+  assert_near(gworld_scene_polygon_node_get_outline_width(polygon), 18.0, 0.001);
+  g_assert_cmpuint(gworld_scene_polygon_node_get_altitude_mode(polygon), ==, GWORLD_SCENE_ALTITUDE_AGL);
+
+  g_object_unref(node);
+}
+
+void
+test_circle_node_stores_shape_and_style()
+{
+  GWorldSceneCircleNode *circle = _gworld_scene_circle_node_new(16, -35.0, 147.0, 30.0, 250.0);
+  GWorldSceneNode *node = GWORLD_SCENE_NODE(circle);
+
+  g_assert_cmpuint(gworld_scene_node_get_id(node), ==, 16);
+  g_assert_cmpuint(gworld_scene_node_get_primitive(node), ==, GWORLD_SCENE_PRIMITIVE_CIRCLE);
+  g_assert_true(GWORLD_IS_SCENE_CIRCLE_NODE(circle));
+  assert_near(gworld_scene_circle_node_get_radius(circle), 250.0, 0.001);
+
+  gworld_scene_circle_node_set_radius(circle, 500.0);
+  gworld_scene_circle_node_set_segments(circle, 48);
+  gworld_scene_circle_node_set_fill_color(circle, 1.0, 0.0, 0.0, 0.25);
+  gworld_scene_circle_node_set_outline_color(circle, 0.0, 1.0, 0.0, 0.75);
+  gworld_scene_circle_node_set_outline_width(circle, 9.0);
+  gworld_scene_circle_node_set_altitude_mode(circle, GWORLD_SCENE_ALTITUDE_CLAMP_TO_GROUND);
+
+  assert_near(gworld_scene_circle_node_get_radius(circle), 500.0, 0.001);
+  g_assert_cmpuint(gworld_scene_circle_node_get_segments(circle), ==, 48);
+  assert_near(gworld_scene_circle_node_get_outline_width(circle), 9.0, 0.001);
+  g_assert_cmpuint(gworld_scene_circle_node_get_altitude_mode(circle), ==, GWORLD_SCENE_ALTITUDE_CLAMP_TO_GROUND);
+
+  double red = 0.0;
+  double green = 0.0;
+  double blue = 0.0;
+  double alpha = 0.0;
+  gworld_scene_circle_node_get_fill_color(circle, &red, &green, &blue, &alpha);
+  assert_near(red, 1.0, 0.001);
+  assert_near(alpha, 0.25, 0.001);
+  gworld_scene_circle_node_get_outline_color(circle, &red, &green, &blue, &alpha);
+  assert_near(green, 1.0, 0.001);
+  assert_near(alpha, 0.75, 0.001);
+
+  g_object_unref(node);
+}
+
+void
+test_text_label_node_stores_text_and_display_policy()
+{
+  GWorldSceneTextLabelNode *label =
+    _gworld_scene_text_label_node_new(17, "Launch", -35.0, 147.0, 80.0);
+  GWorldSceneNode *node = GWORLD_SCENE_NODE(label);
+
+  g_assert_cmpuint(gworld_scene_node_get_id(node), ==, 17);
+  g_assert_cmpuint(gworld_scene_node_get_primitive(node), ==, GWORLD_SCENE_PRIMITIVE_TEXT_LABEL);
+  g_assert_true(GWORLD_IS_SCENE_TEXT_LABEL_NODE(label));
+  g_assert_cmpstr(gworld_scene_text_label_node_get_text(label), ==, "Launch");
+
+  gworld_scene_text_label_node_set_text(label, "Waypoint A");
+  gworld_scene_text_label_node_set_font(label, "Sans Bold 24");
+  gworld_scene_text_label_node_set_text_color(label, 0.9, 0.8, 0.1, 1.0);
+  gworld_scene_text_label_node_set_background_color(label, 0.0, 0.0, 0.0, 0.5);
+  gworld_scene_text_label_node_set_padding(label, 10.0);
+  gworld_scene_text_label_node_set_size_limits(label, 32.0, 256.0);
+  gworld_scene_text_label_node_set_reference_size(label, 120.0, 2000.0);
+  gworld_scene_text_label_node_set_max_visible_distance(label, 9000.0);
+  gworld_scene_text_label_node_set_altitude_mode(label, GWORLD_SCENE_ALTITUDE_AGL);
+
+  g_assert_cmpstr(gworld_scene_text_label_node_get_text(label), ==, "Waypoint A");
+  g_assert_cmpstr(gworld_scene_text_label_node_get_font(label), ==, "Sans Bold 24");
+  assert_near(gworld_scene_text_label_node_get_padding(label), 10.0, 0.001);
+  assert_near(gworld_scene_text_label_node_get_max_visible_distance(label), 9000.0, 0.001);
+  g_assert_cmpuint(gworld_scene_text_label_node_get_altitude_mode(label), ==, GWORLD_SCENE_ALTITUDE_AGL);
+
+  double min_px = 0.0;
+  double max_px = 0.0;
+  gworld_scene_text_label_node_get_size_limits(label, &min_px, &max_px);
+  assert_near(min_px, 32.0, 0.001);
+  assert_near(max_px, 256.0, 0.001);
+
+  double reference_px = 0.0;
+  double reference_distance = 0.0;
+  gworld_scene_text_label_node_get_reference_size(label, &reference_px, &reference_distance);
+  assert_near(reference_px, 120.0, 0.001);
+  assert_near(reference_distance, 2000.0, 0.001);
+
+  g_object_unref(node);
+}
+
 } // namespace
 
 int
@@ -255,5 +410,9 @@ main(int argc, char **argv)
   g_test_add_func("/scene-node/model-node-stores-path-and-uses-white-default-color", test_model_node_stores_path_and_uses_white_default_color);
   g_test_add_func("/scene-node/billboard-node-stores-image-and-size-policy", test_billboard_node_stores_image_and_size_policy);
   g_test_add_func("/scene-node/ground-overlay-node-stores-image-corners-and-display-policy", test_ground_overlay_node_stores_image_corners_and_display_policy);
+  g_test_add_func("/scene-node/polyline-node-stores-points-and-style", test_polyline_node_stores_points_and_style);
+  g_test_add_func("/scene-node/polygon-node-stores-points-and-style", test_polygon_node_stores_points_and_style);
+  g_test_add_func("/scene-node/circle-node-stores-shape-and-style", test_circle_node_stores_shape_and_style);
+  g_test_add_func("/scene-node/text-label-node-stores-text-and-display-policy", test_text_label_node_stores_text_and_display_policy);
   return g_test_run();
 }

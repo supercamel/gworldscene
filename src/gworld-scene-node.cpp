@@ -36,6 +36,67 @@ positive_dimension(double value)
   return std::max(0.001, value);
 }
 
+double
+clamp_unit(double value)
+{
+  return std::clamp(value, 0.0, 1.0);
+}
+
+GWorldSceneAltitudeMode
+valid_altitude_mode(GWorldSceneAltitudeMode altitude_mode)
+{
+  if (altitude_mode == GWORLD_SCENE_ALTITUDE_AGL ||
+      altitude_mode == GWORLD_SCENE_ALTITUDE_CLAMP_TO_GROUND)
+    return altitude_mode;
+  return GWORLD_SCENE_ALTITUDE_AMSL;
+}
+
+GWorldSceneGeoPoint
+sanitized_geo_point(double latitude, double longitude, double altitude_amsl)
+{
+  GWorldSceneGeoPoint point;
+  point.latitude = std::clamp(latitude, -90.0, 90.0);
+  point.longitude = std::clamp(longitude, -180.0, 180.0);
+  point.altitude_amsl = altitude_amsl;
+  return point;
+}
+
+void
+set_rgba(double rgba[4], double red, double green, double blue, double alpha)
+{
+  rgba[0] = clamp_unit(red);
+  rgba[1] = clamp_unit(green);
+  rgba[2] = clamp_unit(blue);
+  rgba[3] = clamp_unit(alpha);
+}
+
+void
+get_rgba(const double rgba[4], double *red, double *green, double *blue, double *alpha)
+{
+  if (red)
+    *red = rgba[0];
+  if (green)
+    *green = rgba[1];
+  if (blue)
+    *blue = rgba[2];
+  if (alpha)
+    *alpha = rgba[3];
+}
+
+void
+set_points(GArray *points, const GWorldSceneGeoPoint *source, gsize n_points)
+{
+  g_array_set_size(points, 0);
+  if (source == nullptr || n_points == 0)
+    return;
+
+  for (gsize i = 0; i < n_points; ++i) {
+    const GWorldSceneGeoPoint point =
+      sanitized_geo_point(source[i].latitude, source[i].longitude, source[i].altitude_amsl);
+    g_array_append_val(points, point);
+  }
+}
+
 void
 emit_changed(GWorldSceneNode *node)
 {
@@ -109,6 +170,52 @@ struct _GWorldSceneGroundOverlayNode {
   double altitude_offset_m = 1.0;
 };
 
+struct _GWorldScenePolylineNode {
+  GWorldSceneNode parent_instance;
+
+  GArray *points = nullptr;
+  double width_m = 8.0;
+  double opacity = 1.0;
+  GWorldSceneAltitudeMode altitude_mode = GWORLD_SCENE_ALTITUDE_AMSL;
+};
+
+struct _GWorldScenePolygonNode {
+  GWorldSceneNode parent_instance;
+
+  GArray *points = nullptr;
+  double fill_rgba[4] = {0.1, 0.55, 0.95, 0.28};
+  double outline_rgba[4] = {0.05, 0.28, 0.85, 0.9};
+  double outline_width_m = 6.0;
+  GWorldSceneAltitudeMode altitude_mode = GWORLD_SCENE_ALTITUDE_AMSL;
+};
+
+struct _GWorldSceneCircleNode {
+  GWorldSceneNode parent_instance;
+
+  double radius_m = 100.0;
+  guint segments = 96;
+  double fill_rgba[4] = {0.1, 0.55, 0.95, 0.22};
+  double outline_rgba[4] = {0.05, 0.28, 0.85, 0.9};
+  double outline_width_m = 6.0;
+  GWorldSceneAltitudeMode altitude_mode = GWORLD_SCENE_ALTITUDE_AMSL;
+};
+
+struct _GWorldSceneTextLabelNode {
+  GWorldSceneNode parent_instance;
+
+  gchar *text = nullptr;
+  gchar *font = nullptr;
+  double text_rgba[4] = {1.0, 1.0, 1.0, 1.0};
+  double background_rgba[4] = {0.02, 0.025, 0.035, 0.72};
+  double padding_px = 6.0;
+  double min_px = 36.0;
+  double max_px = 220.0;
+  double reference_size_px = 96.0;
+  double reference_distance_m = 3000.0;
+  double max_visible_distance_m = 0.0;
+  GWorldSceneAltitudeMode altitude_mode = GWORLD_SCENE_ALTITUDE_AMSL;
+};
+
 G_DEFINE_TYPE_WITH_PRIVATE(GWorldSceneNode, gworld_scene_node, G_TYPE_OBJECT)
 G_DEFINE_TYPE(GWorldSceneCubeNode, gworld_scene_cube_node, GWORLD_TYPE_SCENE_NODE)
 G_DEFINE_TYPE(GWorldSceneSphereNode, gworld_scene_sphere_node, GWORLD_TYPE_SCENE_NODE)
@@ -116,6 +223,10 @@ G_DEFINE_TYPE(GWorldSceneCylinderNode, gworld_scene_cylinder_node, GWORLD_TYPE_S
 G_DEFINE_TYPE(GWorldSceneModelNode, gworld_scene_model_node, GWORLD_TYPE_SCENE_NODE)
 G_DEFINE_TYPE(GWorldSceneBillboardNode, gworld_scene_billboard_node, GWORLD_TYPE_SCENE_NODE)
 G_DEFINE_TYPE(GWorldSceneGroundOverlayNode, gworld_scene_ground_overlay_node, GWORLD_TYPE_SCENE_NODE)
+G_DEFINE_TYPE(GWorldScenePolylineNode, gworld_scene_polyline_node, GWORLD_TYPE_SCENE_NODE)
+G_DEFINE_TYPE(GWorldScenePolygonNode, gworld_scene_polygon_node, GWORLD_TYPE_SCENE_NODE)
+G_DEFINE_TYPE(GWorldSceneCircleNode, gworld_scene_circle_node, GWORLD_TYPE_SCENE_NODE)
+G_DEFINE_TYPE(GWorldSceneTextLabelNode, gworld_scene_text_label_node, GWORLD_TYPE_SCENE_NODE)
 
 static GWorldScenePrimitive
 primitive_for_node(GWorldSceneNode *self)
@@ -132,6 +243,14 @@ primitive_for_node(GWorldSceneNode *self)
     return GWORLD_SCENE_PRIMITIVE_BILLBOARD;
   if (GWORLD_IS_SCENE_GROUND_OVERLAY_NODE(self))
     return GWORLD_SCENE_PRIMITIVE_GROUND_OVERLAY;
+  if (GWORLD_IS_SCENE_POLYLINE_NODE(self))
+    return GWORLD_SCENE_PRIMITIVE_POLYLINE;
+  if (GWORLD_IS_SCENE_POLYGON_NODE(self))
+    return GWORLD_SCENE_PRIMITIVE_POLYGON;
+  if (GWORLD_IS_SCENE_CIRCLE_NODE(self))
+    return GWORLD_SCENE_PRIMITIVE_CIRCLE;
+  if (GWORLD_IS_SCENE_TEXT_LABEL_NODE(self))
+    return GWORLD_SCENE_PRIMITIVE_TEXT_LABEL;
   return GWORLD_SCENE_PRIMITIVE_CUBE;
 }
 
@@ -195,7 +314,7 @@ gworld_scene_node_class_init(GWorldSceneNodeClass *klass)
                       "Primitive",
                       "Scene primitive compatibility kind",
                       GWORLD_SCENE_PRIMITIVE_CUBE,
-                      GWORLD_SCENE_PRIMITIVE_GROUND_OVERLAY,
+                      GWORLD_SCENE_PRIMITIVE_TEXT_LABEL,
                       GWORLD_SCENE_PRIMITIVE_CUBE,
                       static_cast<GParamFlags>(G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
   g_object_class_install_properties(object_class, N_PROPS, properties);
@@ -378,6 +497,112 @@ gworld_scene_ground_overlay_node_init(GWorldSceneGroundOverlayNode *self)
   priv->blue = 1.0;
 }
 
+static void
+gworld_scene_polyline_node_finalize(GObject *object)
+{
+  auto *self = GWORLD_SCENE_POLYLINE_NODE(object);
+  g_clear_pointer(&self->points, g_array_unref);
+  G_OBJECT_CLASS(gworld_scene_polyline_node_parent_class)->finalize(object);
+}
+
+static void
+gworld_scene_polyline_node_class_init(GWorldScenePolylineNodeClass *klass)
+{
+  GObjectClass *object_class = G_OBJECT_CLASS(klass);
+  object_class->finalize = gworld_scene_polyline_node_finalize;
+}
+
+static void
+gworld_scene_polyline_node_init(GWorldScenePolylineNode *self)
+{
+  self->points = g_array_new(FALSE, FALSE, sizeof(GWorldSceneGeoPoint));
+  self->width_m = 8.0;
+  self->opacity = 1.0;
+  self->altitude_mode = GWORLD_SCENE_ALTITUDE_AMSL;
+  auto *priv = node_priv(GWORLD_SCENE_NODE(self));
+  priv->red = 0.1;
+  priv->green = 0.55;
+  priv->blue = 0.95;
+}
+
+static void
+gworld_scene_polygon_node_finalize(GObject *object)
+{
+  auto *self = GWORLD_SCENE_POLYGON_NODE(object);
+  g_clear_pointer(&self->points, g_array_unref);
+  G_OBJECT_CLASS(gworld_scene_polygon_node_parent_class)->finalize(object);
+}
+
+static void
+gworld_scene_polygon_node_class_init(GWorldScenePolygonNodeClass *klass)
+{
+  GObjectClass *object_class = G_OBJECT_CLASS(klass);
+  object_class->finalize = gworld_scene_polygon_node_finalize;
+}
+
+static void
+gworld_scene_polygon_node_init(GWorldScenePolygonNode *self)
+{
+  self->points = g_array_new(FALSE, FALSE, sizeof(GWorldSceneGeoPoint));
+  set_rgba(self->fill_rgba, 0.1, 0.55, 0.95, 0.28);
+  set_rgba(self->outline_rgba, 0.05, 0.28, 0.85, 0.9);
+  self->outline_width_m = 6.0;
+  self->altitude_mode = GWORLD_SCENE_ALTITUDE_AMSL;
+}
+
+static void
+gworld_scene_circle_node_class_init(GWorldSceneCircleNodeClass *klass)
+{
+  (void)klass;
+}
+
+static void
+gworld_scene_circle_node_init(GWorldSceneCircleNode *self)
+{
+  self->radius_m = 100.0;
+  self->segments = 96;
+  set_rgba(self->fill_rgba, 0.1, 0.55, 0.95, 0.22);
+  set_rgba(self->outline_rgba, 0.05, 0.28, 0.85, 0.9);
+  self->outline_width_m = 6.0;
+  self->altitude_mode = GWORLD_SCENE_ALTITUDE_AMSL;
+}
+
+static void
+gworld_scene_text_label_node_finalize(GObject *object)
+{
+  auto *self = GWORLD_SCENE_TEXT_LABEL_NODE(object);
+  g_clear_pointer(&self->text, g_free);
+  g_clear_pointer(&self->font, g_free);
+  G_OBJECT_CLASS(gworld_scene_text_label_node_parent_class)->finalize(object);
+}
+
+static void
+gworld_scene_text_label_node_class_init(GWorldSceneTextLabelNodeClass *klass)
+{
+  GObjectClass *object_class = G_OBJECT_CLASS(klass);
+  object_class->finalize = gworld_scene_text_label_node_finalize;
+}
+
+static void
+gworld_scene_text_label_node_init(GWorldSceneTextLabelNode *self)
+{
+  self->text = nullptr;
+  self->font = g_strdup("Sans Bold 18");
+  set_rgba(self->text_rgba, 1.0, 1.0, 1.0, 1.0);
+  set_rgba(self->background_rgba, 0.02, 0.025, 0.035, 0.72);
+  self->padding_px = 6.0;
+  self->min_px = 36.0;
+  self->max_px = 220.0;
+  self->reference_size_px = 96.0;
+  self->reference_distance_m = 3000.0;
+  self->max_visible_distance_m = 0.0;
+  self->altitude_mode = GWORLD_SCENE_ALTITUDE_AMSL;
+  auto *priv = node_priv(GWORLD_SCENE_NODE(self));
+  priv->red = 1.0;
+  priv->green = 1.0;
+  priv->blue = 1.0;
+}
+
 GWorldSceneCubeNode *
 _gworld_scene_cube_node_new(GWorldSceneNodeId id,
                             double latitude,
@@ -477,6 +702,49 @@ _gworld_scene_ground_overlay_node_new(GWorldSceneNodeId id,
                                    bottom_right_longitude,
                                    bottom_left_latitude,
                                    bottom_left_longitude);
+  return node;
+}
+
+GWorldScenePolylineNode *
+_gworld_scene_polyline_node_new(GWorldSceneNodeId id)
+{
+  auto *node = GWORLD_SCENE_POLYLINE_NODE(g_object_new(GWORLD_TYPE_SCENE_POLYLINE_NODE, nullptr));
+  initialize_node(GWORLD_SCENE_NODE(node), id, 0.0, 0.0, 0.0);
+  return node;
+}
+
+GWorldScenePolygonNode *
+_gworld_scene_polygon_node_new(GWorldSceneNodeId id)
+{
+  auto *node = GWORLD_SCENE_POLYGON_NODE(g_object_new(GWORLD_TYPE_SCENE_POLYGON_NODE, nullptr));
+  initialize_node(GWORLD_SCENE_NODE(node), id, 0.0, 0.0, 0.0);
+  return node;
+}
+
+GWorldSceneCircleNode *
+_gworld_scene_circle_node_new(GWorldSceneNodeId id,
+                              double latitude,
+                              double longitude,
+                              double altitude_amsl,
+                              double radius_m)
+{
+  auto *node = GWORLD_SCENE_CIRCLE_NODE(g_object_new(GWORLD_TYPE_SCENE_CIRCLE_NODE, nullptr));
+  initialize_node(GWORLD_SCENE_NODE(node), id, latitude, longitude, altitude_amsl);
+  node->radius_m = positive_dimension(radius_m);
+  return node;
+}
+
+GWorldSceneTextLabelNode *
+_gworld_scene_text_label_node_new(GWorldSceneNodeId id,
+                                  const char *text,
+                                  double latitude,
+                                  double longitude,
+                                  double altitude_amsl)
+{
+  auto *node = GWORLD_SCENE_TEXT_LABEL_NODE(g_object_new(GWORLD_TYPE_SCENE_TEXT_LABEL_NODE, nullptr));
+  initialize_node(GWORLD_SCENE_NODE(node), id, latitude, longitude, altitude_amsl);
+  g_free(node->text);
+  node->text = g_strdup(text ? text : "");
   return node;
 }
 
@@ -936,6 +1204,489 @@ gworld_scene_ground_overlay_node_get_altitude_offset(GWorldSceneGroundOverlayNod
 {
   g_return_val_if_fail(GWORLD_IS_SCENE_GROUND_OVERLAY_NODE(self), 0.0);
   return self->altitude_offset_m;
+}
+
+void
+gworld_scene_polyline_node_clear_points(GWorldScenePolylineNode *self)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_POLYLINE_NODE(self));
+  g_array_set_size(self->points, 0);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+void
+gworld_scene_polyline_node_append_point(GWorldScenePolylineNode *self,
+                                        double latitude,
+                                        double longitude,
+                                        double altitude_amsl)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_POLYLINE_NODE(self));
+  const GWorldSceneGeoPoint point = sanitized_geo_point(latitude, longitude, altitude_amsl);
+  g_array_append_val(self->points, point);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+void
+gworld_scene_polyline_node_set_points(GWorldScenePolylineNode *self,
+                                      const GWorldSceneGeoPoint *points,
+                                      gsize n_points)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_POLYLINE_NODE(self));
+  set_points(self->points, points, n_points);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+const GWorldSceneGeoPoint *
+gworld_scene_polyline_node_get_points(GWorldScenePolylineNode *self, gsize *n_points)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_POLYLINE_NODE(self), nullptr);
+  if (n_points)
+    *n_points = self->points != nullptr ? self->points->len : 0;
+  return self->points != nullptr && self->points->len > 0
+           ? reinterpret_cast<const GWorldSceneGeoPoint *>(self->points->data)
+           : nullptr;
+}
+
+void
+gworld_scene_polyline_node_set_width(GWorldScenePolylineNode *self, double width_m)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_POLYLINE_NODE(self));
+  self->width_m = positive_dimension(width_m);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+double
+gworld_scene_polyline_node_get_width(GWorldScenePolylineNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_POLYLINE_NODE(self), 0.0);
+  return self->width_m;
+}
+
+void
+gworld_scene_polyline_node_set_opacity(GWorldScenePolylineNode *self, double opacity)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_POLYLINE_NODE(self));
+  self->opacity = clamp_unit(opacity);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+double
+gworld_scene_polyline_node_get_opacity(GWorldScenePolylineNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_POLYLINE_NODE(self), 0.0);
+  return self->opacity;
+}
+
+void
+gworld_scene_polyline_node_set_altitude_mode(GWorldScenePolylineNode *self,
+                                             GWorldSceneAltitudeMode altitude_mode)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_POLYLINE_NODE(self));
+  self->altitude_mode = valid_altitude_mode(altitude_mode);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+GWorldSceneAltitudeMode
+gworld_scene_polyline_node_get_altitude_mode(GWorldScenePolylineNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_POLYLINE_NODE(self), GWORLD_SCENE_ALTITUDE_AMSL);
+  return self->altitude_mode;
+}
+
+void
+gworld_scene_polygon_node_clear_points(GWorldScenePolygonNode *self)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_POLYGON_NODE(self));
+  g_array_set_size(self->points, 0);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+void
+gworld_scene_polygon_node_append_point(GWorldScenePolygonNode *self,
+                                       double latitude,
+                                       double longitude,
+                                       double altitude_amsl)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_POLYGON_NODE(self));
+  const GWorldSceneGeoPoint point = sanitized_geo_point(latitude, longitude, altitude_amsl);
+  g_array_append_val(self->points, point);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+void
+gworld_scene_polygon_node_set_points(GWorldScenePolygonNode *self,
+                                     const GWorldSceneGeoPoint *points,
+                                     gsize n_points)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_POLYGON_NODE(self));
+  set_points(self->points, points, n_points);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+const GWorldSceneGeoPoint *
+gworld_scene_polygon_node_get_points(GWorldScenePolygonNode *self, gsize *n_points)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_POLYGON_NODE(self), nullptr);
+  if (n_points)
+    *n_points = self->points != nullptr ? self->points->len : 0;
+  return self->points != nullptr && self->points->len > 0
+           ? reinterpret_cast<const GWorldSceneGeoPoint *>(self->points->data)
+           : nullptr;
+}
+
+void
+gworld_scene_polygon_node_set_fill_color(GWorldScenePolygonNode *self,
+                                         double red,
+                                         double green,
+                                         double blue,
+                                         double alpha)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_POLYGON_NODE(self));
+  set_rgba(self->fill_rgba, red, green, blue, alpha);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+void
+gworld_scene_polygon_node_get_fill_color(GWorldScenePolygonNode *self,
+                                         double *red,
+                                         double *green,
+                                         double *blue,
+                                         double *alpha)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_POLYGON_NODE(self));
+  get_rgba(self->fill_rgba, red, green, blue, alpha);
+}
+
+void
+gworld_scene_polygon_node_set_outline_color(GWorldScenePolygonNode *self,
+                                            double red,
+                                            double green,
+                                            double blue,
+                                            double alpha)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_POLYGON_NODE(self));
+  set_rgba(self->outline_rgba, red, green, blue, alpha);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+void
+gworld_scene_polygon_node_get_outline_color(GWorldScenePolygonNode *self,
+                                            double *red,
+                                            double *green,
+                                            double *blue,
+                                            double *alpha)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_POLYGON_NODE(self));
+  get_rgba(self->outline_rgba, red, green, blue, alpha);
+}
+
+void
+gworld_scene_polygon_node_set_outline_width(GWorldScenePolygonNode *self, double width_m)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_POLYGON_NODE(self));
+  self->outline_width_m = std::max(0.0, width_m);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+double
+gworld_scene_polygon_node_get_outline_width(GWorldScenePolygonNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_POLYGON_NODE(self), 0.0);
+  return self->outline_width_m;
+}
+
+void
+gworld_scene_polygon_node_set_altitude_mode(GWorldScenePolygonNode *self,
+                                            GWorldSceneAltitudeMode altitude_mode)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_POLYGON_NODE(self));
+  self->altitude_mode = valid_altitude_mode(altitude_mode);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+GWorldSceneAltitudeMode
+gworld_scene_polygon_node_get_altitude_mode(GWorldScenePolygonNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_POLYGON_NODE(self), GWORLD_SCENE_ALTITUDE_AMSL);
+  return self->altitude_mode;
+}
+
+void
+gworld_scene_circle_node_set_radius(GWorldSceneCircleNode *self, double radius_m)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_CIRCLE_NODE(self));
+  self->radius_m = positive_dimension(radius_m);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+double
+gworld_scene_circle_node_get_radius(GWorldSceneCircleNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_CIRCLE_NODE(self), 0.0);
+  return self->radius_m;
+}
+
+void
+gworld_scene_circle_node_set_segments(GWorldSceneCircleNode *self, guint segments)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_CIRCLE_NODE(self));
+  self->segments = std::clamp(segments, 12u, 720u);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+guint
+gworld_scene_circle_node_get_segments(GWorldSceneCircleNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_CIRCLE_NODE(self), 0);
+  return self->segments;
+}
+
+void
+gworld_scene_circle_node_set_fill_color(GWorldSceneCircleNode *self,
+                                        double red,
+                                        double green,
+                                        double blue,
+                                        double alpha)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_CIRCLE_NODE(self));
+  set_rgba(self->fill_rgba, red, green, blue, alpha);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+void
+gworld_scene_circle_node_get_fill_color(GWorldSceneCircleNode *self,
+                                        double *red,
+                                        double *green,
+                                        double *blue,
+                                        double *alpha)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_CIRCLE_NODE(self));
+  get_rgba(self->fill_rgba, red, green, blue, alpha);
+}
+
+void
+gworld_scene_circle_node_set_outline_color(GWorldSceneCircleNode *self,
+                                           double red,
+                                           double green,
+                                           double blue,
+                                           double alpha)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_CIRCLE_NODE(self));
+  set_rgba(self->outline_rgba, red, green, blue, alpha);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+void
+gworld_scene_circle_node_get_outline_color(GWorldSceneCircleNode *self,
+                                           double *red,
+                                           double *green,
+                                           double *blue,
+                                           double *alpha)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_CIRCLE_NODE(self));
+  get_rgba(self->outline_rgba, red, green, blue, alpha);
+}
+
+void
+gworld_scene_circle_node_set_outline_width(GWorldSceneCircleNode *self, double width_m)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_CIRCLE_NODE(self));
+  self->outline_width_m = std::max(0.0, width_m);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+double
+gworld_scene_circle_node_get_outline_width(GWorldSceneCircleNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_CIRCLE_NODE(self), 0.0);
+  return self->outline_width_m;
+}
+
+void
+gworld_scene_circle_node_set_altitude_mode(GWorldSceneCircleNode *self,
+                                           GWorldSceneAltitudeMode altitude_mode)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_CIRCLE_NODE(self));
+  self->altitude_mode = valid_altitude_mode(altitude_mode);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+GWorldSceneAltitudeMode
+gworld_scene_circle_node_get_altitude_mode(GWorldSceneCircleNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_CIRCLE_NODE(self), GWORLD_SCENE_ALTITUDE_AMSL);
+  return self->altitude_mode;
+}
+
+void
+gworld_scene_text_label_node_set_text(GWorldSceneTextLabelNode *self, const char *text)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_TEXT_LABEL_NODE(self));
+  g_free(self->text);
+  self->text = g_strdup(text ? text : "");
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+const char *
+gworld_scene_text_label_node_get_text(GWorldSceneTextLabelNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_TEXT_LABEL_NODE(self), nullptr);
+  return self->text != nullptr && self->text[0] != '\0' ? self->text : nullptr;
+}
+
+void
+gworld_scene_text_label_node_set_font(GWorldSceneTextLabelNode *self, const char *font)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_TEXT_LABEL_NODE(self));
+  g_free(self->font);
+  self->font = g_strdup(font && font[0] != '\0' ? font : "Sans Bold 18");
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+const char *
+gworld_scene_text_label_node_get_font(GWorldSceneTextLabelNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_TEXT_LABEL_NODE(self), nullptr);
+  return self->font != nullptr ? self->font : "Sans Bold 18";
+}
+
+void
+gworld_scene_text_label_node_set_text_color(GWorldSceneTextLabelNode *self,
+                                            double red,
+                                            double green,
+                                            double blue,
+                                            double alpha)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_TEXT_LABEL_NODE(self));
+  set_rgba(self->text_rgba, red, green, blue, alpha);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+void
+gworld_scene_text_label_node_get_text_color(GWorldSceneTextLabelNode *self,
+                                            double *red,
+                                            double *green,
+                                            double *blue,
+                                            double *alpha)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_TEXT_LABEL_NODE(self));
+  get_rgba(self->text_rgba, red, green, blue, alpha);
+}
+
+void
+gworld_scene_text_label_node_set_background_color(GWorldSceneTextLabelNode *self,
+                                                  double red,
+                                                  double green,
+                                                  double blue,
+                                                  double alpha)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_TEXT_LABEL_NODE(self));
+  set_rgba(self->background_rgba, red, green, blue, alpha);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+void
+gworld_scene_text_label_node_get_background_color(GWorldSceneTextLabelNode *self,
+                                                  double *red,
+                                                  double *green,
+                                                  double *blue,
+                                                  double *alpha)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_TEXT_LABEL_NODE(self));
+  get_rgba(self->background_rgba, red, green, blue, alpha);
+}
+
+void
+gworld_scene_text_label_node_set_padding(GWorldSceneTextLabelNode *self, double padding_px)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_TEXT_LABEL_NODE(self));
+  self->padding_px = std::clamp(padding_px, 0.0, 256.0);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+double
+gworld_scene_text_label_node_get_padding(GWorldSceneTextLabelNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_TEXT_LABEL_NODE(self), 0.0);
+  return self->padding_px;
+}
+
+void
+gworld_scene_text_label_node_set_size_limits(GWorldSceneTextLabelNode *self,
+                                             double min_px,
+                                             double max_px)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_TEXT_LABEL_NODE(self));
+  self->min_px = std::max(1.0, min_px);
+  self->max_px = std::max(self->min_px, max_px);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+void
+gworld_scene_text_label_node_get_size_limits(GWorldSceneTextLabelNode *self,
+                                             double *min_px,
+                                             double *max_px)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_TEXT_LABEL_NODE(self));
+  if (min_px)
+    *min_px = self->min_px;
+  if (max_px)
+    *max_px = self->max_px;
+}
+
+void
+gworld_scene_text_label_node_set_reference_size(GWorldSceneTextLabelNode *self,
+                                                double size_px,
+                                                double distance_m)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_TEXT_LABEL_NODE(self));
+  self->reference_size_px = std::max(1.0, size_px);
+  self->reference_distance_m = std::max(1.0, distance_m);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+void
+gworld_scene_text_label_node_get_reference_size(GWorldSceneTextLabelNode *self,
+                                                double *size_px,
+                                                double *distance_m)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_TEXT_LABEL_NODE(self));
+  if (size_px)
+    *size_px = self->reference_size_px;
+  if (distance_m)
+    *distance_m = self->reference_distance_m;
+}
+
+void
+gworld_scene_text_label_node_set_max_visible_distance(GWorldSceneTextLabelNode *self,
+                                                      double distance_m)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_TEXT_LABEL_NODE(self));
+  self->max_visible_distance_m = std::max(0.0, distance_m);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+double
+gworld_scene_text_label_node_get_max_visible_distance(GWorldSceneTextLabelNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_TEXT_LABEL_NODE(self), 0.0);
+  return self->max_visible_distance_m;
+}
+
+void
+gworld_scene_text_label_node_set_altitude_mode(GWorldSceneTextLabelNode *self,
+                                               GWorldSceneAltitudeMode altitude_mode)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_TEXT_LABEL_NODE(self));
+  self->altitude_mode = valid_altitude_mode(altitude_mode);
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+GWorldSceneAltitudeMode
+gworld_scene_text_label_node_get_altitude_mode(GWorldSceneTextLabelNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_TEXT_LABEL_NODE(self), GWORLD_SCENE_ALTITUDE_AMSL);
+  return self->altitude_mode;
 }
 
 void
