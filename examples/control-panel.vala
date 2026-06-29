@@ -4,6 +4,7 @@ namespace GWorldSceneControls {
   private const double HOME_LATITUDE = -16.8878;
   private const double HOME_LONGITUDE = 145.7048;
   private const double HOME_ALTITUDE_AMSL = 7800.0;
+  private const double ZONE_ALTITUDE_AGL = 1.5;
   private const string DEFAULT_TERRAIN_SERVER = "https://ooblerg.xyz/terrain/";
   private const string GOOGLE_LEGACY_SATELLITE =
     "https://mt.google.com/vt/lyrs=s&x={x}&y={y}&z={z}";
@@ -585,12 +586,12 @@ namespace GWorldSceneControls {
       zone.set_fill_color (0.05, 0.48, 0.95, 0.24);
       zone.set_outline_color (0.10, 0.75, 1.0, 0.9);
       zone.set_outline_width (22.0);
-      zone.append_point (-16.8650, 145.6795, 1.5);
-      zone.append_point (-16.8505, 145.7040, 1.5);
-      zone.append_point (-16.8845, 145.7310, 1.5);
-      zone.append_point (-16.9060, 145.6950, 1.5);
+      zone.append_point (-16.8650, 145.6795, ZONE_ALTITUDE_AGL);
+      zone.append_point (-16.8505, 145.7040, ZONE_ALTITUDE_AGL);
+      zone.append_point (-16.8845, 145.7310, ZONE_ALTITUDE_AGL);
+      zone.append_point (-16.9060, 145.6950, ZONE_ALTITUDE_AGL);
 
-      var bubble = scene.add_circle (-16.8280, 145.6530, 1.5, 850.0);
+      var bubble = scene.add_circle (-16.8280, 145.6530, ZONE_ALTITUDE_AGL, 850.0);
       bubble.set_altitude_mode (GWorld.SceneAltitudeMode.AGL);
       bubble.set_fill_color (0.18, 0.85, 0.42, 0.18);
       bubble.set_outline_color (0.20, 1.0, 0.45, 0.9);

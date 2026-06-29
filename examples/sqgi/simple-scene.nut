@@ -14,6 +14,7 @@ local GWorldScene = import("GWorldSceneGtk" + gtk_major, "0.1")
 const INITIAL_LATITUDE = -16.8878
 const INITIAL_LONGITUDE = 145.7048
 const INITIAL_ALTITUDE_AMSL = 7800.0
+const ZONE_ALTITUDE_AGL = 1.5
 
 local app = null
 local W = {
@@ -132,13 +133,13 @@ function add_scene_nodes(view) {
   local area = view.add_polygon()
   area.set_altitude_mode(GWorldScene.SceneAltitudeMode.agl)
   area.set_color(0.95, 0.25, 0.85)
-  area.append_point(-16.8650, 145.6795, 1.5)
-  area.append_point(-16.8505, 145.7040, 1.5)
-  area.append_point(-16.8845, 145.7310, 1.5)
-  area.append_point(-16.9060, 145.6950, 1.5)
+  area.append_point(-16.8650, 145.6795, ZONE_ALTITUDE_AGL)
+  area.append_point(-16.8505, 145.7040, ZONE_ALTITUDE_AGL)
+  area.append_point(-16.8845, 145.7310, ZONE_ALTITUDE_AGL)
+  area.append_point(-16.9060, 145.6950, ZONE_ALTITUDE_AGL)
   W.nodes.append(area)
 
-  local circle = view.add_circle(-16.8280, 145.6530, 1.50, 520.0)
+  local circle = view.add_circle(-16.8280, 145.6530, ZONE_ALTITUDE_AGL, 520.0)
   circle.set_altitude_mode(GWorldScene.SceneAltitudeMode.agl)
   circle.set_color(0.15, 0.95, 0.92)
   W.nodes.append(circle)

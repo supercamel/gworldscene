@@ -206,6 +206,18 @@ if gtk3_dep.found()
     ],
     version: meson.project_version(),
   )
+
+  gtk3_vapi_pc = configuration_data()
+  gtk3_vapi_pc.set('name', 'GWorldSceneGtk3')
+  gtk3_vapi_pc.set('description', 'GTK3 OpenGL world scene widget Vala package alias')
+  gtk3_vapi_pc.set('version', meson.project_version())
+  gtk3_vapi_pc.set('requires', 'gworldscene-gtk3-' + gworldscene_api_version)
+  configure_file(
+    input: 'gworldscene-vapi-alias.pc.in',
+    output: 'GWorldSceneGtk3-' + gworldscene_api_version + '.pc',
+    configuration: gtk3_vapi_pc,
+    install_dir: gworldscene_pkgconfigdir,
+  )
 endif
 
 if gtk4_dep.found()
@@ -308,6 +320,18 @@ if gtk4_dep.found()
       'zlib',
     ],
     version: meson.project_version(),
+  )
+
+  gtk4_vapi_pc = configuration_data()
+  gtk4_vapi_pc.set('name', 'GWorldSceneGtk4')
+  gtk4_vapi_pc.set('description', 'GTK4 OpenGL world scene widget Vala package alias')
+  gtk4_vapi_pc.set('version', meson.project_version())
+  gtk4_vapi_pc.set('requires', 'gworldscene-gtk4-' + gworldscene_api_version)
+  configure_file(
+    input: 'gworldscene-vapi-alias.pc.in',
+    output: 'GWorldSceneGtk4-' + gworldscene_api_version + '.pc',
+    configuration: gtk4_vapi_pc,
+    install_dir: gworldscene_pkgconfigdir,
   )
 endif
 

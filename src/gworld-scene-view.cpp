@@ -95,8 +95,8 @@ constexpr double kDefaultPerfUploadThresholdMs = 3.0;
 constexpr int kMaxSceneImageTexturePixels = 2048;
 constexpr int kGroundOverlayCellMargin = 1;
 constexpr double kGroundOverlayTerrainLoadMarginM = 250.0;
-constexpr double kTerrainPolygonSurfaceOffsetM = 1.0;
-constexpr double kTerrainPolygonOutlineOffsetM = 1.5;
+constexpr double kTerrainPolygonSurfaceOffsetM = 6.0;
+constexpr double kTerrainPolygonOutlineOffsetM = 8.0;
 constexpr double kTerrainPolylineConformSampleSpacingM = 30.0;
 constexpr unsigned int kMaxTerrainPolylineSegmentSamples = 512;
 constexpr double kPolylineDashLengthMinM = 12.0;
@@ -104,6 +104,8 @@ constexpr double kPolylineDashLengthWidthFactor = 4.0;
 constexpr double kPolylineDashGapMinM = 8.0;
 constexpr double kPolylineDashGapWidthFactor = 2.5;
 constexpr double kPolylineDashMaxCyclesPerSegment = 512.0;
+constexpr unsigned int kPolylineRoundMinSegments = 10;
+constexpr unsigned int kPolylineRoundMaxSegments = 28;
 constexpr double kClickDragThresholdPx = 4.0;
 constexpr double kClickCameraRotationThresholdDeg = 0.01;
 constexpr double kSunAngularRadiusDeg = 0.266;
@@ -4007,6 +4009,27 @@ geo_segment_length_m(const GWorldSceneGeoPoint &a, const GWorldSceneGeoPoint &b)
   return std::hypot(north_m, east_m);
 }
 
+bool
+geo_segment_side_offset_m(const GWorldSceneGeoPoint &a,
+                          const GWorldSceneGeoPoint &b,
+                          double width_m,
+                          double &side_north_m,
+                          double &side_east_m)
+{
+  const double latitude = (a.latitude + b.latitude) * 0.5;
+  const double lon_scale = std::max(0.05, std::cos(deg_to_rad(latitude)));
+  const double north_m = (b.latitude - a.latitude) * kEarthMetersPerDegree;
+  const double east_m = (b.longitude - a.longitude) * kEarthMetersPerDegree * lon_scale;
+  const double length_m = std::hypot(north_m, east_m);
+  if (length_m <= 0.000001)
+    return false;
+
+  const double half_width_m = width_m * 0.5;
+  side_north_m = -east_m / length_m * half_width_m;
+  side_east_m = north_m / length_m * half_width_m;
+  return true;
+}
+
 GWorldSceneGeoPoint
 interpolate_geo_point(const GWorldSceneGeoPoint &a, const GWorldSceneGeoPoint &b, double t)
 {
@@ -4016,6 +4039,22 @@ interpolate_geo_point(const GWorldSceneGeoPoint &a, const GWorldSceneGeoPoint &b
     a.longitude + (b.longitude - a.longitude) * t,
     a.altitude_amsl + (b.altitude_amsl - a.altitude_amsl) * t,
   };
+}
+
+GWorldSceneGeoPoint
+offset_geo_point_m(const GWorldSceneGeoPoint &point, double north_m, double east_m)
+{
+  GWorldSceneGeoPoint out = point;
+  gworld_scene::translate_geodetic_ned(point.latitude,
+                                       point.longitude,
+                                       point.altitude_amsl,
+                                       north_m,
+                                       east_m,
+                                       0.0,
+                                       &out.latitude,
+                                       &out.longitude,
+                                       nullptr);
+  return out;
 }
 
 std::vector<GWorldSceneGeoPoint>
@@ -4046,10 +4085,186 @@ sample_terrain_polyline_points(const GWorldSceneGeoPoint *points, gsize n_points
   return sampled;
 }
 
+int
+terrain_mesh_sample_step_for_lat_lon_locked(GWorldSceneViewState *state,
+                                            double latitude,
+                                            double longitude)
+{
+  const bool has_mesh_lod = state->mesh_radius_m > 0.0 && state->mesh_sample_step > 0;
+  const double lod_altitude = has_mesh_lod ? state->mesh_lod_altitude_amsl : state->altitude_amsl;
+  const double radius_m = has_mesh_lod ? state->mesh_radius_m : terrain_build_radius_for_altitude(lod_altitude);
+  const int base_sample_step =
+    has_mesh_lod ? state->mesh_sample_step : terrain_step_for_altitude(lod_altitude);
+  const double near_radius = terrain_near_radius_for_altitude(lod_altitude, radius_m);
+  const double mid_radius = terrain_mid_radius_for_altitude(lod_altitude, radius_m);
+  const double far_radius = terrain_far_radius_for_altitude(lod_altitude, radius_m);
+  const glm::dvec3 center = geodetic_to_enu(latitude,
+                                           longitude,
+                                           0.0,
+                                           state->mesh_origin_latitude,
+                                           state->mesh_origin_longitude,
+                                           0.0);
+  const double distance_m = std::hypot(center.x, center.z);
+  if (distance_m <= near_radius)
+    return terrain_lod_step(base_sample_step, 0);
+  if (distance_m <= mid_radius)
+    return terrain_lod_step(base_sample_step, 1);
+  if (distance_m <= far_radius)
+    return terrain_lod_step(base_sample_step, 2);
+  return terrain_lod_step(base_sample_step, 3);
+}
+
+bool
+terrain_mesh_position_for_geo_point_locked(GWorldSceneViewState *state,
+                                           const GWorldSceneGeoPoint &point,
+                                           GWorldSceneAltitudeMode altitude_mode,
+                                           glm::dvec3 &position)
+{
+  const int lat_floor = static_cast<int>(std::floor(point.latitude));
+  const int lon_floor = static_cast<int>(std::floor(point.longitude));
+  auto iter = state->terrain_tiles.find(terrain_key(lat_floor, lon_floor));
+  if (iter == state->terrain_tiles.end())
+    return false;
+
+  const TerrainTile &tile = *iter->second;
+  if (tile.dimension <= 1 || tile.heights.empty())
+    return false;
+
+  int sample_step = terrain_mesh_sample_step_for_lat_lon_locked(state, point.latitude, point.longitude);
+  sample_step = std::clamp(sample_step, 1, tile.dimension - 1);
+
+  const double sample_scale = static_cast<double>(tile.dimension - 1);
+  const double sx = std::clamp((point.longitude - static_cast<double>(lon_floor)) * sample_scale,
+                               0.0,
+                               sample_scale);
+  const double sy = std::clamp((static_cast<double>(lat_floor + 1) - point.latitude) * sample_scale,
+                               0.0,
+                               sample_scale);
+  int x0 = static_cast<int>(std::floor(sx / static_cast<double>(sample_step))) * sample_step;
+  int y0 = static_cast<int>(std::floor(sy / static_cast<double>(sample_step))) * sample_step;
+  if (x0 >= tile.dimension - 1)
+    x0 = std::max(0, tile.dimension - 1 - sample_step);
+  if (y0 >= tile.dimension - 1)
+    y0 = std::max(0, tile.dimension - 1 - sample_step);
+  const int x1 = std::min(tile.dimension - 1, x0 + sample_step);
+  const int y1 = std::min(tile.dimension - 1, y0 + sample_step);
+  if (x1 <= x0 || y1 <= y0)
+    return false;
+
+  const double tx = std::clamp((sx - static_cast<double>(x0)) /
+                                static_cast<double>(x1 - x0),
+                              0.0,
+                              1.0);
+  const double ty = std::clamp((sy - static_cast<double>(y0)) /
+                                static_cast<double>(y1 - y0),
+                              0.0,
+                              1.0);
+  const double altitude_offset_m =
+    altitude_mode == GWORLD_SCENE_ALTITUDE_AGL ? point.altitude_amsl : 0.0;
+
+  auto sample_position = [&](int x, int y) {
+    double latitude = 0.0;
+    double longitude = 0.0;
+    sample_to_lat_lon(tile, x, y, latitude, longitude);
+    return geodetic_to_enu(latitude,
+                           longitude,
+                           static_cast<double>(get_safe_height(tile, x, y)) + altitude_offset_m,
+                           state->mesh_origin_latitude,
+                           state->mesh_origin_longitude,
+                           0.0);
+  };
+
+  const glm::dvec3 p00 = sample_position(x0, y0);
+  const glm::dvec3 p10 = sample_position(x1, y0);
+  const glm::dvec3 p01 = sample_position(x0, y1);
+  const glm::dvec3 p11 = sample_position(x1, y1);
+  if (tx + ty <= 1.0) {
+    position = p00 + (p10 - p00) * tx + (p01 - p00) * ty;
+  } else {
+    const double w10 = 1.0 - ty;
+    const double w01 = 1.0 - tx;
+    const double w11 = tx + ty - 1.0;
+    position = p10 * w10 + p01 * w01 + p11 * w11;
+  }
+  return true;
+}
+
+glm::dvec3
+terrain_polyline_position_locked(GWorldSceneViewState *state,
+                                 const GWorldSceneGeoPoint &point,
+                                 GWorldSceneAltitudeMode altitude_mode)
+{
+  glm::dvec3 position(0.0);
+  if (terrain_mesh_position_for_geo_point_locked(state, point, altitude_mode, position))
+    return position;
+  return geo_point_position_locked(state, point, altitude_mode);
+}
+
 struct PolylineDashState {
   bool drawing = true;
   double phase_m = 0.0;
 };
+
+unsigned int
+round_stroke_segment_count(double radius_m)
+{
+  return std::clamp(static_cast<unsigned int>(std::ceil(radius_m * 1.2)),
+                    kPolylineRoundMinSegments,
+                    kPolylineRoundMaxSegments);
+}
+
+void
+append_round_stroke_disc(std::vector<float> &vertices,
+                         std::vector<unsigned int> &indices,
+                         const glm::dvec3 &center,
+                         double radius_m,
+                         const glm::vec4 &color)
+{
+  if (radius_m <= 0.0 || color.a <= 0.0)
+    return;
+
+  const unsigned int segments = round_stroke_segment_count(radius_m);
+  for (unsigned int i = 0; i < segments; ++i) {
+    const double a0 = 2.0 * kPi * static_cast<double>(i) / static_cast<double>(segments);
+    const double a1 = 2.0 * kPi * static_cast<double>(i + 1) / static_cast<double>(segments);
+    const glm::dvec3 p0(center.x + std::cos(a0) * radius_m,
+                        center.y,
+                        center.z + std::sin(a0) * radius_m);
+    const glm::dvec3 p1(center.x + std::cos(a1) * radius_m,
+                        center.y,
+                        center.z + std::sin(a1) * radius_m);
+    append_solid_triangle(vertices, indices, center, p1, p0, color);
+  }
+}
+
+void
+append_round_terrain_stroke_disc(GWorldSceneViewState *state,
+                                 const GWorldSceneGeoPoint &center,
+                                 double radius_m,
+                                 GWorldSceneAltitudeMode altitude_mode,
+                                 const glm::vec4 &color)
+{
+  if (radius_m <= 0.0 || color.a <= 0.0)
+    return;
+
+  const glm::dvec3 center_position =
+    terrain_polyline_position_locked(state, center, altitude_mode);
+  const unsigned int segments = round_stroke_segment_count(radius_m);
+  for (unsigned int i = 0; i < segments; ++i) {
+    const double a0 = 2.0 * kPi * static_cast<double>(i) / static_cast<double>(segments);
+    const double a1 = 2.0 * kPi * static_cast<double>(i + 1) / static_cast<double>(segments);
+    const GWorldSceneGeoPoint p0 =
+      offset_geo_point_m(center, std::cos(a0) * radius_m, std::sin(a0) * radius_m);
+    const GWorldSceneGeoPoint p1 =
+      offset_geo_point_m(center, std::cos(a1) * radius_m, std::sin(a1) * radius_m);
+    append_solid_triangle(state->vertices,
+                          state->indices,
+                          center_position,
+                          terrain_polyline_position_locked(state, p1, altitude_mode),
+                          terrain_polyline_position_locked(state, p0, altitude_mode),
+                          color);
+  }
+}
 
 void
 append_dashed_polyline_segment(std::vector<float> &vertices,
@@ -4058,7 +4273,8 @@ append_dashed_polyline_segment(std::vector<float> &vertices,
                                const glm::dvec3 &p1,
                                double width_m,
                                const glm::vec4 &color,
-                               PolylineDashState &dash_state)
+                               PolylineDashState &dash_state,
+                               bool round_caps)
 {
   if (width_m <= 0.0 || color.a <= 0.0)
     return;
@@ -4095,6 +4311,11 @@ append_dashed_polyline_segment(std::vector<float> &vertices,
       const glm::dvec3 dash_start = p0 + unit_direction * traveled_m;
       const glm::dvec3 dash_end = p0 + unit_direction * (traveled_m + step_m);
       append_polyline_segment(vertices, indices, dash_start, dash_end, width_m, color);
+      if (round_caps) {
+        const double radius_m = width_m * 0.5;
+        append_round_stroke_disc(vertices, indices, dash_start, radius_m, color);
+        append_round_stroke_disc(vertices, indices, dash_end, radius_m, color);
+      }
     }
 
     traveled_m += step_m;
@@ -4103,6 +4324,64 @@ append_dashed_polyline_segment(std::vector<float> &vertices,
       dash_state.drawing = !dash_state.drawing;
       dash_state.phase_m = 0.0;
     }
+  }
+}
+
+void
+append_polyline_positions(GWorldSceneViewState *state,
+                          const std::vector<glm::dvec3> &positions,
+                          bool closed,
+                          double width_m,
+                          bool dashed,
+                          bool round_dash_caps,
+                          const glm::vec4 &color)
+{
+  if (positions.size() < 2 || width_m <= 0.0 || color.a <= 0.0)
+    return;
+
+  PolylineDashState dash_state;
+  for (std::size_t i = 0; i + 1 < positions.size(); ++i) {
+    if (dashed)
+      append_dashed_polyline_segment(state->vertices,
+                                     state->indices,
+                                     positions[i],
+                                     positions[i + 1],
+                                     width_m,
+                                     color,
+                                     dash_state,
+                                     round_dash_caps);
+    else
+      append_polyline_segment(state->vertices,
+                              state->indices,
+                              positions[i],
+                              positions[i + 1],
+                              width_m,
+                              color);
+  }
+
+  if (closed && positions.size() > 2) {
+    if (dashed)
+      append_dashed_polyline_segment(state->vertices,
+                                     state->indices,
+                                     positions.back(),
+                                     positions.front(),
+                                     width_m,
+                                     color,
+                                     dash_state,
+                                     round_dash_caps);
+    else
+      append_polyline_segment(state->vertices,
+                              state->indices,
+                              positions.back(),
+                              positions.front(),
+                              width_m,
+                              color);
+  }
+
+  if (!dashed) {
+    const double radius_m = width_m * 0.5;
+    for (const glm::dvec3 &position : positions)
+      append_round_stroke_disc(state->vertices, state->indices, position, radius_m, color);
   }
 }
 
@@ -4124,42 +4403,43 @@ append_polyline_points(GWorldSceneViewState *state,
   for (gsize i = 0; i < n_points; ++i)
     positions.push_back(geo_point_position_locked(state, points[i], altitude_mode));
 
-  PolylineDashState dash_state;
-  for (gsize i = 0; i + 1 < n_points; ++i) {
-    if (dashed)
-      append_dashed_polyline_segment(state->vertices,
-                                     state->indices,
-                                     positions[i],
-                                     positions[i + 1],
-                                     width_m,
-                                     color,
-                                     dash_state);
-    else
-      append_polyline_segment(state->vertices,
-                              state->indices,
-                              positions[i],
-                              positions[i + 1],
-                              width_m,
-                              color);
+  append_polyline_positions(state, positions, closed, width_m, dashed, true, color);
+}
+
+void
+append_terrain_polyline_ribbon(GWorldSceneViewState *state,
+                               const std::vector<GWorldSceneGeoPoint> &points,
+                               const GWorldSceneGeoPoint *join_points,
+                               gsize n_join_points,
+                               double width_m,
+                               GWorldSceneAltitudeMode altitude_mode,
+                               const glm::vec4 &color)
+{
+  if (points.size() < 2 || width_m <= 0.0 || color.a <= 0.0)
+    return;
+
+  for (std::size_t i = 0; i + 1 < points.size(); ++i) {
+    double side_north_m = 0.0;
+    double side_east_m = 0.0;
+    if (!geo_segment_side_offset_m(points[i], points[i + 1], width_m, side_north_m, side_east_m))
+      continue;
+
+    const GWorldSceneGeoPoint a_left = offset_geo_point_m(points[i], side_north_m, side_east_m);
+    const GWorldSceneGeoPoint b_left = offset_geo_point_m(points[i + 1], side_north_m, side_east_m);
+    const GWorldSceneGeoPoint b_right = offset_geo_point_m(points[i + 1], -side_north_m, -side_east_m);
+    const GWorldSceneGeoPoint a_right = offset_geo_point_m(points[i], -side_north_m, -side_east_m);
+    append_solid_quad(state->vertices,
+                      state->indices,
+                      terrain_polyline_position_locked(state, a_left, altitude_mode),
+                      terrain_polyline_position_locked(state, b_left, altitude_mode),
+                      terrain_polyline_position_locked(state, b_right, altitude_mode),
+                      terrain_polyline_position_locked(state, a_right, altitude_mode),
+                      color);
   }
 
-  if (closed && n_points > 2) {
-    if (dashed)
-      append_dashed_polyline_segment(state->vertices,
-                                     state->indices,
-                                     positions.back(),
-                                     positions.front(),
-                                     width_m,
-                                     color,
-                                     dash_state);
-    else
-      append_polyline_segment(state->vertices,
-                              state->indices,
-                              positions.back(),
-                              positions.front(),
-                              width_m,
-                              color);
-  }
+  const double radius_m = width_m * 0.5;
+  for (gsize i = 0; join_points != nullptr && i < n_join_points; ++i)
+    append_round_terrain_stroke_disc(state, join_points[i], radius_m, altitude_mode, color);
 }
 
 void
@@ -4179,14 +4459,16 @@ append_conforming_polyline_points(GWorldSceneViewState *state,
 
   const std::vector<GWorldSceneGeoPoint> sampled =
     sample_terrain_polyline_points(points, n_points, closed);
-  append_polyline_points(state,
-                         sampled.data(),
-                         sampled.size(),
-                         false,
-                         width_m,
-                         altitude_mode,
-                         dashed,
-                         color);
+  if (!dashed) {
+    append_terrain_polyline_ribbon(state, sampled, points, n_points, width_m, altitude_mode, color);
+    return;
+  }
+
+  std::vector<glm::dvec3> positions;
+  positions.reserve(sampled.size());
+  for (const GWorldSceneGeoPoint &point : sampled)
+    positions.push_back(terrain_polyline_position_locked(state, point, altitude_mode));
+  append_polyline_positions(state, positions, false, width_m, dashed, false, color);
 }
 
 void
@@ -4213,8 +4495,7 @@ append_polyline_node(GWorldSceneViewState *state, GWorldScenePolylineNode *polyl
 struct TerrainPolygonVertex {
   double latitude = 0.0;
   double longitude = 0.0;
-  double height_amsl = 0.0;
-  double altitude_offset_m = 0.0;
+  glm::dvec3 position = glm::dvec3(0.0);
 };
 
 double
@@ -4281,8 +4562,7 @@ interpolate_terrain_polygon_vertex(const TerrainPolygonVertex &a,
   TerrainPolygonVertex out;
   out.latitude = a.latitude + (b.latitude - a.latitude) * t;
   out.longitude = a.longitude + (b.longitude - a.longitude) * t;
-  out.height_amsl = a.height_amsl + (b.height_amsl - a.height_amsl) * t;
-  out.altitude_offset_m = a.altitude_offset_m + (b.altitude_offset_m - a.altitude_offset_m) * t;
+  out.position = a.position + (b.position - a.position) * t;
   return out;
 }
 
@@ -4387,7 +4667,8 @@ terrain_polygon_altitude_offset_at(const GWorldSceneGeoPoint *points,
 }
 
 TerrainPolygonVertex
-terrain_polygon_hgt_vertex(const TerrainTile &tile,
+terrain_polygon_hgt_vertex(GWorldSceneViewState *state,
+                           const TerrainTile &tile,
                            int sample_x,
                            int sample_y,
                            const GWorldSceneGeoPoint *points,
@@ -4396,12 +4677,18 @@ terrain_polygon_hgt_vertex(const TerrainTile &tile,
 {
   TerrainPolygonVertex vertex;
   sample_to_lat_lon(tile, sample_x, sample_y, vertex.latitude, vertex.longitude);
-  vertex.height_amsl = static_cast<double>(get_safe_height(tile, sample_x, sample_y));
-  vertex.altitude_offset_m = terrain_polygon_altitude_offset_at(points,
-                                                               n_points,
-                                                               altitude_mode,
-                                                               vertex.latitude,
-                                                               vertex.longitude);
+  const double height_amsl = static_cast<double>(get_safe_height(tile, sample_x, sample_y));
+  const double altitude_offset_m = terrain_polygon_altitude_offset_at(points,
+                                                                     n_points,
+                                                                     altitude_mode,
+                                                                     vertex.latitude,
+                                                                     vertex.longitude);
+  vertex.position = geodetic_to_enu(vertex.latitude,
+                                    vertex.longitude,
+                                    height_amsl + altitude_offset_m + kTerrainPolygonSurfaceOffsetM,
+                                    state->mesh_origin_latitude,
+                                    state->mesh_origin_longitude,
+                                    0.0);
   return vertex;
 }
 
@@ -4409,12 +4696,8 @@ glm::dvec3
 terrain_polygon_vertex_position(GWorldSceneViewState *state,
                                 const TerrainPolygonVertex &vertex)
 {
-  return geodetic_to_enu(vertex.latitude,
-                         vertex.longitude,
-                         vertex.height_amsl + vertex.altitude_offset_m + kTerrainPolygonSurfaceOffsetM,
-                         state->mesh_origin_latitude,
-                         state->mesh_origin_longitude,
-                         0.0);
+  (void)state;
+  return vertex.position;
 }
 
 void
@@ -4567,10 +4850,10 @@ append_terrain_polygon_tile_ring(GWorldSceneViewState *state,
       if (center_distance <= inner_radius_m || center_distance > outer_radius_m + 2000.0)
         continue;
 
-      const TerrainPolygonVertex v00 = terrain_polygon_hgt_vertex(tile, sx, sy, points, n_points, altitude_mode);
-      const TerrainPolygonVertex v10 = terrain_polygon_hgt_vertex(tile, sx1, sy, points, n_points, altitude_mode);
-      const TerrainPolygonVertex v01 = terrain_polygon_hgt_vertex(tile, sx, sy1, points, n_points, altitude_mode);
-      const TerrainPolygonVertex v11 = terrain_polygon_hgt_vertex(tile, sx1, sy1, points, n_points, altitude_mode);
+      const TerrainPolygonVertex v00 = terrain_polygon_hgt_vertex(state, tile, sx, sy, points, n_points, altitude_mode);
+      const TerrainPolygonVertex v10 = terrain_polygon_hgt_vertex(state, tile, sx1, sy, points, n_points, altitude_mode);
+      const TerrainPolygonVertex v01 = terrain_polygon_hgt_vertex(state, tile, sx, sy1, points, n_points, altitude_mode);
+      const TerrainPolygonVertex v11 = terrain_polygon_hgt_vertex(state, tile, sx1, sy1, points, n_points, altitude_mode);
 
       appended = append_clipped_terrain_polygon_triangle(state,
                                                          v00,
@@ -4718,12 +5001,14 @@ append_polygon_node(GWorldSceneViewState *state, GWorldScenePolygonNode *polygon
     }
 
     if (!terrain_fill_appended) {
+      const bool lift_fallback = altitude_mode_uses_terrain(altitude_mode);
+      const glm::dvec3 fallback_lift(0.0, lift_fallback ? kTerrainPolygonSurfaceOffsetM : 0.0, 0.0);
       for (gsize i = 1; i + 1 < n_points; ++i) {
         append_solid_triangle(state->vertices,
                               state->indices,
-                              positions[0],
-                              positions[i],
-                              positions[i + 1],
+                              positions[0] + fallback_lift,
+                              positions[i] + fallback_lift,
+                              positions[i + 1] + fallback_lift,
                               fill_color);
       }
     }
@@ -4802,10 +5087,12 @@ append_circle_node(GWorldSceneViewState *state, GWorldSceneCircleNode *circle)
 
     if (!terrain_fill_appended) {
       const GWorldSceneGeoPoint center_point{center_latitude, center_longitude, center_altitude};
-      const glm::dvec3 center = geo_point_position_locked(state, center_point, altitude_mode);
+      const bool lift_fallback = altitude_mode_uses_terrain(altitude_mode);
+      const glm::dvec3 fallback_lift(0.0, lift_fallback ? kTerrainPolygonSurfaceOffsetM : 0.0, 0.0);
+      const glm::dvec3 center = geo_point_position_locked(state, center_point, altitude_mode) + fallback_lift;
       for (guint i = 0; i < segments; ++i) {
-        const glm::dvec3 p0 = geo_point_position_locked(state, points[i], altitude_mode);
-        const glm::dvec3 p1 = geo_point_position_locked(state, points[(i + 1) % segments], altitude_mode);
+        const glm::dvec3 p0 = geo_point_position_locked(state, points[i], altitude_mode) + fallback_lift;
+        const glm::dvec3 p1 = geo_point_position_locked(state, points[(i + 1) % segments], altitude_mode) + fallback_lift;
         append_solid_triangle(state->vertices, state->indices, center, p0, p1, fill_color);
       }
     }

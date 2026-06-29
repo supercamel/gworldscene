@@ -212,6 +212,7 @@ activate(GtkApplication *app, gpointer user_data)
   const double initial_longitude = 145.7048;
   const double initial_altitude_amsl = 7800.0;
   const double marker_altitude_amsl = 650.0;
+  const double zone_altitude_agl = 1.5;
 
   GtkWidget *view = gworld_scene_view_new();
   configure_map_tiles(GWORLD_SCENE_VIEW(view));
@@ -265,15 +266,15 @@ activate(GtkApplication *app, gpointer user_data)
   gworld_scene_polygon_node_set_fill_color(zone, 0.05, 0.48, 0.95, 0.24);
   gworld_scene_polygon_node_set_outline_color(zone, 0.10, 0.75, 1.0, 0.9);
   gworld_scene_polygon_node_set_outline_width(zone, 22.0);
-  gworld_scene_polygon_node_append_point(zone, -16.8650, 145.6795, 1.5);
-  gworld_scene_polygon_node_append_point(zone, -16.8505, 145.7040, 1.5);
-  gworld_scene_polygon_node_append_point(zone, -16.8845, 145.7310, 1.5);
-  gworld_scene_polygon_node_append_point(zone, -16.9060, 145.6950, 1.5);
+  gworld_scene_polygon_node_append_point(zone, -16.8650, 145.6795, zone_altitude_agl);
+  gworld_scene_polygon_node_append_point(zone, -16.8505, 145.7040, zone_altitude_agl);
+  gworld_scene_polygon_node_append_point(zone, -16.8845, 145.7310, zone_altitude_agl);
+  gworld_scene_polygon_node_append_point(zone, -16.9060, 145.6950, zone_altitude_agl);
 
   GWorldSceneCircleNode *bubble = gworld_scene_view_add_circle(GWORLD_SCENE_VIEW(view),
                                                                -16.8280,
                                                                145.6530,
-                                                               1.5,
+                                                               zone_altitude_agl,
                                                                850.0);
   gworld_scene_circle_node_set_altitude_mode(bubble, GWORLD_SCENE_ALTITUDE_AGL);
   gworld_scene_circle_node_set_fill_color(bubble, 0.18, 0.85, 0.42, 0.18);
