@@ -81,22 +81,27 @@ The main C demo starts near Cairns, Queensland, with terrain, satellite imagery,
 fog, sun lighting, shadows, and a mix of scene nodes:
 
 ```sh
-./builddir/examples/gworldscene-demo
+./builddir/examples/gworldscene-demo-gtk4
+# or, when built with GTK3:
+./builddir/examples/gworldscene-demo-gtk3
 ```
 
 The Vala control panel exposes map provider, terrain, fog, sun, shadow, and
 picking controls:
 
 ```sh
-./builddir/examples/gworldscene-controls
+./builddir/examples/gworldscene-controls-gtk4
 ```
 
-The SQGI scripts use the installed `GWorldScene-0.1` typelib:
+The SQGI scripts use the installed `GWorldSceneGtk3-0.1` or
+`GWorldSceneGtk4-0.1` typelibs:
 
 ```sh
 cd examples/sqgi
-sqgi introspection.nut
-sqgi simple-scene.nut
+sqgi introspection-gtk3.nut
+sqgi simple-scene-gtk3.nut
+sqgi introspection-gtk4.nut
+sqgi simple-scene-gtk4.nut
 ```
 
 To run SQGI against an uninstalled build tree:
@@ -104,7 +109,7 @@ To run SQGI against an uninstalled build tree:
 ```sh
 GI_TYPELIB_PATH=builddir/src \
 LD_LIBRARY_PATH=builddir/src \
-sqgi examples/sqgi/simple-scene.nut
+sqgi examples/sqgi/simple-scene-gtk4.nut
 ```
 
 ## Map Tiles And Terrain
@@ -234,7 +239,7 @@ activate(GtkApplication *app)
 Compile an installed library with pkg-config:
 
 ```sh
-cc app.c -o app $(pkg-config --cflags --libs gworldscene-0.1)
+cc app.c -o app $(pkg-config --cflags --libs gworldscene-gtk4-0.1)
 ```
 
 ## Language Bindings
@@ -248,14 +253,14 @@ C uses the umbrella header:
 Vala uses the generated package:
 
 ```sh
-valac --pkg gtk4 --pkg GWorldScene-0.1 app.vala
+valac --pkg gtk4 --pkg GWorldSceneGtk4-0.1 app.vala
 ```
 
 SQGI imports the typelib:
 
 ```nut
 local Gtk = import("Gtk", "4.0")
-local GWorldScene = import("GWorldScene", "0.1")
+local GWorldScene = import("GWorldSceneGtk4", "0.1")
 ```
 
 ## Documentation

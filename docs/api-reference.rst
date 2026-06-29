@@ -2,8 +2,8 @@ API Reference
 =============
 
 This page summarizes the public API exported by ``gworldscene.h`` and the
-``GWorldScene-0.1`` GIR. C names are canonical. Vala and SQGI names follow the
-generated introspection bindings.
+``GWorldSceneGtk3-0.1`` / ``GWorldSceneGtk4-0.1`` GIRs. C names are canonical.
+Vala and SQGI names follow the generated introspection bindings.
 
 Namespace mapping
 -----------------
@@ -18,11 +18,11 @@ Namespace mapping
      - ``#include <gworldscene/gworldscene.h>``
      - ``gworld_scene_*`` / ``GWorldScene*``
    * - Vala
-     - ``--pkg GWorldScene-0.1``
+     - ``--pkg GWorldSceneGtk3-0.1`` or ``--pkg GWorldSceneGtk4-0.1``
      - ``GWorld``
    * - SQGI
-     - ``import("GWorldScene", "0.1")``
-     - ``GWorldScene``
+     - ``import("GWorldSceneGtk3", "0.1")`` or ``import("GWorldSceneGtk4", "0.1")``
+     - ``GWorldSceneGtk3`` or ``GWorldSceneGtk4``
 
 Enumerations and records
 ------------------------
@@ -326,14 +326,15 @@ Vala classes:
   ``GWorld.SceneCircleNode``, and ``GWorld.SceneTextLabelNode``.
 
 SQGI classes:
-  ``GWorldScene.SceneView``, ``GWorldScene.SceneNode``,
-  ``GWorldScene.SceneCubeNode``, ``GWorldScene.SceneSphereNode``,
-  ``GWorldScene.SceneCylinderNode``, ``GWorldScene.SceneModelNode``,
-  ``GWorldScene.SceneBillboardNode``,
-  ``GWorldScene.SceneGroundOverlayNode``,
-  ``GWorldScene.ScenePolylineNode``, ``GWorldScene.ScenePolygonNode``,
-  ``GWorldScene.SceneCircleNode``, and
-  ``GWorldScene.SceneTextLabelNode``.
+  ``GWorldSceneGtk4.SceneView``, ``GWorldSceneGtk4.SceneNode``,
+  ``GWorldSceneGtk4.SceneCubeNode``, ``GWorldSceneGtk4.SceneSphereNode``,
+  ``GWorldSceneGtk4.SceneCylinderNode``, ``GWorldSceneGtk4.SceneModelNode``,
+  ``GWorldSceneGtk4.SceneBillboardNode``,
+  ``GWorldSceneGtk4.SceneGroundOverlayNode``,
+  ``GWorldSceneGtk4.ScenePolylineNode``, ``GWorldSceneGtk4.ScenePolygonNode``,
+  ``GWorldSceneGtk4.SceneCircleNode``, and
+  ``GWorldSceneGtk4.SceneTextLabelNode``. Use ``GWorldSceneGtk3`` instead for
+  GTK3 builds.
 
 Some generated Vala getters for multiple ``double*`` outputs currently lack
 ``out`` annotations in the generated VAPI. Prefer the setters in new examples,

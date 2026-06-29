@@ -1,18 +1,34 @@
-executable(
-  'gworldscene-demo',
-  'simple.c',
-  dependencies: gworldscene_dep,
-  install: false,
-)
+if gworldscene_gtk3_built
+  executable(
+    'gworldscene-demo-gtk3',
+    'simple.c',
+    dependencies: gworldscene_gtk3_dep,
+    c_args: ['-DGWORLD_SCENE_GTK_MAJOR=3'],
+    install: false,
+  )
+endif
 
-executable(
-  'gworldscene-controls',
-  'control-panel.vala',
-  include_directories: gworldscene_inc,
-  link_with: gworldscene_lib,
-  dependencies: [
-    gworldscene_vapi_dep,
-    dependency('gtk4'),
-  ],
-  install: false,
-)
+if gworldscene_gtk4_built
+  executable(
+    'gworldscene-demo-gtk4',
+    'simple.c',
+    dependencies: gworldscene_gtk4_dep,
+    c_args: ['-DGWORLD_SCENE_GTK_MAJOR=4'],
+    install: false,
+  )
+
+  executable(
+    'gworldscene-controls-gtk4',
+    'control-panel.vala',
+    include_directories: gworldscene_inc,
+    link_with: [
+      gworldscene_core_lib,
+      gworldscene_gtk4_lib,
+    ],
+    dependencies: [
+      gworldscene_gtk4_vapi_dep,
+      gtk4_dep,
+    ],
+    install: false,
+  )
+endif

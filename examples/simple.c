@@ -3,6 +3,14 @@
 
 #include "gworldscene.h"
 
+#ifndef GWORLD_SCENE_GTK_MAJOR
+#define GWORLD_SCENE_GTK_MAJOR 4
+#endif
+
+#if !GLIB_CHECK_VERSION(2, 74, 0)
+#define G_APPLICATION_DEFAULT_FLAGS G_APPLICATION_FLAGS_NONE
+#endif
+
 static gboolean
 env_is_set(const char *value)
 {
@@ -245,6 +253,7 @@ activate(GtkApplication *app, gpointer user_data)
   gworld_scene_node_set_color(GWORLD_SCENE_NODE(route), 0.95, 0.86, 0.18);
   gworld_scene_polyline_node_set_width(route, 35.0);
   gworld_scene_polyline_node_set_opacity(route, 0.92);
+  gworld_scene_polyline_node_set_dashed(route, TRUE);
   gworld_scene_polyline_node_set_altitude_mode(route, GWORLD_SCENE_ALTITUDE_AGL);
   gworld_scene_polyline_node_append_point(route, -16.8290, 145.6460, 90.0);
   gworld_scene_polyline_node_append_point(route, -16.8500, 145.6755, 120.0);
@@ -334,9 +343,14 @@ activate(GtkApplication *app, gpointer user_data)
   } else {
     g_warning("ToyCar demo model was not found");
   }
+#if GWORLD_SCENE_GTK_MAJOR == 4
   gtk_window_set_child(GTK_WINDOW(window), view);
 
   gtk_window_present(GTK_WINDOW(window));
+#else
+  gtk_container_add(GTK_CONTAINER(window), view);
+  gtk_widget_show_all(window);
+#endif
 }
 
 int

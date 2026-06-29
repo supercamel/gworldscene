@@ -2,8 +2,14 @@
 
 local GLib = import("GLib")
 local Gio = import("Gio")
-local Gtk = import("Gtk", "4.0")
-local GWorldScene = import("GWorldScene", "0.1")
+local gtk_major = ("GWORLD_SCENE_SQGI_GTK_MAJOR" in getroottable())
+  ? GWORLD_SCENE_SQGI_GTK_MAJOR
+  : 4
+if (gtk_major != 3 && gtk_major != 4)
+  throw "GWORLD_SCENE_SQGI_GTK_MAJOR must be 3 or 4"
+
+local Gtk = import("Gtk", gtk_major + ".0")
+local GWorldScene = import("GWorldSceneGtk" + gtk_major, "0.1")
 
 const INITIAL_LATITUDE = -16.8878
 const INITIAL_LONGITUDE = 145.7048
@@ -113,6 +119,9 @@ function add_scene_nodes(view) {
 
   local route = view.add_polyline()
   route.set_color(1.0, 0.86, 0.18)
+  route.set_width(35.0)
+  route.set_opacity(0.92)
+  route.set_dashed(true)
   route.set_altitude_mode(GWorldScene.SceneAltitudeMode.agl)
   route.append_point(-16.8290, 145.6460, 90.0)
   route.append_point(-16.8500, 145.6755, 120.0)
@@ -144,7 +153,7 @@ function add_scene_nodes(view) {
 
 function activate() {
   local window = Gtk.ApplicationWindow.new(app)
-  window.set_title("GWorldScene SQGI")
+  window.set_title("GWorldScene SQGI GTK" + gtk_major)
   window.set_default_size(1100, 760)
   W.window = window
 
@@ -159,15 +168,20 @@ function activate() {
   view.set_terrain_normal_smoothing(0.92)
   add_scene_nodes(view)
 
-  window.set_child(view)
-  window.present()
+  if (gtk_major == 4) {
+    window.set_child(view)
+    window.present()
+  } else {
+    window.add(view)
+    window.show_all()
+  }
 }
 
-app = Gtk.Application.new("com.supercamel.GWorldScene.SQGI",
+app = Gtk.Application.new("com.supercamel.GWorldScene.SQGI.Gtk" + gtk_major,
                           Gio.ApplicationFlags.flags_none)
 app.connect("activate", activate)
 
-local argv = ["gworldscene-sqgi-simple-scene"]
+local argv = ["gworldscene-sqgi-simple-scene-gtk" + gtk_major]
 foreach (arg in vargv) argv.append(arg)
 
 local status = app.run(argv.len(), argv)

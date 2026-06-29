@@ -302,6 +302,11 @@ void gworld_scene_polyline_node_set_opacity(GWorldScenePolylineNode *self,
 
 double gworld_scene_polyline_node_get_opacity(GWorldScenePolylineNode *self);
 
+void gworld_scene_polyline_node_set_dashed(GWorldScenePolylineNode *self,
+                                           gboolean dashed);
+
+gboolean gworld_scene_polyline_node_get_dashed(GWorldScenePolylineNode *self);
+
 void gworld_scene_polyline_node_set_altitude_mode(GWorldScenePolylineNode *self,
                                                   GWorldSceneAltitudeMode altitude_mode);
 

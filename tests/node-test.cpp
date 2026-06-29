@@ -263,9 +263,12 @@ test_polyline_node_stores_points_and_style()
 
   gworld_scene_polyline_node_set_width(polyline, 12.0);
   gworld_scene_polyline_node_set_opacity(polyline, 0.45);
+  g_assert_false(gworld_scene_polyline_node_get_dashed(polyline));
+  gworld_scene_polyline_node_set_dashed(polyline, TRUE);
   gworld_scene_polyline_node_set_altitude_mode(polyline, GWORLD_SCENE_ALTITUDE_CLAMP_TO_GROUND);
   assert_near(gworld_scene_polyline_node_get_width(polyline), 12.0, 0.001);
   assert_near(gworld_scene_polyline_node_get_opacity(polyline), 0.45, 0.001);
+  g_assert_true(gworld_scene_polyline_node_get_dashed(polyline));
   g_assert_cmpuint(gworld_scene_polyline_node_get_altitude_mode(polyline), ==, GWORLD_SCENE_ALTITUDE_CLAMP_TO_GROUND);
 
   gworld_scene_polyline_node_clear_points(polyline);

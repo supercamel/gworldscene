@@ -45,6 +45,14 @@
 #include <utility>
 #include <vector>
 
+#ifndef GWORLD_SCENE_GTK_MAJOR
+#define GWORLD_SCENE_GTK_MAJOR 4
+#endif
+
+#if GWORLD_SCENE_GTK_MAJOR != 3 && GWORLD_SCENE_GTK_MAJOR != 4
+#error "GWORLD_SCENE_GTK_MAJOR must be 3 or 4"
+#endif
+
 namespace {
 
 constexpr double kPi = 3.14159265358979323846;
@@ -91,6 +99,11 @@ constexpr double kTerrainPolygonSurfaceOffsetM = 1.0;
 constexpr double kTerrainPolygonOutlineOffsetM = 1.5;
 constexpr double kTerrainPolylineConformSampleSpacingM = 30.0;
 constexpr unsigned int kMaxTerrainPolylineSegmentSamples = 512;
+constexpr double kPolylineDashLengthMinM = 12.0;
+constexpr double kPolylineDashLengthWidthFactor = 4.0;
+constexpr double kPolylineDashGapMinM = 8.0;
+constexpr double kPolylineDashGapWidthFactor = 2.5;
+constexpr double kPolylineDashMaxCyclesPerSegment = 512.0;
 constexpr double kClickDragThresholdPx = 4.0;
 constexpr double kClickCameraRotationThresholdDeg = 0.01;
 constexpr double kSunAngularRadiusDeg = 0.266;
@@ -105,6 +118,28 @@ constexpr const char *kDefaultMapTileTemplate = "https://tile.openstreetmap.org/
 using gworld_scene::deg_to_rad;
 using gworld_scene::kEarthMetersPerDegree;
 using gworld_scene::ned_to_scene_vector;
+
+void
+widget_size(GtkWidget *widget, int *width, int *height)
+{
+#if GWORLD_SCENE_GTK_MAJOR == 4
+  *width = std::max(1, gtk_widget_get_width(widget));
+  *height = std::max(1, gtk_widget_get_height(widget));
+#else
+  *width = std::max(1, gtk_widget_get_allocated_width(widget));
+  *height = std::max(1, gtk_widget_get_allocated_height(widget));
+#endif
+}
+
+void
+widget_set_focusable(GtkWidget *widget, gboolean focusable)
+{
+#if GWORLD_SCENE_GTK_MAJOR == 4
+  gtk_widget_set_focusable(widget, focusable);
+#else
+  gtk_widget_set_can_focus(widget, focusable);
+#endif
+}
 
 struct TileCoord {
   int z = 0;
@@ -435,6 +470,7 @@ struct GWorldSceneViewState {
   double click_press_y = 0.0;
   double click_press_heading_deg = 0.0;
   double click_press_pitch_deg = 0.0;
+  int click_n_press = 1;
   bool click_dragged = false;
 
   bool move_forward = false;
@@ -2353,8 +2389,9 @@ make_pick_ray_locked(GWorldSceneViewState *state,
                      double widget_y,
                      gworld_scene::PickRay &ray)
 {
-  const int width = std::max(1, gtk_widget_get_width(widget));
-  const int height = std::max(1, gtk_widget_get_height(widget));
+  int width = 1;
+  int height = 1;
+  widget_size(widget, &width, &height);
   const double altitude = std::max(25.0, state->altitude_amsl);
   const double radius_m = terrain_build_radius_for_altitude(state->altitude_amsl);
   const bool render_globe = altitude >= kGlobeRenderAltitudeM;
@@ -4009,6 +4046,66 @@ sample_terrain_polyline_points(const GWorldSceneGeoPoint *points, gsize n_points
   return sampled;
 }
 
+struct PolylineDashState {
+  bool drawing = true;
+  double phase_m = 0.0;
+};
+
+void
+append_dashed_polyline_segment(std::vector<float> &vertices,
+                               std::vector<unsigned int> &indices,
+                               const glm::dvec3 &p0,
+                               const glm::dvec3 &p1,
+                               double width_m,
+                               const glm::vec4 &color,
+                               PolylineDashState &dash_state)
+{
+  if (width_m <= 0.0 || color.a <= 0.0)
+    return;
+
+  const glm::dvec3 direction = p1 - p0;
+  const double segment_length_m = glm::length(direction);
+  if (segment_length_m <= 0.000001)
+    return;
+
+  double dash_length_m =
+    std::max(kPolylineDashLengthMinM, width_m * kPolylineDashLengthWidthFactor);
+  double gap_length_m =
+    std::max(kPolylineDashGapMinM, width_m * kPolylineDashGapWidthFactor);
+  const double cycle_count = segment_length_m / (dash_length_m + gap_length_m);
+  if (cycle_count > kPolylineDashMaxCyclesPerSegment) {
+    const double scale = cycle_count / kPolylineDashMaxCyclesPerSegment;
+    dash_length_m *= scale;
+    gap_length_m *= scale;
+  }
+  const glm::dvec3 unit_direction = direction / segment_length_m;
+  double traveled_m = 0.0;
+
+  while (traveled_m < segment_length_m) {
+    const double span_length_m = dash_state.drawing ? dash_length_m : gap_length_m;
+    const double span_remaining_m = span_length_m - dash_state.phase_m;
+    if (span_remaining_m <= 0.000001) {
+      dash_state.drawing = !dash_state.drawing;
+      dash_state.phase_m = 0.0;
+      continue;
+    }
+
+    const double step_m = std::min(span_remaining_m, segment_length_m - traveled_m);
+    if (dash_state.drawing && step_m > 0.000001) {
+      const glm::dvec3 dash_start = p0 + unit_direction * traveled_m;
+      const glm::dvec3 dash_end = p0 + unit_direction * (traveled_m + step_m);
+      append_polyline_segment(vertices, indices, dash_start, dash_end, width_m, color);
+    }
+
+    traveled_m += step_m;
+    dash_state.phase_m += step_m;
+    if (dash_state.phase_m >= span_length_m - 0.000001) {
+      dash_state.drawing = !dash_state.drawing;
+      dash_state.phase_m = 0.0;
+    }
+  }
+}
+
 void
 append_polyline_points(GWorldSceneViewState *state,
                        const GWorldSceneGeoPoint *points,
@@ -4016,6 +4113,7 @@ append_polyline_points(GWorldSceneViewState *state,
                        bool closed,
                        double width_m,
                        GWorldSceneAltitudeMode altitude_mode,
+                       bool dashed,
                        const glm::vec4 &color)
 {
   if (points == nullptr || n_points < 2 || width_m <= 0.0 || color.a <= 0.0)
@@ -4026,11 +4124,42 @@ append_polyline_points(GWorldSceneViewState *state,
   for (gsize i = 0; i < n_points; ++i)
     positions.push_back(geo_point_position_locked(state, points[i], altitude_mode));
 
-  for (gsize i = 0; i + 1 < n_points; ++i)
-    append_polyline_segment(state->vertices, state->indices, positions[i], positions[i + 1], width_m, color);
+  PolylineDashState dash_state;
+  for (gsize i = 0; i + 1 < n_points; ++i) {
+    if (dashed)
+      append_dashed_polyline_segment(state->vertices,
+                                     state->indices,
+                                     positions[i],
+                                     positions[i + 1],
+                                     width_m,
+                                     color,
+                                     dash_state);
+    else
+      append_polyline_segment(state->vertices,
+                              state->indices,
+                              positions[i],
+                              positions[i + 1],
+                              width_m,
+                              color);
+  }
 
-  if (closed && n_points > 2)
-    append_polyline_segment(state->vertices, state->indices, positions.back(), positions.front(), width_m, color);
+  if (closed && n_points > 2) {
+    if (dashed)
+      append_dashed_polyline_segment(state->vertices,
+                                     state->indices,
+                                     positions.back(),
+                                     positions.front(),
+                                     width_m,
+                                     color,
+                                     dash_state);
+    else
+      append_polyline_segment(state->vertices,
+                              state->indices,
+                              positions.back(),
+                              positions.front(),
+                              width_m,
+                              color);
+  }
 }
 
 void
@@ -4040,10 +4169,11 @@ append_conforming_polyline_points(GWorldSceneViewState *state,
                                   bool closed,
                                   double width_m,
                                   GWorldSceneAltitudeMode altitude_mode,
+                                  bool dashed,
                                   const glm::vec4 &color)
 {
   if (!altitude_mode_uses_terrain(altitude_mode)) {
-    append_polyline_points(state, points, n_points, closed, width_m, altitude_mode, color);
+    append_polyline_points(state, points, n_points, closed, width_m, altitude_mode, dashed, color);
     return;
   }
 
@@ -4055,6 +4185,7 @@ append_conforming_polyline_points(GWorldSceneViewState *state,
                          false,
                          width_m,
                          altitude_mode,
+                         dashed,
                          color);
 }
 
@@ -4075,6 +4206,7 @@ append_polyline_node(GWorldSceneViewState *state, GWorldScenePolylineNode *polyl
                                     false,
                                     gworld_scene_polyline_node_get_width(polyline),
                                     gworld_scene_polyline_node_get_altitude_mode(polyline),
+                                    gworld_scene_polyline_node_get_dashed(polyline),
                                     color);
 }
 
@@ -4618,6 +4750,7 @@ append_polygon_node(GWorldSceneViewState *state, GWorldScenePolygonNode *polygon
                                     true,
                                     gworld_scene_polygon_node_get_outline_width(polygon),
                                     outline_altitude_mode,
+                                    false,
                                     rgba_from_components(red, green, blue, alpha));
 }
 
@@ -4699,6 +4832,7 @@ append_circle_node(GWorldSceneViewState *state, GWorldSceneCircleNode *circle)
                                     true,
                                     gworld_scene_circle_node_get_outline_width(circle),
                                     outline_altitude_mode,
+                                    false,
                                     rgba_from_components(red, green, blue, alpha));
 }
 
@@ -8402,8 +8536,9 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
   }
 
   const gint64 camera_start_us = perf_now_us();
-  const int width = std::max(1, gtk_widget_get_width(GTK_WIDGET(area)));
-  const int height = std::max(1, gtk_widget_get_height(GTK_WIDGET(area)));
+  int width = 1;
+  int height = 1;
+  widget_size(GTK_WIDGET(area), &width, &height);
   glViewport(0, 0, width, height);
 
   double far_plane_m = std::max(100000.0, radius_m * 3.0 + altitude * 4.0);
@@ -8743,48 +8878,37 @@ rotate_camera_pixels(GWorldSceneView *self, double dx, double dy)
 }
 
 static void
-on_rotate_drag_begin(GtkGestureDrag *gesture, double start_x, double start_y, gpointer user_data)
+mark_drag_and_rotate(GWorldSceneView *self, double dx, double dy, double total_dx, double total_dy)
 {
-  (void)gesture;
-  (void)start_x;
-  (void)start_y;
-  auto *self = GWORLD_SCENE_VIEW(user_data);
-  gtk_widget_grab_focus(GTK_WIDGET(self));
   auto *state = get_state(self);
-  std::unique_lock<std::mutex> lock(state->mutex);
-  state->rotate_drag_last_x = 0.0;
-  state->rotate_drag_last_y = 0.0;
-}
-
-static void
-on_rotate_drag_update(GtkGestureDrag *gesture, double offset_x, double offset_y, gpointer user_data)
-{
-  (void)gesture;
-  auto *self = GWORLD_SCENE_VIEW(user_data);
-  auto *state = get_state(self);
-  double dx = 0.0;
-  double dy = 0.0;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
-    dx = offset_x - state->rotate_drag_last_x;
-    dy = offset_y - state->rotate_drag_last_y;
-    state->rotate_drag_last_x = offset_x;
-    state->rotate_drag_last_y = offset_y;
-    if (std::hypot(offset_x, offset_y) >= kClickDragThresholdPx ||
+    if (std::hypot(total_dx, total_dy) >= kClickDragThresholdPx ||
         std::hypot(dx, dy) > 0.25)
       state->click_dragged = true;
   }
   rotate_camera_pixels(self, dx, dy);
 }
 
-static gboolean
-on_scroll(GtkEventControllerScroll *controller, double dx, double dy, gpointer user_data)
+static void
+begin_click(GWorldSceneView *self, guint button, int n_press, double x, double y)
 {
-  (void)controller;
-  (void)dx;
-  auto *self = GWORLD_SCENE_VIEW(user_data);
   gtk_widget_grab_focus(GTK_WIDGET(self));
+  auto *state = get_state(self);
+  std::lock_guard<std::mutex> lock(state->mutex);
+  state->click_button = button;
+  state->click_n_press = n_press;
+  state->click_press_x = x;
+  state->click_press_y = y;
+  state->click_press_heading_deg = state->heading_deg;
+  state->click_press_pitch_deg = state->pitch_deg;
+  state->click_dragged = false;
+}
 
+static gboolean
+zoom_camera_scroll(GWorldSceneView *self, double dy)
+{
+  gtk_widget_grab_focus(GTK_WIDGET(self));
   double latitude = 0.0;
   double longitude = 0.0;
   double altitude = 0.0;
@@ -8879,15 +9003,8 @@ on_tick(GtkWidget *widget, GdkFrameClock *frame_clock, gpointer user_data)
 }
 
 static gboolean
-on_key_pressed(GtkEventControllerKey *controller,
-               guint keyval,
-               guint keycode,
-               GdkModifierType modifiers,
-               gpointer user_data)
+handle_key_pressed(GWorldSceneView *self, guint keyval, GdkModifierType modifiers)
 {
-  (void)controller;
-  (void)keycode;
-  auto *self = GWORLD_SCENE_VIEW(user_data);
   auto *state = get_state(self);
 
   double heading = 0.0;
@@ -8928,15 +9045,8 @@ on_key_pressed(GtkEventControllerKey *controller,
 }
 
 static void
-on_key_released(GtkEventControllerKey *controller,
-                guint keyval,
-                guint keycode,
-                GdkModifierType modifiers,
-                gpointer user_data)
+handle_key_released(GWorldSceneView *self, guint keyval, GdkModifierType modifiers)
 {
-  (void)controller;
-  (void)keycode;
-  auto *self = GWORLD_SCENE_VIEW(user_data);
   auto *state = get_state(self);
   std::unique_lock<std::mutex> lock(state->mutex);
   set_movement_key(state, keyval, false);
@@ -8945,26 +9055,8 @@ on_key_released(GtkEventControllerKey *controller,
 }
 
 static void
-on_click_pressed(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data)
+finish_click(GWorldSceneView *self, int n_press, double x, double y, guint fallback_button)
 {
-  (void)n_press;
-  auto *self = GWORLD_SCENE_VIEW(user_data);
-  gtk_widget_grab_focus(GTK_WIDGET(self));
-
-  auto *state = get_state(self);
-  std::lock_guard<std::mutex> lock(state->mutex);
-  state->click_button = gtk_gesture_single_get_current_button(GTK_GESTURE_SINGLE(gesture));
-  state->click_press_x = x;
-  state->click_press_y = y;
-  state->click_press_heading_deg = state->heading_deg;
-  state->click_press_pitch_deg = state->pitch_deg;
-  state->click_dragged = false;
-}
-
-static void
-on_click_released(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data)
-{
-  auto *self = GWORLD_SCENE_VIEW(user_data);
   guint button = 0;
   bool suppress_pick = false;
   {
@@ -8980,11 +9072,12 @@ on_click_released(GtkGestureClick *gesture, int n_press, double x, double y, gpo
                     camera_rotated ||
                     std::hypot(dx, dy) >= kClickDragThresholdPx;
     state->click_button = 0;
+    state->click_n_press = 1;
     state->click_dragged = false;
   }
 
   if (button == 0)
-    button = gtk_gesture_single_get_current_button(GTK_GESTURE_SINGLE(gesture));
+    button = fallback_button;
   if (suppress_pick)
     return;
 
@@ -9017,6 +9110,190 @@ on_click_released(GtkGestureClick *gesture, int n_press, double x, double y, gpo
                 pick.altitude_amsl,
                 button);
 }
+
+#if GWORLD_SCENE_GTK_MAJOR == 4
+static void
+on_rotate_drag_begin(GtkGestureDrag *gesture, double start_x, double start_y, gpointer user_data)
+{
+  (void)gesture;
+  (void)start_x;
+  (void)start_y;
+  auto *self = GWORLD_SCENE_VIEW(user_data);
+  gtk_widget_grab_focus(GTK_WIDGET(self));
+  auto *state = get_state(self);
+  std::unique_lock<std::mutex> lock(state->mutex);
+  state->rotate_drag_last_x = 0.0;
+  state->rotate_drag_last_y = 0.0;
+}
+
+static void
+on_rotate_drag_update(GtkGestureDrag *gesture, double offset_x, double offset_y, gpointer user_data)
+{
+  (void)gesture;
+  auto *self = GWORLD_SCENE_VIEW(user_data);
+  auto *state = get_state(self);
+  double dx = 0.0;
+  double dy = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    dx = offset_x - state->rotate_drag_last_x;
+    dy = offset_y - state->rotate_drag_last_y;
+    state->rotate_drag_last_x = offset_x;
+    state->rotate_drag_last_y = offset_y;
+  }
+  mark_drag_and_rotate(self, dx, dy, offset_x, offset_y);
+}
+
+static gboolean
+on_scroll(GtkEventControllerScroll *controller, double dx, double dy, gpointer user_data)
+{
+  (void)controller;
+  (void)dx;
+  return zoom_camera_scroll(GWORLD_SCENE_VIEW(user_data), dy);
+}
+
+static gboolean
+on_key_pressed(GtkEventControllerKey *controller,
+               guint keyval,
+               guint keycode,
+               GdkModifierType modifiers,
+               gpointer user_data)
+{
+  (void)controller;
+  (void)keycode;
+  return handle_key_pressed(GWORLD_SCENE_VIEW(user_data), keyval, modifiers);
+}
+
+static void
+on_key_released(GtkEventControllerKey *controller,
+                guint keyval,
+                guint keycode,
+                GdkModifierType modifiers,
+                gpointer user_data)
+{
+  (void)controller;
+  (void)keycode;
+  handle_key_released(GWORLD_SCENE_VIEW(user_data), keyval, modifiers);
+}
+
+static void
+on_click_pressed(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data)
+{
+  begin_click(GWORLD_SCENE_VIEW(user_data),
+              gtk_gesture_single_get_current_button(GTK_GESTURE_SINGLE(gesture)),
+              n_press,
+              x,
+              y);
+}
+
+static void
+on_click_released(GtkGestureClick *gesture, int n_press, double x, double y, gpointer user_data)
+{
+  finish_click(GWORLD_SCENE_VIEW(user_data),
+               n_press,
+               x,
+               y,
+               gtk_gesture_single_get_current_button(GTK_GESTURE_SINGLE(gesture)));
+}
+#else
+static gboolean
+on_button_press(GtkWidget *widget, GdkEventButton *event, gpointer user_data)
+{
+  (void)widget;
+  auto *self = GWORLD_SCENE_VIEW(user_data);
+  const int n_press = event->type == GDK_2BUTTON_PRESS ? 2 : 1;
+  begin_click(self, event->button, n_press, event->x, event->y);
+
+  auto *state = get_state(self);
+  std::lock_guard<std::mutex> lock(state->mutex);
+  state->rotate_drag_last_x = event->x;
+  state->rotate_drag_last_y = event->y;
+  return TRUE;
+}
+
+static gboolean
+on_button_release(GtkWidget *widget, GdkEventButton *event, gpointer user_data)
+{
+  (void)widget;
+  auto *self = GWORLD_SCENE_VIEW(user_data);
+  int n_press = 1;
+  {
+    auto *state = get_state(self);
+    std::lock_guard<std::mutex> lock(state->mutex);
+    n_press = state->click_n_press;
+  }
+  finish_click(self, n_press, event->x, event->y, event->button);
+  return TRUE;
+}
+
+static gboolean
+on_motion_notify(GtkWidget *widget, GdkEventMotion *event, gpointer user_data)
+{
+  (void)widget;
+  if ((event->state & GDK_BUTTON1_MASK) == 0)
+    return FALSE;
+
+  auto *self = GWORLD_SCENE_VIEW(user_data);
+  auto *state = get_state(self);
+  double dx = 0.0;
+  double dy = 0.0;
+  double total_dx = 0.0;
+  double total_dy = 0.0;
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->click_button != GDK_BUTTON_PRIMARY)
+      return FALSE;
+    dx = event->x - state->rotate_drag_last_x;
+    dy = event->y - state->rotate_drag_last_y;
+    total_dx = event->x - state->click_press_x;
+    total_dy = event->y - state->click_press_y;
+    state->rotate_drag_last_x = event->x;
+    state->rotate_drag_last_y = event->y;
+  }
+  mark_drag_and_rotate(self, dx, dy, total_dx, total_dy);
+  return TRUE;
+}
+
+static gboolean
+on_scroll_event(GtkWidget *widget, GdkEventScroll *event, gpointer user_data)
+{
+  (void)widget;
+  double dy = 0.0;
+  switch (event->direction) {
+  case GDK_SCROLL_UP:
+    dy = -1.0;
+    break;
+  case GDK_SCROLL_DOWN:
+    dy = 1.0;
+    break;
+  case GDK_SCROLL_SMOOTH:
+    dy = event->delta_y;
+    break;
+  default:
+    return FALSE;
+  }
+  return zoom_camera_scroll(GWORLD_SCENE_VIEW(user_data), dy);
+}
+
+static gboolean
+on_key_press_event(GtkWidget *widget, GdkEventKey *event, gpointer user_data)
+{
+  (void)widget;
+  return handle_key_pressed(GWORLD_SCENE_VIEW(user_data),
+                            event->keyval,
+                            static_cast<GdkModifierType>(event->state));
+}
+
+static gboolean
+on_key_release_event(GtkWidget *widget, GdkEventKey *event, gpointer user_data)
+{
+  (void)widget;
+  handle_key_released(GWORLD_SCENE_VIEW(user_data),
+                      event->keyval,
+                      static_cast<GdkModifierType>(event->state));
+  return FALSE;
+}
+#endif
 
 static void
 gworld_scene_view_set_property(GObject *object,
@@ -9352,7 +9629,7 @@ gworld_scene_view_init(GWorldSceneView *self)
   gtk_gl_area_set_auto_render(GTK_GL_AREA(self), TRUE);
   gtk_widget_set_hexpand(GTK_WIDGET(self), TRUE);
   gtk_widget_set_vexpand(GTK_WIDGET(self), TRUE);
-  gtk_widget_set_focusable(GTK_WIDGET(self), TRUE);
+  widget_set_focusable(GTK_WIDGET(self), TRUE);
 
   static gsize registered = 0;
   if (g_once_init_enter(&registered)) {
@@ -9362,6 +9639,7 @@ gworld_scene_view_init(GWorldSceneView *self)
     g_once_init_leave(&registered, 1);
   }
 
+#if GWORLD_SCENE_GTK_MAJOR == 4
   auto *click = gtk_gesture_click_new();
   gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click), 0);
   g_signal_connect(click, "pressed", G_CALLBACK(on_click_pressed), self);
@@ -9383,6 +9661,25 @@ gworld_scene_view_init(GWorldSceneView *self)
   g_signal_connect(key, "key-pressed", G_CALLBACK(on_key_pressed), self);
   g_signal_connect(key, "key-released", G_CALLBACK(on_key_released), self);
   gtk_widget_add_controller(GTK_WIDGET(self), key);
+#else
+  gint event_mask =
+    GDK_BUTTON_PRESS_MASK |
+    GDK_BUTTON_RELEASE_MASK |
+    GDK_POINTER_MOTION_MASK |
+    GDK_SCROLL_MASK |
+    GDK_KEY_PRESS_MASK |
+    GDK_KEY_RELEASE_MASK;
+#ifdef GDK_SMOOTH_SCROLL_MASK
+  event_mask |= GDK_SMOOTH_SCROLL_MASK;
+#endif
+  gtk_widget_add_events(GTK_WIDGET(self), event_mask);
+  g_signal_connect(self, "button-press-event", G_CALLBACK(on_button_press), self);
+  g_signal_connect(self, "button-release-event", G_CALLBACK(on_button_release), self);
+  g_signal_connect(self, "motion-notify-event", G_CALLBACK(on_motion_notify), self);
+  g_signal_connect(self, "scroll-event", G_CALLBACK(on_scroll_event), self);
+  g_signal_connect(self, "key-press-event", G_CALLBACK(on_key_press_event), self);
+  g_signal_connect(self, "key-release-event", G_CALLBACK(on_key_release_event), self);
+#endif
 
   gtk_widget_add_tick_callback(GTK_WIDGET(self), on_tick, nullptr, nullptr);
 

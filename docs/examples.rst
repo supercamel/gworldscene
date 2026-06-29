@@ -69,7 +69,7 @@ SQGI
 
    local Gio = import("Gio")
    local Gtk = import("Gtk", "4.0")
-   local GWorldScene = import("GWorldScene", "0.1")
+   local GWorldScene = import("GWorldSceneGtk4", "0.1")
 
    local app = null
    local W = { window = null, view = null }

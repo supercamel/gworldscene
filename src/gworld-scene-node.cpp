@@ -176,6 +176,7 @@ struct _GWorldScenePolylineNode {
   GArray *points = nullptr;
   double width_m = 8.0;
   double opacity = 1.0;
+  bool dashed = false;
   GWorldSceneAltitudeMode altitude_mode = GWORLD_SCENE_ALTITUDE_AMSL;
 };
 
@@ -518,6 +519,7 @@ gworld_scene_polyline_node_init(GWorldScenePolylineNode *self)
   self->points = g_array_new(FALSE, FALSE, sizeof(GWorldSceneGeoPoint));
   self->width_m = 8.0;
   self->opacity = 1.0;
+  self->dashed = false;
   self->altitude_mode = GWORLD_SCENE_ALTITUDE_AMSL;
   auto *priv = node_priv(GWORLD_SCENE_NODE(self));
   priv->red = 0.1;
@@ -1275,6 +1277,21 @@ gworld_scene_polyline_node_get_opacity(GWorldScenePolylineNode *self)
 {
   g_return_val_if_fail(GWORLD_IS_SCENE_POLYLINE_NODE(self), 0.0);
   return self->opacity;
+}
+
+void
+gworld_scene_polyline_node_set_dashed(GWorldScenePolylineNode *self, gboolean dashed)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_POLYLINE_NODE(self));
+  self->dashed = dashed != FALSE;
+  emit_changed(GWORLD_SCENE_NODE(self));
+}
+
+gboolean
+gworld_scene_polyline_node_get_dashed(GWorldScenePolylineNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_POLYLINE_NODE(self), FALSE);
+  return self->dashed;
 }
 
 void

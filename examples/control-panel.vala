@@ -573,6 +573,7 @@ namespace GWorldSceneControls {
       route.set_color (0.95, 0.86, 0.18);
       route.set_width (35.0);
       route.set_opacity (0.92);
+      route.set_dashed (true);
       route.set_altitude_mode (GWorld.SceneAltitudeMode.AGL);
       route.append_point (-16.8290, 145.6460, 90.0);
       route.append_point (-16.8500, 145.6755, 120.0);

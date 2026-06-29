@@ -1,0 +1,2 @@
+option('gtk3', type: 'feature', value: 'auto', description: 'Build the GTK3 GWorldScene widget library')
+option('gtk4', type: 'feature', value: 'auto', description: 'Build the GTK4 GWorldScene widget library')
