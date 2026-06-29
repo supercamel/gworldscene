@@ -4,7 +4,8 @@ Concepts
 Scene view
 ----------
 
-``GWorldSceneView`` is a GTK 4 widget derived from ``GtkGLArea``. Add it to a
+``GWorldSceneView`` is a GTK widget derived from ``GtkGLArea``. It is provided
+by separate GTK 3 and GTK 4 libraries with the same C API surface. Add it to a
 normal GTK widget hierarchy and then configure the camera, map tiles, terrain,
 lighting, and scene nodes.
 

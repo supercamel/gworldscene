@@ -27,6 +27,17 @@ Build and install
    meson test -C builddir --print-errorlogs
    sudo meson install -C builddir
 
+Meson builds each backend whose development package is available. You can also
+force a specific backend:
+
+.. code-block:: sh
+
+   meson setup builddir -Dgtk3=enabled -Dgtk4=disabled
+   meson setup builddir -Dgtk3=disabled -Dgtk4=enabled
+
+Applications should link only one GTK backend in a single process, even when
+both libraries are installed.
+
 The install layout intentionally follows the system GObject Introspection
 directories. On aarch64 Linux, the installed files include:
 
@@ -57,6 +68,8 @@ Compile with pkg-config:
 
    cc app.c -o app $(pkg-config --cflags --libs gworldscene-gtk4-0.1)
 
+Use ``gworldscene-gtk3-0.1`` instead for GTK 3 applications.
+
 Use the umbrella header:
 
 .. code-block:: c
@@ -71,6 +84,9 @@ After installation, compile against the generated VAPI:
 .. code-block:: sh
 
    valac --pkg gtk4 --pkg GWorldSceneGtk4-0.1 app.vala
+
+Use ``--pkg gtk+-3.0 --pkg GWorldSceneGtk3-0.1`` instead for GTK 3
+applications.
 
 The Vala namespace is ``GWorld``.
 

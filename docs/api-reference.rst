@@ -5,6 +5,10 @@ This page summarizes the public API exported by ``gworldscene.h`` and the
 ``GWorldSceneGtk3-0.1`` / ``GWorldSceneGtk4-0.1`` GIRs. C names are canonical.
 Vala and SQGI names follow the generated introspection bindings.
 
+The C symbol names are shared between backends. Choose exactly one GTK package
+for an application: ``gworldscene-gtk3-0.1`` for GTK 3 or
+``gworldscene-gtk4-0.1`` for GTK 4.
+
 Namespace mapping
 -----------------
 
@@ -15,7 +19,7 @@ Namespace mapping
      - Import
      - Namespace
    * - C
-     - ``#include <gworldscene/gworldscene.h>``
+     - ``pkg-config --libs gworldscene-gtk3-0.1`` or ``pkg-config --libs gworldscene-gtk4-0.1``
      - ``gworld_scene_*`` / ``GWorldScene*``
    * - Vala
      - ``--pkg GWorldSceneGtk3-0.1`` or ``--pkg GWorldSceneGtk4-0.1``
@@ -50,7 +54,7 @@ Enumerations and records
 -------------------
 
 Inheritance:
-  ``GWorldSceneView`` derives from ``GtkGLArea``.
+  ``GWorldSceneView`` derives from ``GtkGLArea`` in the selected GTK backend.
 
 Constructor:
   ``GtkWidget *gworld_scene_view_new(void)``
@@ -334,7 +338,7 @@ SQGI classes:
   ``GWorldSceneGtk4.ScenePolylineNode``, ``GWorldSceneGtk4.ScenePolygonNode``,
   ``GWorldSceneGtk4.SceneCircleNode``, and
   ``GWorldSceneGtk4.SceneTextLabelNode``. Use ``GWorldSceneGtk3`` instead for
-  GTK3 builds.
+  GTK 3 builds.
 
 Some generated Vala getters for multiple ``double*`` outputs currently lack
 ``out`` annotations in the generated VAPI. Prefer the setters in new examples,

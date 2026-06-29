@@ -4,6 +4,10 @@ Examples
 Minimal application
 -------------------
 
+The snippets below use GTK 4 APIs and the GTK 4 package names. For GTK 3,
+link ``gworldscene-gtk3-0.1`` / ``GWorldSceneGtk3-0.1`` and use GTK 3 window
+packing such as ``gtk_container_add()`` and ``gtk_widget_show_all()``.
+
 C
 ~
 

@@ -1,8 +1,8 @@
 # GWorldScene
 
-GWorldScene is a GTK 4 `GtkGLArea` widget for rendering geospatial scenes:
-terrain, map imagery, a globe view, and scene graph objects positioned with
-latitude, longitude, altitude, and local NED orientation.
+GWorldScene is a geospatial scene widget for GTK 3 and GTK 4, built on
+`GtkGLArea`: terrain, map imagery, a globe view, and scene graph objects
+positioned with latitude, longitude, altitude, and local NED orientation.
 
 It is currently an experimental geospatial rendering library with a C API,
 GObject Introspection metadata, generated Vala bindings, and SQGI examples.
@@ -17,7 +17,8 @@ GObject Introspection metadata, generated Vala bindings, and SQGI examples.
 
 ## Features
 
-- GTK 4 widget built on `GtkGLArea`.
+- GTK 3 and GTK 4 widget libraries built on `GtkGLArea`.
+- Shared core library for scene nodes, camera math, picking, and geodesy.
 - Local terrain rendering from HGT-style elevation tiles.
 - Slippy-map texture imagery with disk caching.
 - Earth-scale globe rendering when zoomed far out.
@@ -36,7 +37,7 @@ GObject Introspection metadata, generated Vala bindings, and SQGI examples.
 
 GWorldScene is built with Meson and Ninja. It depends on:
 
-- GTK 4
+- GTK 3, GTK 4, or both
 - GObject Introspection
 - gdk-pixbuf
 - epoxy
@@ -51,8 +52,8 @@ On Debian or Ubuntu-style systems:
 
 ```sh
 sudo apt install meson ninja-build gcc g++ valac \
-  libgtk-4-dev libgirepository1.0-dev libepoxy-dev libgdal-dev \
-  libassimp-dev libsoup-3.0-dev libglm-dev zlib1g-dev \
+  libgtk-3-dev libgtk-4-dev libgirepository1.0-dev \
+  libepoxy-dev libgdal-dev libassimp-dev libsoup-3.0-dev libglm-dev zlib1g-dev \
   libgdk-pixbuf-2.0-dev
 ```
 
@@ -64,6 +65,17 @@ ninja -C builddir
 meson test -C builddir --print-errorlogs
 ```
 
+Meson builds each backend whose development package is available. You can make
+that explicit when packaging or testing a single backend:
+
+```sh
+meson setup builddir -Dgtk3=enabled -Dgtk4=disabled
+meson setup builddir -Dgtk3=disabled -Dgtk4=enabled
+```
+
+When both backends are enabled, applications should still link only one of
+`gworldscene-gtk3-0.1` or `gworldscene-gtk4-0.1` in a single process.
+
 Install system-wide when you want the headers, pkg-config file, GIR, typelib,
 and VAPI available to external programs:
 
@@ -72,8 +84,9 @@ sudo meson install -C builddir
 ```
 
 The installed layout follows the platform GObject Introspection directories.
-For example, on aarch64 Linux the typelib is installed under
-`/usr/lib/aarch64-linux-gnu/girepository-1.0/`.
+For example, on aarch64 Linux the typelibs are installed under
+`/usr/lib/aarch64-linux-gnu/girepository-1.0/` as
+`GWorldSceneGtk3-0.1.typelib` and `GWorldSceneGtk4-0.1.typelib`.
 
 ## Run The Demos
 
@@ -82,7 +95,7 @@ fog, sun lighting, shadows, and a mix of scene nodes:
 
 ```sh
 ./builddir/examples/gworldscene-demo-gtk4
-# or, when built with GTK3:
+# or, when built with GTK 3:
 ./builddir/examples/gworldscene-demo-gtk3
 ```
 
