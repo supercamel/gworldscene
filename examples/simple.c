@@ -232,7 +232,7 @@ activate(GtkApplication *app, gpointer user_data)
   gworld_scene_view_set_camera_orientation(GWORLD_SCENE_VIEW(view), 72.0, -66.0);
   gworld_scene_view_set_sun_time_of_day(GWORLD_SCENE_VIEW(view), 15.25);
   gworld_scene_view_set_fog_range(GWORLD_SCENE_VIEW(view), 9000.0, 90000.0);
-  gworld_scene_view_set_shadows_enabled(GWORLD_SCENE_VIEW(view), TRUE);
+  gworld_scene_view_set_shadows_enabled(GWORLD_SCENE_VIEW(view), FALSE);
   gworld_scene_view_set_terrain_normal_smoothing(GWORLD_SCENE_VIEW(view), 0.92);
   GWorldSceneCubeNode *cube = gworld_scene_view_add_cube(GWORLD_SCENE_VIEW(view),
                                                          initial_latitude,

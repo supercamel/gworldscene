@@ -1,6 +1,7 @@
 #pragma once
 
 #include <libsoup/soup.h>
+#include "water-fixture-private.h"
 #include <gdk-pixbuf/gdk-pixbuf.h>
 
 #include <map>
@@ -15,6 +16,8 @@ struct StalledTileServer {
   std::map<std::string, SoupServerMessage *> pending;
   char *png = nullptr;
   gsize png_size = 0;
+  unsigned water_requests = 0;
+  bool water_failed = false;
 
   void pause(SoupServerMessage *message)
   {
@@ -54,6 +57,13 @@ struct StalledTileServer {
           }
           self.pending[path] = SOUP_SERVER_MESSAGE(g_object_ref(message));
           self.pause(message);
+        } else if (g_str_has_prefix(path, "/water/")) {
+          ++self.water_requests;
+          const auto tile = water_fixture::tile(false, false, false,
+            g_str_has_prefix(path, "/water/land/") ? "landcover" : "water", true);
+          soup_server_message_set_status(message, self.water_failed ? SOUP_STATUS_SERVICE_UNAVAILABLE : SOUP_STATUS_OK, nullptr);
+          soup_server_message_set_response(message, "application/x-protobuf", SOUP_MEMORY_COPY,
+            reinterpret_cast<const char *>(tile.data()), tile.size());
         } else {
           soup_server_message_set_status(message, SOUP_STATUS_OK, nullptr);
           soup_server_message_set_response(message, "image/png", SOUP_MEMORY_COPY, self.png, self.png_size);

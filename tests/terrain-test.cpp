@@ -93,6 +93,60 @@ wait_for_heights(GWorldSceneView *view, double east, double west)
 }
 
 void
+test_loading_during_continuous_frames()
+{
+#if GWORLD_SCENE_GTK_MAJOR == 4
+  const bool initialized = gtk_init_check();
+#else
+  const bool initialized = gtk_init_check(nullptr, nullptr);
+#endif
+  if (!initialized) {
+    g_test_skip("No GTK display available; run under xvfb-run");
+    return;
+  }
+  TileServer server;
+  g_autofree char *cache = g_dir_make_tmp("gworldscene-busy-terrain-test-XXXXXX", nullptr);
+  g_assert_nonnull(cache);
+  auto *view = GWORLD_SCENE_VIEW(gworld_scene_view_new());
+  g_object_ref_sink(view);
+  gworld_scene_view_set_cache_directory(view, cache);
+  gworld_scene_view_set_map_tile_url_template(view, (server.base + "tiles/{z}/{x}/{y}.png").c_str());
+  gworld_scene_view_set_terrain_server(view, (server.base + "one/{tile}.hgt").c_str());
+  gworld_scene_view_set_camera(view, 0.5, 179.999, 1500.0);
+
+  // An always-ready source above idle priority models continuous GTK frames
+  // on a busy renderer. Tile refreshes must still make progress between frames.
+  guint frames = 0;
+  const guint busy_source = g_idle_add_full(G_PRIORITY_HIGH_IDLE,
+    [](gpointer data) -> gboolean {
+      ++*static_cast<guint *>(data);
+      return G_SOURCE_CONTINUE;
+    }, &frames, nullptr);
+  bool loaded = false;
+  const gint64 deadline = g_get_monotonic_time() + 5 * G_USEC_PER_SEC;
+  while (g_get_monotonic_time() < deadline) {
+    double height = 0.0;
+    if (gworld_scene_view_sample_terrain_altitude(view, 0.5, 179.999, &height) && height == 101.0) {
+      loaded = true;
+      break;
+    }
+    g_main_context_iteration(nullptr, FALSE);
+    g_usleep(1000);
+  }
+  g_source_remove(busy_source);
+  g_object_run_dispose(G_OBJECT(view));
+  g_object_unref(view);
+  const gint64 cleanup_deadline = g_get_monotonic_time() + 100 * 1000;
+  while (g_get_monotonic_time() < cleanup_deadline) {
+    g_main_context_iteration(nullptr, FALSE);
+    g_usleep(1000);
+  }
+  std::filesystem::remove_all(cache);
+  g_assert_cmpuint(frames, >, 0);
+  g_assert_true(loaded);
+}
+
+void
 test_provider_cache_and_dateline()
 {
 #if GWORLD_SCENE_GTK_MAJOR == 4
@@ -208,5 +262,6 @@ main(int argc, char **argv)
 {
   g_test_init(&argc, &argv, nullptr);
   g_test_add_func("/terrain/provider-cache-and-dateline", test_provider_cache_and_dateline);
+  g_test_add_func("/terrain/loading-during-continuous-frames", test_loading_during_continuous_frames);
   return g_test_run();
 }

@@ -210,6 +210,40 @@ void gworld_scene_node_get_color(GWorldSceneNode *self,
                                  double *green,
                                  double *blue);
 
+/**
+ * gworld_scene_node_set_roughness:
+ * @self: a scene node
+ * @roughness: surface roughness in [0, 1], or -1 to use the imported material/default
+ *
+ * Applies to mesh nodes. Billboard images, labels and ground overlays retain
+ * their image colors. Defaults use roughness 0.65 and metallic 0 for primitives.
+ */
+void gworld_scene_node_set_roughness(GWorldSceneNode *self, double roughness);
+/**
+ * gworld_scene_node_get_roughness:
+ * @self: a scene node
+ *
+ * Returns: the override in [0, 1], or -1 when the imported/default material is used
+ */
+double gworld_scene_node_get_roughness(GWorldSceneNode *self);
+
+/**
+ * gworld_scene_node_set_metallic:
+ * @self: a scene node
+ * @metallic: metallic fraction in [0, 1], or -1 to use the imported material/default
+ *
+ * Applies to mesh nodes. Billboard images, labels and ground overlays retain
+ * their image colors. Defaults use roughness 0.65 and metallic 0 for primitives.
+ */
+void gworld_scene_node_set_metallic(GWorldSceneNode *self, double metallic);
+/**
+ * gworld_scene_node_get_metallic:
+ * @self: a scene node
+ *
+ * Returns: the override in [0, 1], or -1 when the imported/default material is used
+ */
+double gworld_scene_node_get_metallic(GWorldSceneNode *self);
+
 void gworld_scene_cube_node_set_dimensions(GWorldSceneCubeNode *self,
                                            double width_m,
                                            double depth_m,

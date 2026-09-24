@@ -240,6 +240,70 @@ void gworld_scene_view_get_fog_color(GWorldSceneView *self,
                                      double *green,
                                      double *blue);
 
+/**
+ * gworld_scene_view_set_atmosphere_enabled:
+ * @self: a scene view
+ * @enabled: whether to render the sky and aerial perspective with atmospheric scattering
+ *
+ * Enabled by default. Disabling restores the gradient sky. Distance fog is controlled independently.
+ */
+void gworld_scene_view_set_atmosphere_enabled(GWorldSceneView *self, gboolean enabled);
+gboolean gworld_scene_view_get_atmosphere_enabled(GWorldSceneView *self);
+
+/**
+ * gworld_scene_view_set_atmosphere_density:
+ * @self: a scene view
+ * @density: air-density multiplier in [0, 4], default 1
+ */
+void gworld_scene_view_set_atmosphere_density(GWorldSceneView *self, double density);
+double gworld_scene_view_get_atmosphere_density(GWorldSceneView *self);
+
+/**
+ * gworld_scene_view_set_atmosphere_haze:
+ * @self: a scene view
+ * @haze: aerosol-scattering multiplier in [0, 4], default 1
+ */
+void gworld_scene_view_set_atmosphere_haze(GWorldSceneView *self, double haze);
+double gworld_scene_view_get_atmosphere_haze(GWorldSceneView *self);
+
+/**
+ * gworld_scene_view_set_water_enabled:
+ * @self: a scene view
+ * @enabled: whether to load water boundaries and render reflective water
+ *
+ * Disabled by default. Uses OSM-derived water polygons from OpenFreeMap unless
+ * a custom tile URL is configured. Water data loads asynchronously and has its
+ * own cache. Imagery stays visible while water data is unavailable.
+ */
+void gworld_scene_view_set_water_enabled(GWorldSceneView *self, gboolean enabled);
+gboolean gworld_scene_view_get_water_enabled(GWorldSceneView *self);
+
+/**
+ * gworld_scene_view_set_water_wave_strength:
+ * @self: a scene view
+ * @strength: wave-normal strength in [0, 2], default 0.35; zero gives still water
+ */
+void gworld_scene_view_set_water_wave_strength(GWorldSceneView *self, double strength);
+double gworld_scene_view_get_water_wave_strength(GWorldSceneView *self);
+
+/**
+ * gworld_scene_view_set_water_tile_url_template:
+ * @self: a scene view
+ * @url_template: (nullable): HTTP(S) MVT URL containing {z}, {x}, {y}; NULL restores the default
+ *
+ * Tiles must use the OpenMapTiles water layer schema. Attribution for a custom
+ * provider is the application's responsibility in addition to the built-in OSM
+ * and OpenMapTiles credits. Changing providers invalidates pending water work.
+ */
+void gworld_scene_view_set_water_tile_url_template(GWorldSceneView *self, const char *url_template);
+/**
+ * gworld_scene_view_get_water_tile_url_template:
+ * @self: a scene view
+ *
+ * Returns: (transfer none): the current water tile URL template
+ */
+const char *gworld_scene_view_get_water_tile_url_template(GWorldSceneView *self);
+
 void gworld_scene_view_set_shadows_enabled(GWorldSceneView *self,
                                            gboolean shadows_enabled);
 

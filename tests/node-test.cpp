@@ -444,12 +444,35 @@ test_string_setters_accept_getter_results()
   g_object_unref(label);
 }
 
+void test_material_overrides()
+{
+  auto *node = GWORLD_SCENE_NODE(g_object_new(GWORLD_TYPE_SCENE_CUBE_NODE, nullptr));
+  g_assert_cmpfloat(gworld_scene_node_get_roughness(node), ==, -1);
+  g_assert_cmpfloat(gworld_scene_node_get_metallic(node), ==, -1);
+  unsigned changed = 0;
+  g_signal_connect(node, "changed", G_CALLBACK(+[](GWorldSceneNode *, gpointer p) { ++*static_cast<unsigned *>(p); }), &changed);
+  g_object_set(node, "roughness", 0.2, "metallic", 0.8, nullptr);
+  g_assert_cmpfloat(gworld_scene_node_get_roughness(node), ==, 0.2);
+  g_assert_cmpfloat(gworld_scene_node_get_metallic(node), ==, 0.8);
+  g_assert_cmpuint(changed, ==, 2);
+  gworld_scene_node_set_roughness(node, 0.2);
+  g_assert_cmpuint(changed, ==, 2);
+  gworld_scene_node_set_metallic(node, 5.0);
+  g_assert_cmpfloat(gworld_scene_node_get_metallic(node), ==, 1.0);
+  gworld_scene_node_set_roughness(node, NAN);
+  gworld_scene_node_set_metallic(node, -1);
+  g_assert_cmpfloat(gworld_scene_node_get_roughness(node), ==, -1);
+  g_assert_cmpfloat(gworld_scene_node_get_metallic(node), ==, -1);
+  g_object_unref(node);
+}
+
 } // namespace
 
 int
 main(int argc, char **argv)
 {
   g_test_init(&argc, &argv, nullptr);
+  g_test_add_func("/scene-node/material-overrides", test_material_overrides);
   g_test_add_func("/scene-node/moves-across-dateline", test_node_moves_across_dateline);
   g_test_add_func("/scene-node/string-setters-accept-getter-results", test_string_setters_accept_getter_results);
   g_test_add_func("/scene-node/new-node-has-nonzero-defaults", test_new_node_has_nonzero_defaults);

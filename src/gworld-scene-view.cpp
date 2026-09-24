@@ -4,12 +4,17 @@
 
 #include "gworld-scene-view.h"
 #include "gworld-scene-camera-private.h"
+#include "gworld-scene-atmosphere-private.h"
 #include "gworld-scene-geo-private.h"
 #include "gworld-scene-light-private.h"
+#include "gworld-scene-shadow-private.h"
 #include "gworld-scene-lod-private.h"
 #include "gworld-scene-node-private.h"
 #include "gworld-scene-picking-private.h"
 #include "gworld-scene-view-private.h"
+#include "gworld-scene-terrain-private.h"
+#include "gworld-scene-render-private.h"
+#include "gworld-scene-water-private.h"
 #include "gworld-scene-view-shaders-private.h"
 
 #include <assimp/Importer.hpp>
@@ -81,7 +86,7 @@ constexpr int kMaxUltraAtlasTilesPerAxis = kMaxAtlasPixels / kAtlasTilePixels;
 constexpr int kMaxUltraAtlasTiles = kMaxUltraAtlasTilesPerAxis * kMaxUltraAtlasTilesPerAxis;
 constexpr int kGlobeLatSegments = 128;
 constexpr int kGlobeLonSegments = 256;
-constexpr int kVertexStride = 19;
+constexpr int kVertexStride = 21;
 constexpr int kSphereSegments = 24;
 constexpr int kSphereRings = 12;
 constexpr int kCylinderSegments = 32;
@@ -163,12 +168,9 @@ struct LatLonBounds {
 
 using AtlasRange = gworld_scene::TileRange;
 
-struct TerrainTile {
-  int lat = 0;
-  int lon = 0;
-  int dimension = 0;
-  std::vector<int16_t> heights;
-};
+using gworld_scene::TerrainTile;
+using gworld_scene::terrain_key;
+using gworld_scene::get_safe_height;
 
 struct TerrainCandidate {
   int lat = 0;
@@ -215,6 +217,7 @@ struct ModelVertex {
   glm::vec3 color;
   glm::vec2 texcoord = glm::vec2(-1.0f);
   bool has_texture = false;
+  glm::vec2 surface = glm::vec2(0.65f, 0.0f);
 };
 
 struct ModelMesh {
@@ -322,6 +325,11 @@ struct SceneNode {
   std::string model_path;
 };
 
+struct AttributionLink {
+  double x, y, width, height;
+  const char *uri;
+};
+
 struct GWorldSceneViewState {
   std::mutex mutex;
 
@@ -341,11 +349,19 @@ struct GWorldSceneViewState {
   double sun_time_of_day = 14.0;
   double sun_declination_deg = 0.0;
   bool sun_uses_time_of_day = false;
-  bool fog_enabled = true;
+  bool fog_enabled = false;
   double fog_start_m = 12000.0;
   double fog_end_m = 120000.0;
   glm::vec3 fog_color = glm::vec3(0.60f, 0.72f, 0.86f);
-  bool shadows_enabled = true;
+  bool atmosphere_enabled = true;
+  double atmosphere_density = 1.0;
+  double atmosphere_haze = 1.0;
+  bool water_enabled = false;
+  double water_wave_strength = 0.35;
+  std::string water_tile_template = gworld_scene::kDefaultWaterTileTemplate;
+  gworld_scene::WaterTiles water_tiles;
+  std::vector<AttributionLink> water_attribution;
+  bool shadows_enabled = false;
   double terrain_normal_smoothing = 0.88;
 
   std::string terrain_server = kDefaultTerrainServer;
@@ -355,7 +371,7 @@ struct GWorldSceneViewState {
   guint texture_memory_budget_mib = kDefaultTextureMemoryBudgetMib;
   int gl_max_texture_size = kMaxAtlasPixels;
 
-  std::unordered_map<std::string, std::shared_ptr<const TerrainTile>> terrain_tiles;
+  gworld_scene::TerrainTileMap terrain_tiles;
   std::unordered_set<std::string> wanted_terrain_keys;
   std::unordered_set<std::string> pending;
   std::unordered_map<std::string, GCancellable *> pending_cancellables;
@@ -453,7 +469,9 @@ struct GWorldSceneViewState {
   int model_texture_width = 0;
   int model_texture_height = 0;
   bool model_texture_dirty = false;
+  bool texture_uploads_pending = false;
 
+  gworld_scene::LinearRenderTarget linear_target;
   GLuint program = 0;
   GLuint shadow_program = 0;
   GLuint shadow_fbo = 0;
@@ -965,9 +983,10 @@ texture_dimensions_bytes(int width, int height)
 }
 
 std::size_t
-texture_storage_bytes(GLuint texture, int width, int height)
+texture_storage_bytes(GLuint texture, int width, int height, bool mipmaps = true)
 {
-  return texture != 0 ? texture_dimensions_bytes(width, height) : 0;
+  return texture != 0 ? (mipmaps ? gworld_scene::mipmap_storage_bytes(width, height) :
+                                  texture_dimensions_bytes(width, height)) : 0;
 }
 
 std::size_t
@@ -996,7 +1015,7 @@ estimated_active_texture_storage_bytes_locked(const GWorldSceneViewState *state)
                                state->globe_texture_height) +
          texture_storage_bytes(state->model_texture,
                                state->model_texture_width,
-                               state->model_texture_height);
+                               state->model_texture_height, false);
 }
 
 int
@@ -1099,12 +1118,6 @@ hgt_tile_name(int lat_floor, int lon_floor)
                 lon_floor >= 0 ? 'E' : 'W',
                 std::abs(lon_floor));
   return buffer;
-}
-
-std::string
-terrain_key(int lat_floor, int lon_floor)
-{
-  return std::to_string(lat_floor) + "," + std::to_string(lon_floor);
 }
 
 int
@@ -1489,16 +1502,6 @@ sun_enu_for_state(const GWorldSceneViewState *state, double latitude)
                                                   state->sun_elevation_deg);
 }
 
-glm::vec3
-sun_scene_direction_from_enu(const glm::dvec3 &enu)
-{
-  const glm::dvec3 scene = safe_normalize(glm::dvec3(enu.x, enu.z, -enu.y),
-                                         glm::dvec3(-0.45, 0.76, 0.38));
-  return glm::vec3(static_cast<float>(scene.x),
-                   static_cast<float>(scene.y),
-                   static_cast<float>(scene.z));
-}
-
 gworld_scene::CameraMode
 view_camera_mode(GWorldSceneCameraMode camera_mode)
 {
@@ -1716,70 +1719,13 @@ read_hgt_file(const std::string &path, std::vector<int16_t> &heights, int &dimen
   return parse_hgt_bytes(bytes, heights, dimension);
 }
 
-int16_t
-get_height_clamped(const TerrainTile &tile, int x, int y)
-{
-  x = std::clamp(x, 0, tile.dimension - 1);
-  y = std::clamp(y, 0, tile.dimension - 1);
-  return tile.heights[static_cast<std::size_t>(y * tile.dimension + x)];
-}
-
-int16_t
-get_safe_height(const TerrainTile &tile, int x, int y)
-{
-  const int16_t h = get_height_clamped(tile, x, y);
-  if (h != -32768)
-    return h;
-
-  for (int radius = 1; radius < 8; ++radius) {
-    for (int oy = -radius; oy <= radius; ++oy) {
-      for (int ox = -radius; ox <= radius; ++ox) {
-        const int16_t candidate = get_height_clamped(tile, x + ox, y + oy);
-        if (candidate != -32768)
-          return candidate;
-      }
-    }
-  }
-
-  return 0;
-}
-
 bool
 terrain_height_at_lat_lon_locked(GWorldSceneViewState *state,
                                  double latitude,
                                  double longitude,
                                  double &height_amsl)
 {
-  longitude = gworld_scene::wrap_longitude(longitude);
-  const int lat_floor = static_cast<int>(std::floor(latitude));
-  const int lon_floor = static_cast<int>(std::floor(longitude));
-  auto iter = state->terrain_tiles.find(terrain_key(lat_floor, lon_floor));
-  if (iter == state->terrain_tiles.end())
-    return false;
-
-  const TerrainTile &tile = *iter->second;
-  if (tile.dimension <= 1 || tile.heights.empty())
-    return false;
-
-  const double u = std::clamp(longitude - static_cast<double>(lon_floor), 0.0, 1.0);
-  const double v = std::clamp(static_cast<double>(lat_floor + 1) - latitude, 0.0, 1.0);
-  const double sx = u * static_cast<double>(tile.dimension - 1);
-  const double sy = v * static_cast<double>(tile.dimension - 1);
-  const int x0 = std::clamp(static_cast<int>(std::floor(sx)), 0, tile.dimension - 1);
-  const int y0 = std::clamp(static_cast<int>(std::floor(sy)), 0, tile.dimension - 1);
-  const int x1 = std::min(tile.dimension - 1, x0 + 1);
-  const int y1 = std::min(tile.dimension - 1, y0 + 1);
-  const double tx = sx - static_cast<double>(x0);
-  const double ty = sy - static_cast<double>(y0);
-
-  const double h00 = static_cast<double>(get_safe_height(tile, x0, y0));
-  const double h10 = static_cast<double>(get_safe_height(tile, x1, y0));
-  const double h01 = static_cast<double>(get_safe_height(tile, x0, y1));
-  const double h11 = static_cast<double>(get_safe_height(tile, x1, y1));
-  const double h0 = h00 * (1.0 - tx) + h10 * tx;
-  const double h1 = h01 * (1.0 - tx) + h11 * tx;
-  height_amsl = h0 * (1.0 - ty) + h1 * ty;
-  return true;
+  return gworld_scene::terrain_height_at(state->terrain_tiles, latitude, longitude, height_amsl);
 }
 
 glm::vec4 rgba_from_components(double red, double green, double blue, double alpha);
@@ -3268,7 +3214,8 @@ append_vertex(std::vector<float> &vertices,
               const TexCoords &uv,
               const glm::vec3 &normal,
               const glm::vec4 &color = glm::vec4(1.0f),
-              float material = kMaterialTerrain)
+              float material = kMaterialTerrain,
+              const glm::vec2 &surface = glm::vec2(0.65f, 0.0f))
 {
   vertices.push_back(static_cast<float>(position.x));
   vertices.push_back(static_cast<float>(position.y));
@@ -3289,6 +3236,8 @@ append_vertex(std::vector<float> &vertices,
   vertices.push_back(color.b);
   vertices.push_back(color.a);
   vertices.push_back(material);
+  vertices.push_back(surface.x);
+  vertices.push_back(surface.y);
 }
 
 glm::vec3
@@ -3854,6 +3803,13 @@ load_model_mesh_from_file(GWorldSceneViewState *state, const std::string &path, 
     const aiMaterial *material = (source->mMaterialIndex < scene->mNumMaterials)
                                    ? scene->mMaterials[source->mMaterialIndex]
                                    : nullptr;
+    float roughness = 0.65f, metallic = 0.0f;
+    if (material) {
+      material->Get(AI_MATKEY_ROUGHNESS_FACTOR, roughness);
+      material->Get(AI_MATKEY_METALLIC_FACTOR, metallic);
+    }
+    const glm::vec2 surface(std::isfinite(roughness) ? std::clamp(roughness, 0.0f, 1.0f) : 0.65f,
+                            std::isfinite(metallic) ? std::clamp(metallic, 0.0f, 1.0f) : 0.0f);
     const bool has_normals = source->HasNormals();
     const bool has_vertex_colors = source->HasVertexColors(0);
     const bool has_texcoords = source->HasTextureCoords(0);
@@ -3887,9 +3843,10 @@ load_model_mesh_from_file(GWorldSceneViewState *state, const std::string &path, 
                                            face_normal)
                           : face_normal;
         vertex.color = material_color;
+        vertex.surface = surface;
         if (has_vertex_colors) {
           const aiColor4D &color = source->mColors[0][source_index];
-          vertex.color = clamp_color(glm::vec3(color.r, color.g, color.b));
+          vertex.color *= clamp_color(glm::vec3(color.r, color.g, color.b));
         }
         if (texture_slot >= 0 && has_texcoords) {
           vertex.texcoord = model_atlas_uv_for_slot(texture_slot,
@@ -3939,23 +3896,15 @@ append_triangle(std::vector<float> &vertices,
                 const glm::dvec3 &p2,
                 const TexCoords &uv0,
                 const TexCoords &uv1,
-                const TexCoords &uv2)
+                const TexCoords &uv2,
+                const glm::vec3 &n0,
+                const glm::vec3 &n1,
+                const glm::vec3 &n2)
 {
-  glm::dvec3 n64 = glm::cross(p1 - p0, p2 - p0);
-  if (glm::length(n64) <= 0.000001)
-    n64 = glm::dvec3(0.0, 1.0, 0.0);
-  else
-    n64 = glm::normalize(n64);
-  if (n64.y < 0.0)
-    n64 = -n64;
-
-  const glm::vec3 normal(static_cast<float>(n64.x),
-                         static_cast<float>(n64.y),
-                         static_cast<float>(n64.z));
   const unsigned int base = static_cast<unsigned int>(vertices.size() / kVertexStride);
-  append_vertex(vertices, p0, uv0, normal);
-  append_vertex(vertices, p1, uv1, normal);
-  append_vertex(vertices, p2, uv2, normal);
+  append_vertex(vertices, p0, uv0, n0);
+  append_vertex(vertices, p1, uv1, n1);
+  append_vertex(vertices, p2, uv2, n2);
   indices.push_back(base);
   indices.push_back(base + 1);
   indices.push_back(base + 2);
@@ -5358,7 +5307,12 @@ append_model_node(GWorldSceneViewState *state, const SceneNode &node)
       safe_normalize(glm::dvec3(n.z, n.x, -n.y), glm::dvec3(0.0, 0.0, -1.0));
     const glm::dvec3 normal_scene =
       safe_normalize(ned_to_scene_vector(rotation * normal_ned), glm::dvec3(0.0, 1.0, 0.0));
-    const glm::vec3 color = clamp_color(model_vertex.color * glm::vec3(node.color));
+    // Assimp material factors/vertex colors are linear reflectance. The shared
+    // mesh attribute stores sRGB, matching public node colors.
+    glm::vec3 color;
+    for (int channel = 0; channel < 3; ++channel)
+      color[channel] = gworld_scene::linear_to_srgb(model_vertex.color[channel] *
+        gworld_scene::srgb_to_linear(node.color[channel]));
     TexCoords uv{-1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f};
     float material = kMaterialSolidNode;
     if (model_vertex.has_texture) {
@@ -5375,7 +5329,7 @@ append_model_node(GWorldSceneViewState *state, const SceneNode &node)
                             static_cast<float>(normal_scene.y),
                             static_cast<float>(normal_scene.z)),
                   glm::vec4(color, node.color.a),
-                  material);
+                  material, model_vertex.surface);
     state->indices.push_back(base);
   }
 }
@@ -5394,16 +5348,28 @@ append_scene_nodes(GWorldSceneViewState *state)
     if (GWORLD_IS_SCENE_TEXT_LABEL_NODE(scene_node))
       continue;
 
+    const std::size_t start = state->vertices.size();
+    const auto apply_material = [&]() {
+      const double roughness = gworld_scene_node_get_roughness(scene_node);
+      const double metallic = gworld_scene_node_get_metallic(scene_node);
+      for (std::size_t offset = start; offset < state->vertices.size(); offset += kVertexStride) {
+        if (roughness >= 0.0) state->vertices[offset + 19] = static_cast<float>(roughness);
+        if (metallic >= 0.0) state->vertices[offset + 20] = static_cast<float>(metallic);
+      }
+    };
     if (GWORLD_IS_SCENE_POLYLINE_NODE(scene_node)) {
       append_polyline_node(state, GWORLD_SCENE_POLYLINE_NODE(scene_node));
+      apply_material();
       continue;
     }
     if (GWORLD_IS_SCENE_POLYGON_NODE(scene_node)) {
       append_polygon_node(state, GWORLD_SCENE_POLYGON_NODE(scene_node));
+      apply_material();
       continue;
     }
     if (GWORLD_IS_SCENE_CIRCLE_NODE(scene_node)) {
       append_circle_node(state, GWORLD_SCENE_CIRCLE_NODE(scene_node));
+      apply_material();
       continue;
     }
 
@@ -5456,6 +5422,7 @@ append_scene_nodes(GWorldSceneViewState *state)
         node.model_path = model_path;
       append_model_node(state, node);
     }
+    apply_material();
   }
 }
 
@@ -5584,7 +5551,8 @@ append_terrain_tile_mesh_ring(GWorldSceneViewState *state,
                               double ultra_lateral_radius_m,
                               double inner_radius_m,
                               double outer_radius_m,
-                              int sample_step)
+                              int sample_step,
+                              std::unordered_map<int, glm::vec3> &normals)
 {
   (void)ultra_range;
   (void)detail_range;
@@ -5706,8 +5674,19 @@ append_terrain_tile_mesh_ring(GWorldSceneViewState *state,
       uv11.detail_u = static_cast<float>(lat11);
       uv11.detail_v = static_cast<float>(lon11);
 
-      append_triangle(state->vertices, state->indices, p00, p10, p01, uv00, uv10, uv01);
-      append_triangle(state->vertices, state->indices, p10, p11, p01, uv10, uv11, uv01);
+      const auto normal_at = [&](int x, int y) {
+        const int key = y * tile.dimension + x;
+        auto iter = normals.find(key);
+        if (iter == normals.end())
+          iter = normals.emplace(key, gworld_scene::terrain_normal_at(
+            state->terrain_tiles, tile, x, y,
+            state->mesh_origin_latitude, state->mesh_origin_longitude)).first;
+        return iter->second;
+      };
+      const glm::vec3 n00 = normal_at(sx, sy), n10 = normal_at(sx1, sy);
+      const glm::vec3 n01 = normal_at(sx, sy1), n11 = normal_at(sx1, sy1);
+      append_triangle(state->vertices, state->indices, p00, p10, p01, uv00, uv10, uv01, n00, n10, n01);
+      append_triangle(state->vertices, state->indices, p10, p11, p01, uv10, uv11, uv01, n10, n11, n01);
     }
   }
 }
@@ -5723,6 +5702,7 @@ append_terrain_tile_mesh(GWorldSceneViewState *state,
                          double radius_m,
                          int base_sample_step)
 {
+  std::unordered_map<int, glm::vec3> normals;
   const double near_radius = terrain_near_radius_for_altitude(state->altitude_amsl, radius_m);
   const double mid_radius = terrain_mid_radius_for_altitude(state->altitude_amsl, radius_m);
   const double far_radius = terrain_far_radius_for_altitude(state->altitude_amsl, radius_m);
@@ -5736,7 +5716,7 @@ append_terrain_tile_mesh(GWorldSceneViewState *state,
                                 ultra_lateral_radius_m,
                                 0.0,
                                 near_radius,
-                                terrain_lod_step(base_sample_step, 0));
+                                terrain_lod_step(base_sample_step, 0), normals);
   if (mid_radius > near_radius) {
     append_terrain_tile_mesh_ring(state,
                                   tile,
@@ -5747,7 +5727,7 @@ append_terrain_tile_mesh(GWorldSceneViewState *state,
                                   ultra_lateral_radius_m,
                                   near_radius,
                                   mid_radius,
-                                  terrain_lod_step(base_sample_step, 1));
+                                  terrain_lod_step(base_sample_step, 1), normals);
   }
   if (far_radius > mid_radius) {
     append_terrain_tile_mesh_ring(state,
@@ -5759,7 +5739,7 @@ append_terrain_tile_mesh(GWorldSceneViewState *state,
                                   ultra_lateral_radius_m,
                                   mid_radius,
                                   far_radius,
-                                  terrain_lod_step(base_sample_step, 2));
+                                  terrain_lod_step(base_sample_step, 2), normals);
   }
   if (radius_m > far_radius) {
     append_terrain_tile_mesh_ring(state,
@@ -5771,7 +5751,7 @@ append_terrain_tile_mesh(GWorldSceneViewState *state,
                                   ultra_lateral_radius_m,
                                   far_radius,
                                   radius_m,
-                                  terrain_lod_step(base_sample_step, 3));
+                                  terrain_lod_step(base_sample_step, 3), normals);
   }
 }
 
@@ -6029,7 +6009,7 @@ upload_scene_texture(GWorldSceneViewState *state,
   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
   glTexImage2D(GL_TEXTURE_2D,
                0,
-               GL_RGBA8,
+               GL_SRGB8_ALPHA8,
                width,
                height,
                0,
@@ -6139,6 +6119,18 @@ write_billboard_vertex(float *vertices, int &offset, const glm::dvec3 &position,
 }
 
 void
+set_atmosphere_uniforms(GLuint program, const glm::vec3 &settings,
+                        const gworld_scene::AtmosphereFrame &frame)
+{
+  glUniform1i(glGetUniformLocation(program, "atmosphere_enabled"), settings.x > 0.5f);
+  glUniform1f(glGetUniformLocation(program, "atmosphere_density"), settings.y);
+  glUniform1f(glGetUniformLocation(program, "atmosphere_haze"), settings.z);
+  glUniform3fv(glGetUniformLocation(program, "planet_center"), 1, glm::value_ptr(frame.planet_center));
+  glUniformMatrix3fv(glGetUniformLocation(program, "atmosphere_from_scene"), 1, GL_FALSE,
+                     glm::value_ptr(frame.from_scene));
+}
+
+void
 render_sky_background(GWorldSceneViewState *state,
                       const glm::mat4 &mvp,
                       const gworld_scene::CameraPose &camera_pose,
@@ -6146,7 +6138,9 @@ render_sky_background(GWorldSceneViewState *state,
                       const glm::vec3 &fog_color,
                       float daylight,
                       float twilight,
-                      float horizon_glow_strength)
+                      float horizon_glow_strength,
+                      const glm::vec3 &atmosphere_settings,
+                      const gworld_scene::AtmosphereFrame &atmosphere_frame)
 {
   if (!ensure_sky_resources(state))
     return;
@@ -6160,6 +6154,7 @@ render_sky_background(GWorldSceneViewState *state,
   const glm::vec3 night_color(0.085f, 0.105f, 0.175f);
 
   glUseProgram(state->sky_program);
+  set_atmosphere_uniforms(state->sky_program, atmosphere_settings, atmosphere_frame);
   glUniformMatrix4fv(glGetUniformLocation(state->sky_program, "inverse_mvp"),
                      1,
                      GL_FALSE,
@@ -6381,6 +6376,70 @@ render_billboards(GWorldSceneViewState *state,
   glUseProgram(0);
 }
 
+// Data credits are part of the widget, so applications cannot accidentally
+// omit attribution when enabling the automatic water source.
+void
+render_water_attribution(GWorldSceneViewState *state, int width, int height)
+{
+  state->water_attribution.clear();
+  if (!state->water_enabled || width <= 6 || height <= 6 || !ensure_billboard_resources(state))
+    return;
+  const glm::mat4 projection = glm::ortho(0.0f, float(width), float(height), 0.0f);
+  glUseProgram(state->billboard_program);
+  glUniformMatrix4fv(glGetUniformLocation(state->billboard_program, "mvp"), 1, GL_FALSE, glm::value_ptr(projection));
+  glUniform1i(glGetUniformLocation(state->billboard_program, "billboard_texture"), 6);
+  glUniform1f(glGetUniformLocation(state->billboard_program, "opacity"), 1.0f);
+  glBindVertexArray(state->billboard_vao);
+  glBindBuffer(GL_ARRAY_BUFFER, state->billboard_vbo);
+  glDisable(GL_DEPTH_TEST);
+  glDepthMask(GL_FALSE);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  double right = width - 3.0, bottom = height - 3.0;
+  const std::pair<const char *, const char *> credits[] = {
+    {"© OpenStreetMap", "https://www.openstreetmap.org/copyright"},
+    {"© OpenMapTiles", "https://openmaptiles.org/"},
+    {"OpenFreeMap", "https://openfreemap.org/"},
+  };
+  for (const auto &credit : credits) {
+    if (std::strcmp(credit.second, "https://openfreemap.org/") == 0 && state->water_tile_template != gworld_scene::kDefaultWaterTileTemplate)
+      continue;
+    BillboardRenderItem label;
+    label.generated_text = true;
+    label.text = credit.first;
+    label.font = "Sans 9";
+    label.padding_px = 3.0;
+    label.background_color = glm::vec4(0.04f, 0.06f, 0.09f, 0.85f);
+    auto *texture = ensure_scene_text_texture(state, label);
+    if (!texture || !texture->texture) continue;
+    const double w = std::min(double(texture->width), double(width - 6));
+    const double h = texture->height;
+    if (right - w < 3.0 && right < width - 3.0) { right = width - 3.0; bottom -= h; }
+    const double left = right - w, top = bottom - h;
+    float vertices[30];
+    int offset = 0;
+    write_billboard_vertex(vertices, offset, {left, top, 0}, 0, 0);
+    write_billboard_vertex(vertices, offset, {left, bottom, 0}, 0, 1);
+    write_billboard_vertex(vertices, offset, {right, bottom, 0}, 1, 1);
+    write_billboard_vertex(vertices, offset, {left, top, 0}, 0, 0);
+    write_billboard_vertex(vertices, offset, {right, bottom, 0}, 1, 1);
+    write_billboard_vertex(vertices, offset, {right, top, 0}, 1, 0);
+    glActiveTexture(GL_TEXTURE6);
+    glBindTexture(GL_TEXTURE_2D, texture->texture);
+    glBufferSubData(GL_ARRAY_BUFFER, 0, sizeof vertices, vertices);
+    glDrawArrays(GL_TRIANGLES, 0, 6);
+    state->water_attribution.push_back({left, top, w, h, credit.second});
+    right = left;
+  }
+  glBindTexture(GL_TEXTURE_2D, 0);
+  glBindBuffer(GL_ARRAY_BUFFER, 0);
+  glBindVertexArray(0);
+  glDisable(GL_BLEND);
+  glDepthMask(GL_TRUE);
+  glEnable(GL_DEPTH_TEST);
+  glUseProgram(0);
+}
+
 void
 render_ground_overlays(GWorldSceneViewState *state,
                        const std::vector<GroundOverlayRenderItem> &ground_overlays,
@@ -6450,121 +6509,86 @@ render_ground_overlays(GWorldSceneViewState *state,
 bool
 ensure_shadow_resources(GWorldSceneViewState *state)
 {
-  if (state->shadow_program == 0)
+  if (!state->shadow_program)
     state->shadow_program = gworld_scene_view_create_shadow_program();
-  if (state->shadow_program == 0)
-    return false;
-
-  if (state->shadow_depth_texture == 0) {
+  if (!state->shadow_program) return false;
+  if (!state->shadow_depth_texture) {
     glGenTextures(1, &state->shadow_depth_texture);
-    glBindTexture(GL_TEXTURE_2D, state->shadow_depth_texture);
-    glTexImage2D(GL_TEXTURE_2D,
-                 0,
-                 GL_DEPTH_COMPONENT24,
-                 kShadowMapSize,
-                 kShadowMapSize,
-                 0,
-                 GL_DEPTH_COMPONENT,
-                 GL_UNSIGNED_INT,
-                 nullptr);
-    // PCF is performed by the shader; raw depth sampling on GLES requires nearest filtering.
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    glBindTexture(GL_TEXTURE_2D, 0);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, state->shadow_depth_texture);
+    glTexImage3D(GL_TEXTURE_2D_ARRAY, 0, GL_DEPTH_COMPONENT24,
+                 kShadowMapSize, kShadowMapSize, gworld_scene::kShadowCascades,
+                 0, GL_DEPTH_COMPONENT, GL_UNSIGNED_INT, nullptr);
+    // Raw depth + manual tent PCF works on GLES 3 without depth-filter extensions.
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D_ARRAY, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, 0);
   }
-
-  if (state->shadow_fbo == 0) {
-    GLint previous_draw_fbo = 0;
-    GLint previous_read_fbo = 0;
-    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previous_draw_fbo);
-    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previous_read_fbo);
+  if (!state->shadow_fbo) {
+    GLint draw = 0, read = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &draw);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &read);
     glGenFramebuffers(1, &state->shadow_fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, state->shadow_fbo);
-    glFramebufferTexture2D(GL_FRAMEBUFFER,
-                           GL_DEPTH_ATTACHMENT,
-                           GL_TEXTURE_2D,
-                           state->shadow_depth_texture,
-                           0);
-    const GLenum draw_buffer = GL_NONE;
-    glDrawBuffers(1, &draw_buffer);
+    glFramebufferTextureLayer(GL_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, state->shadow_depth_texture, 0, 0);
+    const GLenum none = GL_NONE;
+    glDrawBuffers(1, &none);
     glReadBuffer(GL_NONE);
     const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(previous_draw_fbo));
-    glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(previous_read_fbo));
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(draw));
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(read));
     if (status != GL_FRAMEBUFFER_COMPLETE) {
       glDeleteFramebuffers(1, &state->shadow_fbo);
       glDeleteTextures(1, &state->shadow_depth_texture);
-      state->shadow_fbo = 0;
-      state->shadow_depth_texture = 0;
+      state->shadow_fbo = state->shadow_depth_texture = 0;
       g_warning("Shadow framebuffer is incomplete: 0x%x", status);
       return false;
     }
   }
-
   return true;
 }
 
-glm::mat4
-shadow_light_matrix(const glm::dvec3 &center,
-                    const glm::vec3 &sun_direction,
-                    double extent_m)
-{
-  const glm::dvec3 light_direction =
-    safe_normalize(glm::dvec3(sun_direction), glm::dvec3(-0.45, 0.76, 0.38));
-  const double extent = std::max(1000.0, extent_m);
-  const double depth = extent * 4.0;
-  glm::dvec3 up(0.0, 1.0, 0.0);
-  if (std::abs(glm::dot(light_direction, up)) > 0.9)
-    up = glm::dvec3(0.0, 0.0, -1.0);
-
-  const glm::dvec3 eye = center + light_direction * depth;
-  const glm::mat4 light_view = glm::lookAt(glm::vec3(eye),
-                                           glm::vec3(center),
-                                           glm::vec3(up));
-  const glm::mat4 light_projection = glm::ortho(static_cast<float>(-extent),
-                                                static_cast<float>(extent),
-                                                static_cast<float>(-extent),
-                                                static_cast<float>(extent),
-                                                1.0f,
-                                                static_cast<float>(depth * 2.0));
-  return light_projection * light_view;
-}
-
 bool
-render_shadow_map(GWorldSceneViewState *state, const glm::mat4 &light_mvp)
+render_shadow_map(GWorldSceneViewState *state, const gworld_scene::ShadowCascades &cascades)
 {
-  if (state->index_count == 0 || !ensure_shadow_resources(state))
-    return false;
-
-  GLint previous_fbo = 0;
+  if (!state->index_count || !ensure_shadow_resources(state)) return false;
+  GLint previous_fbo = 0, viewport[4] = {};
   glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previous_fbo);
-
+  glGetIntegerv(GL_VIEWPORT, viewport);
   glViewport(0, 0, kShadowMapSize, kShadowMapSize);
   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, state->shadow_fbo);
-  glClear(GL_DEPTH_BUFFER_BIT);
   glUseProgram(state->shadow_program);
-  glUniformMatrix4fv(glGetUniformLocation(state->shadow_program, "light_mvp"),
-                     1,
-                     GL_FALSE,
-                     glm::value_ptr(light_mvp));
+  glUniform1i(glGetUniformLocation(state->shadow_program, "model_texture"), 4);
+  glUniform1i(glGetUniformLocation(state->shadow_program, "has_model_texture"), state->model_texture != 0);
+  glActiveTexture(GL_TEXTURE4);
+  glBindTexture(GL_TEXTURE_2D, state->model_texture);
   glEnable(GL_DEPTH_TEST);
   glDisable(GL_CULL_FACE);
   glEnable(GL_POLYGON_OFFSET_FILL);
-  glPolygonOffset(2.0f, 4.0f);
+  glPolygonOffset(1.5f, 2.0f);
   glBindVertexArray(state->vao);
-  glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(state->index_count), GL_UNSIGNED_INT, nullptr);
+  for (int i = 0; i < gworld_scene::kShadowCascades; ++i) {
+    glFramebufferTextureLayer(GL_DRAW_FRAMEBUFFER, GL_DEPTH_ATTACHMENT, state->shadow_depth_texture, 0, i);
+    glClear(GL_DEPTH_BUFFER_BIT);
+    glUniformMatrix4fv(glGetUniformLocation(state->shadow_program, "light_mvp"),
+                       1, GL_FALSE, glm::value_ptr(cascades.matrices[i]));
+    glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(state->index_count), GL_UNSIGNED_INT, nullptr);
+  }
   glBindVertexArray(0);
   glDisable(GL_POLYGON_OFFSET_FILL);
   glUseProgram(0);
   glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(previous_fbo));
+  glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
   return true;
 }
 
 void
 delete_gl_resources(GWorldSceneViewState *state)
 {
+  state->linear_target.destroy();
+  state->water_tiles.destroy_gl();
+  state->texture_uploads_pending = false;
   if (state->ultra_texture)
     glDeleteTextures(1, &state->ultra_texture);
   if (state->ultra_texture_upload.texture)
@@ -6747,6 +6771,9 @@ configure_scene_vertex_attributes()
                         GL_FALSE,
                         kVertexStride * sizeof(float),
                         reinterpret_cast<void *>(18 * sizeof(float)));
+  glEnableVertexAttribArray(8);
+  glVertexAttribPointer(8, 2, GL_FLOAT, GL_FALSE, kVertexStride * sizeof(float),
+                        reinterpret_cast<void *>(19 * sizeof(float)));
 }
 
 void
@@ -6882,7 +6909,7 @@ upload_texture_buffer_if_needed(GLuint &texture,
   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
   glTexImage2D(GL_TEXTURE_2D,
                0,
-               GL_RGBA8,
+               GL_SRGB8_ALPHA8,
                width,
                height,
                0,
@@ -6931,15 +6958,6 @@ upload_texture_buffer_if_needed(GLuint &texture,
     stats->error = error;
   }
   return true;
-}
-
-void
-configure_texture_sampler()
-{
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 }
 
 bool
@@ -7024,12 +7042,12 @@ upload_atlas_texture_chunk_if_needed(GWorldSceneViewState *state,
     glGenTextures(1, &upload.texture);
 
   glBindTexture(GL_TEXTURE_2D, upload.texture);
-  configure_texture_sampler();
+  gworld_scene::configure_imagery_sampler();
   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
   if (upload.uploaded_rows <= 0) {
     glTexImage2D(GL_TEXTURE_2D,
                  0,
-                 GL_RGBA8,
+                 GL_SRGB8_ALPHA8,
                  width,
                  height,
                  0,
@@ -7057,6 +7075,9 @@ upload_atlas_texture_chunk_if_needed(GWorldSceneViewState *state,
     upload.uploaded_rows = y + rows;
   }
 
+  // Publish only after all rows and the complete mip chain are ready.
+  if (upload.uploaded_rows >= height)
+    glGenerateMipmap(GL_TEXTURE_2D);
   const GLenum error = glGetError();
   glBindTexture(GL_TEXTURE_2D, 0);
   const double duration_ms = perf_elapsed_ms(start_us);
@@ -7277,7 +7298,10 @@ GWorldSceneViewBackend::schedule_scene_requests(guint delay_ms)
   if (old_source != 0)
     g_source_remove(old_source);
 
-  const guint source = g_timeout_add_full(G_PRIORITY_DEFAULT_IDLE,
+  // Continuous GTK frames (for example animated water on software GL) can
+  // starve idle sources. Keep tile and mesh refreshes at normal event priority;
+  // the timeout still coalesces requests during bursts of changes.
+  const guint source = g_timeout_add_full(G_PRIORITY_DEFAULT,
                                           delay_ms,
                                           scheduled_scene_request_cb,
                                           g_object_ref(owner_),
@@ -7297,7 +7321,8 @@ GWorldSceneViewBackend::ensure_scene_requests_scheduled(guint delay_ms)
       return;
   }
 
-  const guint source = g_timeout_add_full(G_PRIORITY_DEFAULT_IDLE,
+  // Match schedule_scene_requests(): refreshes must progress during animation.
+  const guint source = g_timeout_add_full(G_PRIORITY_DEFAULT,
                                           delay_ms,
                                           scheduled_scene_request_cb,
                                           g_object_ref(owner_),
@@ -7332,6 +7357,12 @@ enum {
   PROP_SUN_ELEVATION_DEG,
   PROP_SUN_TIME_OF_DAY,
   PROP_FOG_ENABLED,
+  PROP_ATMOSPHERE_ENABLED,
+  PROP_ATMOSPHERE_DENSITY,
+  PROP_ATMOSPHERE_HAZE,
+  PROP_WATER_ENABLED,
+  PROP_WATER_WAVE_STRENGTH,
+  PROP_WATER_TILE_URL_TEMPLATE,
   PROP_SHADOWS_ENABLED,
   PROP_TERRAIN_NORMAL_SMOOTHING,
   N_PROPS,
@@ -7675,11 +7706,10 @@ load_image_rgba_256(const std::string &path,
                     std::vector<unsigned char> &pixels,
                     std::string *error_message = nullptr)
 {
-  return load_image_rgba_scaled(path,
-                                kAtlasTilePixels,
-                                kAtlasTilePixels,
-                                pixels,
-                                error_message);
+  if (!load_image_rgba_scaled(path, kAtlasTilePixels, kAtlasTilePixels, pixels, error_message))
+    return false;
+  gworld_scene::premultiply_imagery(pixels);
+  return true;
 }
 
 static void
@@ -8388,6 +8418,7 @@ cancel_world_mesh_build_locked(GWorldSceneViewState *state)
 void
 cancel_view_async_work_locked(GWorldSceneViewState *state)
 {
+  state->water_tiles.cancel();
   if (state->scene_update_source != 0) {
     g_source_remove(state->scene_update_source);
     state->scene_update_source = 0;
@@ -9187,8 +9218,8 @@ queue_scene_requests(GWorldSceneView *self)
     texture_queue_ms = perf_elapsed_ms(texture_start_us);
     if (texture_trace_enabled()) {
       const double max_atlas_layer_mib =
-        bytes_to_mib(static_cast<std::size_t>(texture_capacity.atlas_pixels) *
-                     static_cast<std::size_t>(texture_capacity.atlas_pixels) * 4);
+        bytes_to_mib(gworld_scene::mipmap_storage_bytes(texture_capacity.atlas_pixels,
+                                                       texture_capacity.atlas_pixels));
       g_message("GWorldScene texture-trace queue budget=%uMiB atlas_pixels=%d max_layer=%.1fMiB max_tiles=%d max_ultra_tiles=%d ultra_bubble=%.0fm downloads(new=%d pending=%d oldest=%.2fms limit_skips=%d candidates=%d) refresh(wait=%d flushed=%d) ranges ultra=%s detail=%s mid=%s far=%s base=%s globe=%s",
                 texture_budget_mib,
                 texture_capacity.atlas_pixels,
@@ -9456,6 +9487,9 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
   double fog_start = 0.0;
   double fog_end = 0.0;
   glm::vec3 fog_color(0.60f, 0.72f, 0.86f);
+  glm::vec3 atmosphere_settings(1.0f);
+  bool water_enabled = false;
+  double water_wave_strength = 0.0;
   bool shadows_enabled = false;
   double terrain_normal_smoothing = 0.0;
   double ultra_texture_lateral_radius = 0.0;
@@ -9519,6 +9553,10 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
     fog_start = state->fog_start_m;
     fog_end = state->fog_end_m;
     fog_color = state->fog_color;
+    atmosphere_settings = glm::vec3(state->atmosphere_enabled ? 1.0f : 0.0f,
+                                      state->atmosphere_density, state->atmosphere_haze);
+    water_enabled = state->water_enabled;
+    water_wave_strength = state->water_wave_strength;
     shadows_enabled = state->shadows_enabled;
     terrain_normal_smoothing = state->terrain_normal_smoothing;
     ultra_texture_lateral_radius = state->ultra_texture_lateral_radius_m;
@@ -9550,6 +9588,12 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
     if (render_globe)
       upload_globe_mesh_if_needed(state, &globe_upload_stats);
     more_texture_uploads_pending = upload_textures_if_needed(state, &texture_upload_stats);
+    state->texture_uploads_pending = more_texture_uploads_pending;
+    if (water_enabled)
+      state->water_tiles.update(GTK_WIDGET(self), state->water_tile_template, state->cache_directory,
+        state->cache_enabled, latitude, longitude, altitude, render_globe ? std::max(radius_m, altitude * 2.0) : radius_m);
+    else if (state->water_tiles.near_atlas.texture || state->water_tiles.mid_atlas.texture || state->water_tiles.far_atlas.texture)
+      state->water_tiles.destroy_gl();
     ultra_texture_atlas_range = state->ultra_texture_atlas_range;
     texture_atlas_range = state->texture_atlas_range;
     mid_texture_atlas_range = state->mid_texture_atlas_range;
@@ -9581,7 +9625,9 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
     sun_uses_time_of_day
       ? gworld_scene::sun_direction_from_time(latitude, sun_time_of_day, sun_declination)
       : gworld_scene::sun_direction_from_position(sun_azimuth, sun_elevation);
-  const glm::vec3 sun_direction = sun_scene_direction_from_enu(sun_enu);
+  const auto sun_frame = gworld_scene::local_frame_at(latitude, longitude, mesh_origin_latitude, mesh_origin_longitude);
+  const glm::vec3 sun_direction(sun_frame.east * sun_enu.x + sun_frame.north * sun_enu.y + sun_frame.up * sun_enu.z);
+  const auto atmosphere_frame = gworld_scene::atmosphere_frame(mesh_origin_latitude, mesh_origin_longitude);
   const double sun_height = sun_enu.z;
   const float daylight = static_cast<float>(smoothstep_value(-0.18, 0.12, sun_height));
   const float direct_daylight = static_cast<float>(smoothstep_value(-0.04, 0.14, sun_height));
@@ -9645,25 +9691,30 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
   const double camera_setup_ms = perf_elapsed_ms(camera_start_us);
 
   const gint64 shadow_start_us = perf_now_us();
-  glm::mat4 light_mvp(1.0f);
+  gworld_scene::ShadowCascades cascades{};
   bool shadow_available = false;
-  if (shadows_enabled &&
-      render_world_mesh &&
-      altitude < kShadowMaxAltitudeM &&
-      sun_enu.z > 0.04) {
-    const double shadow_extent =
-      std::clamp(std::max(terrain_near_radius_for_altitude(altitude, radius_m),
-                          altitude * 4.0),
-                 2500.0,
-                 120000.0);
-    light_mvp = shadow_light_matrix(camera_frame.origin, sun_direction, shadow_extent);
-    shadow_available = render_shadow_map(state, light_mvp);
+  if (shadows_enabled && render_world_mesh && altitude < kShadowMaxAltitudeM && sun_enu.z > 0.02) {
+    cascades = gworld_scene::shadow_cascades(camera_pose, static_cast<double>(width) / height,
+      glm::radians(45.0), near_plane, std::clamp(radius_m * 0.7 + altitude * 2.0, 5000.0, 60000.0),
+      glm::dvec3(sun_direction), kShadowMapSize);
+    shadow_available = render_shadow_map(state, cascades);
+  }
+  if (!shadows_enabled && state->shadow_depth_texture) {
+    glDeleteTextures(1, &state->shadow_depth_texture);
+    glDeleteFramebuffers(1, &state->shadow_fbo);
+    state->shadow_depth_texture = state->shadow_fbo = 0;
   }
   const double shadow_ms = perf_elapsed_ms(shadow_start_us);
 
   const gint64 draw_start_us = perf_now_us();
   glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
-  glClearColor(effective_fog_color.r, effective_fog_color.g, effective_fog_color.b, 1.0f);
+  if (!state->linear_target.begin()) {
+    g_warning("Unable to allocate the linear scene framebuffer");
+    return FALSE;
+  }
+  glClearColor(gworld_scene::srgb_to_linear(effective_fog_color.r),
+                gworld_scene::srgb_to_linear(effective_fog_color.g),
+                gworld_scene::srgb_to_linear(effective_fog_color.b), 1.0f);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
   render_sky_background(state,
                         mvp,
@@ -9672,7 +9723,7 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
                         fog_color,
                         daylight,
                         twilight,
-                        horizon_glow_strength);
+                        horizon_glow_strength, atmosphere_settings, atmosphere_frame);
   render_sun_disc(state,
                   mvp,
                   camera_pose,
@@ -9683,14 +9734,26 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
                   height);
 
   glUseProgram(state->program);
+  set_atmosphere_uniforms(state->program, atmosphere_settings, atmosphere_frame);
+  glUniform1i(glGetUniformLocation(state->program, "water_enabled"), water_enabled);
+  glUniform1f(glGetUniformLocation(state->program, "water_wave_strength"), water_wave_strength);
+  const double wave_time = g_get_monotonic_time() / 1000000.0;
+  glUniform3f(glGetUniformLocation(state->program, "water_wave_phase"),
+               std::fmod(wave_time * 0.8, 2.0 * kPi), std::fmod(wave_time * 1.1, 2.0 * kPi),
+               std::fmod(wave_time * 1.65, 2.0 * kPi));
+  state->water_tiles.bind(state->program);
   glUniformMatrix4fv(glGetUniformLocation(state->program, "mvp"),
                      1,
                      GL_FALSE,
                      glm::value_ptr(mvp));
-  glUniformMatrix4fv(glGetUniformLocation(state->program, "light_mvp"),
-                     1,
-                     GL_FALSE,
-                     glm::value_ptr(light_mvp));
+  if (shadow_available) {
+    glUniformMatrix4fv(glGetUniformLocation(state->program, "shadow_matrices[0]"),
+                       gworld_scene::kShadowCascades, GL_FALSE, glm::value_ptr(cascades.matrices[0]));
+    glUniform3fv(glGetUniformLocation(state->program, "shadow_splits"), 1, glm::value_ptr(cascades.splits));
+    glUniform3fv(glGetUniformLocation(state->program, "shadow_texel_meters"), 1, glm::value_ptr(cascades.texel_meters));
+    const glm::vec3 forward(glm::normalize(camera_pose.center - camera_pose.eye));
+    glUniform3fv(glGetUniformLocation(state->program, "camera_forward"), 1, glm::value_ptr(forward));
+  }
   glUniform1i(glGetUniformLocation(state->program, "detail_texture"), 0);
   glUniform1i(glGetUniformLocation(state->program, "mid_texture"), 1);
   glUniform1i(glGetUniformLocation(state->program, "base_texture"), 2);
@@ -9734,7 +9797,7 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
               static_cast<float>(std::clamp(terrain_normal_smoothing, 0.0, 1.0)));
   if (shadow_available) {
     glActiveTexture(GL_TEXTURE3);
-    glBindTexture(GL_TEXTURE_2D, state->shadow_depth_texture);
+    glBindTexture(GL_TEXTURE_2D_ARRAY, state->shadow_depth_texture);
   }
 
   if (render_globe && state->globe_index_count > 0) {
@@ -9809,6 +9872,8 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
                     height,
                     mesh_origin_latitude,
                     mesh_origin_longitude);
+  render_water_attribution(state, width, height);
+  state->linear_target.present();
   const double draw_ms = perf_elapsed_ms(draw_start_us);
   const double total_ms = perf_elapsed_ms(frame_start_us);
 
@@ -10017,6 +10082,12 @@ on_tick(GtkWidget *widget, GdkFrameClock *frame_clock, gpointer user_data)
     free_camera = state->camera_mode == GWORLD_SCENE_CAMERA_MODE_FREE;
   }
 
+  // queue_draw() from inside render can be consumed by the current GTK paint.
+  // Schedule staged uploads during the next frame-clock update instead.
+  if (state->texture_uploads_pending ||
+      (state->water_enabled && state->water_tiles.wants_frame(state->water_wave_strength > 0.0)))
+    gtk_widget_queue_draw(widget);
+
   if (dt <= 0.0 || (!forward && !backward && !left && !right))
     return G_SOURCE_CONTINUE;
 
@@ -10114,6 +10185,22 @@ finish_click(GWorldSceneView *self, int n_press, double x, double y, guint fallb
     button = fallback_button;
   if (suppress_pick)
     return;
+
+  std::string credit_uri;
+  if (button == GDK_BUTTON_PRIMARY && n_press == 1) {
+    auto *state = get_state(self);
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->water_enabled)
+      for (const auto &link : state->water_attribution)
+        if (x >= link.x && x < link.x + link.width && y >= link.y && y < link.y + link.height) {
+          credit_uri = link.uri;
+          break;
+        }
+  }
+  if (!credit_uri.empty()) {
+    g_app_info_launch_default_for_uri(credit_uri.c_str(), nullptr, nullptr);
+    return;
+  }
 
   ScenePickResult pick = pick_scene_at_widget_point(self, x, y);
   if (!pick.hit)
@@ -10389,6 +10476,24 @@ gworld_scene_view_set_property(GObject *object,
   case PROP_FOG_ENABLED:
     gworld_scene_view_set_fog_enabled(self, g_value_get_boolean(value));
     break;
+  case PROP_ATMOSPHERE_ENABLED:
+    gworld_scene_view_set_atmosphere_enabled(self, g_value_get_boolean(value));
+    break;
+  case PROP_ATMOSPHERE_DENSITY:
+    gworld_scene_view_set_atmosphere_density(self, g_value_get_double(value));
+    break;
+  case PROP_ATMOSPHERE_HAZE:
+    gworld_scene_view_set_atmosphere_haze(self, g_value_get_double(value));
+    break;
+  case PROP_WATER_ENABLED:
+    gworld_scene_view_set_water_enabled(self, g_value_get_boolean(value));
+    break;
+  case PROP_WATER_WAVE_STRENGTH:
+    gworld_scene_view_set_water_wave_strength(self, g_value_get_double(value));
+    break;
+  case PROP_WATER_TILE_URL_TEMPLATE:
+    gworld_scene_view_set_water_tile_url_template(self, g_value_get_string(value));
+    break;
   case PROP_SHADOWS_ENABLED:
     gworld_scene_view_set_shadows_enabled(self, g_value_get_boolean(value));
     break;
@@ -10453,6 +10558,24 @@ gworld_scene_view_get_property(GObject *object,
     break;
   case PROP_FOG_ENABLED:
     g_value_set_boolean(value, state->fog_enabled);
+    break;
+  case PROP_ATMOSPHERE_ENABLED:
+    g_value_set_boolean(value, state->atmosphere_enabled);
+    break;
+  case PROP_ATMOSPHERE_DENSITY:
+    g_value_set_double(value, state->atmosphere_density);
+    break;
+  case PROP_ATMOSPHERE_HAZE:
+    g_value_set_double(value, state->atmosphere_haze);
+    break;
+  case PROP_WATER_ENABLED:
+    g_value_set_boolean(value, state->water_enabled);
+    break;
+  case PROP_WATER_WAVE_STRENGTH:
+    g_value_set_double(value, state->water_wave_strength);
+    break;
+  case PROP_WATER_TILE_URL_TEMPLATE:
+    g_value_set_string(value, state->water_tile_template.c_str());
     break;
   case PROP_SHADOWS_ENABLED:
     g_value_set_boolean(value, state->shadows_enabled);
@@ -10655,18 +10778,37 @@ gworld_scene_view_class_init(GWorldSceneViewClass *klass)
     g_param_spec_boolean("fog-enabled",
                          "Fog Enabled",
                          "Whether distance fog is applied",
-                         TRUE,
+                         FALSE,
                          static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY));
+  properties[PROP_ATMOSPHERE_ENABLED] =
+    g_param_spec_boolean("atmosphere-enabled", "Atmosphere Enabled", "Whether sky and aerial perspective use atmospheric scattering",
+                         TRUE, static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY));
+  properties[PROP_ATMOSPHERE_DENSITY] =
+    g_param_spec_double("atmosphere-density", "Atmosphere Density", "Air-density multiplier",
+                         0.0, 4.0, 1.0, static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY));
+  properties[PROP_ATMOSPHERE_HAZE] =
+    g_param_spec_double("atmosphere-haze", "Atmosphere Haze", "Aerosol-scattering multiplier",
+                         0.0, 4.0, 1.0, static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY));
+  properties[PROP_WATER_ENABLED] =
+    g_param_spec_boolean("water-enabled", "Water Enabled", "Load boundaries and render reflective water",
+                         FALSE, static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY));
+  properties[PROP_WATER_WAVE_STRENGTH] =
+    g_param_spec_double("water-wave-strength", "Water Wave Strength", "Wave-normal strength; zero gives still water",
+                        0.0, 2.0, 0.35, static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY));
+  properties[PROP_WATER_TILE_URL_TEMPLATE] =
+    g_param_spec_string("water-tile-url-template", "Water Tile URL", "OpenMapTiles-compatible MVT water source",
+                        gworld_scene::kDefaultWaterTileTemplate,
+                        static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY));
   properties[PROP_SHADOWS_ENABLED] =
     g_param_spec_boolean("shadows-enabled",
                          "Shadows Enabled",
-                         "Whether the local terrain and scene nodes use the directional shadow map",
-                         TRUE,
+                         "Whether the local terrain and scene nodes use directional shadow maps",
+                         FALSE,
                          static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY));
   properties[PROP_TERRAIN_NORMAL_SMOOTHING] =
     g_param_spec_double("terrain-normal-smoothing",
                         "Terrain Normal Smoothing",
-                        "Shader-side smoothing amount applied to terrain lighting normals",
+                        "Blend from triangle normals to smooth elevation-derived terrain normals",
                         0.0,
                         1.0,
                         0.88,
@@ -11401,6 +11543,151 @@ gworld_scene_view_get_fog_color(GWorldSceneView *self,
     *green = state->fog_color.g;
   if (blue)
     *blue = state->fog_color.b;
+}
+
+void
+gworld_scene_view_set_atmosphere_enabled(GWorldSceneView *self, gboolean value)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+  auto *state = get_state(self);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    const auto sanitized = value != FALSE;
+    if (state->atmosphere_enabled == sanitized) return;
+    state->atmosphere_enabled = sanitized;
+  }
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_ATMOSPHERE_ENABLED]);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+gboolean
+gworld_scene_view_get_atmosphere_enabled(GWorldSceneView *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), true);
+  auto *state = get_state(self);
+  std::lock_guard<std::mutex> lock(state->mutex);
+  return state->atmosphere_enabled;
+}
+
+void
+gworld_scene_view_set_atmosphere_density(GWorldSceneView *self, double value)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+  auto *state = get_state(self);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    const auto sanitized = (std::isfinite(value) ? std::clamp(value, 0.0, 4.0) : 1.0);
+    if (state->atmosphere_density == sanitized) return;
+    state->atmosphere_density = sanitized;
+  }
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_ATMOSPHERE_DENSITY]);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+double
+gworld_scene_view_get_atmosphere_density(GWorldSceneView *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), 1.0);
+  auto *state = get_state(self);
+  std::lock_guard<std::mutex> lock(state->mutex);
+  return state->atmosphere_density;
+}
+
+void
+gworld_scene_view_set_atmosphere_haze(GWorldSceneView *self, double value)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+  auto *state = get_state(self);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    const auto sanitized = (std::isfinite(value) ? std::clamp(value, 0.0, 4.0) : 1.0);
+    if (state->atmosphere_haze == sanitized) return;
+    state->atmosphere_haze = sanitized;
+  }
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_ATMOSPHERE_HAZE]);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+double
+gworld_scene_view_get_atmosphere_haze(GWorldSceneView *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), 1.0);
+  auto *state = get_state(self);
+  std::lock_guard<std::mutex> lock(state->mutex);
+  return state->atmosphere_haze;
+}
+
+void
+gworld_scene_view_set_water_enabled(GWorldSceneView *self, gboolean enabled)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+  auto *state = get_state(self);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->water_enabled == (enabled != FALSE)) return;
+    state->water_enabled = enabled != FALSE;
+    if (!enabled) state->water_tiles.cancel();
+  }
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_WATER_ENABLED]);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+gboolean
+gworld_scene_view_get_water_enabled(GWorldSceneView *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), FALSE);
+  auto *state = get_state(self);
+  std::lock_guard<std::mutex> lock(state->mutex);
+  return state->water_enabled;
+}
+
+void
+gworld_scene_view_set_water_wave_strength(GWorldSceneView *self, double strength)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+  auto *state = get_state(self);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    const double value = std::isfinite(strength) ? std::clamp(strength, 0.0, 2.0) : 0.35;
+    if (state->water_wave_strength == value) return;
+    state->water_wave_strength = value;
+  }
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_WATER_WAVE_STRENGTH]);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+double
+gworld_scene_view_get_water_wave_strength(GWorldSceneView *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), 0.35);
+  auto *state = get_state(self);
+  std::lock_guard<std::mutex> lock(state->mutex);
+  return state->water_wave_strength;
+}
+
+void
+gworld_scene_view_set_water_tile_url_template(GWorldSceneView *self, const char *url_template)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+  auto *state = get_state(self);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    const std::string value = url_template && *url_template ? url_template : gworld_scene::kDefaultWaterTileTemplate;
+    if (state->water_tile_template == value) return;
+    state->water_tiles.cancel();
+    state->water_tile_template = value;
+  }
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_WATER_TILE_URL_TEMPLATE]);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+const char *
+gworld_scene_view_get_water_tile_url_template(GWorldSceneView *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), nullptr);
+  auto *state = get_state(self);
+  std::lock_guard<std::mutex> lock(state->mutex);
+  return state->water_tile_template.c_str();
 }
 
 void

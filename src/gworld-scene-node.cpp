@@ -10,6 +10,8 @@ enum {
   PROP_0,
   PROP_ID,
   PROP_PRIMITIVE,
+  PROP_ROUGHNESS,
+  PROP_METALLIC,
   N_PROPS,
 };
 
@@ -128,6 +130,8 @@ struct GWorldSceneNodePrivate {
   double red = 0.96;
   double green = 0.54;
   double blue = 0.20;
+  double roughness = -1.0;
+  double metallic = -1.0;
 };
 
 struct _GWorldSceneCubeNode {
@@ -293,6 +297,12 @@ gworld_scene_node_get_property(GObject *object,
   auto *self = GWORLD_SCENE_NODE(object);
 
   switch (prop_id) {
+  case PROP_ROUGHNESS:
+    g_value_set_double(value, node_priv(self)->roughness);
+    break;
+  case PROP_METALLIC:
+    g_value_set_double(value, node_priv(self)->metallic);
+    break;
   case PROP_ID:
     g_value_set_uint64(value, node_priv(self)->id);
     break;
@@ -306,10 +316,28 @@ gworld_scene_node_get_property(GObject *object,
 }
 
 static void
+gworld_scene_node_set_property(GObject *object, guint prop_id, const GValue *value, GParamSpec *pspec)
+{
+  auto *self = GWORLD_SCENE_NODE(object);
+  switch (prop_id) {
+  case PROP_ROUGHNESS:
+    gworld_scene_node_set_roughness(self, g_value_get_double(value));
+    break;
+  case PROP_METALLIC:
+    gworld_scene_node_set_metallic(self, g_value_get_double(value));
+    break;
+  default:
+    G_OBJECT_WARN_INVALID_PROPERTY_ID(object, prop_id, pspec);
+    break;
+  }
+}
+
+static void
 gworld_scene_node_class_init(GWorldSceneNodeClass *klass)
 {
   GObjectClass *object_class = G_OBJECT_CLASS(klass);
   object_class->get_property = gworld_scene_node_get_property;
+  object_class->set_property = gworld_scene_node_set_property;
 
   properties[PROP_ID] =
     g_param_spec_uint64("id",
@@ -327,6 +355,16 @@ gworld_scene_node_class_init(GWorldSceneNodeClass *klass)
                       GWORLD_SCENE_PRIMITIVE_TEXT_LABEL,
                       GWORLD_SCENE_PRIMITIVE_CUBE,
                       static_cast<GParamFlags>(G_PARAM_READABLE | G_PARAM_STATIC_STRINGS));
+  properties[PROP_ROUGHNESS] =
+    g_param_spec_double("roughness", "Roughness",
+                        "Material override; -1 uses the imported/default value",
+                        -1.0, 1.0, -1.0,
+                        static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY | G_PARAM_STATIC_STRINGS));
+  properties[PROP_METALLIC] =
+    g_param_spec_double("metallic", "Metallic",
+                        "Material override; -1 uses the imported/default value",
+                        -1.0, 1.0, -1.0,
+                        static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY | G_PARAM_STATIC_STRINGS));
   g_object_class_install_properties(object_class, N_PROPS, properties);
 
   signals[CHANGED] =
@@ -358,6 +396,8 @@ gworld_scene_node_init(GWorldSceneNode *self)
   priv->red = 0.96;
   priv->green = 0.54;
   priv->blue = 0.20;
+  priv->roughness = -1.0;
+  priv->metallic = -1.0;
 }
 
 static void
@@ -934,6 +974,44 @@ gworld_scene_node_get_color(GWorldSceneNode *self,
     *green = priv->green;
   if (blue)
     *blue = priv->blue;
+}
+
+void
+gworld_scene_node_set_roughness(GWorldSceneNode *self, double roughness)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_NODE(self));
+  auto *priv = node_priv(self);
+  const double value = !std::isfinite(roughness) || roughness < 0.0 ? -1.0 : std::min(roughness, 1.0);
+  if (priv->roughness == value) return;
+  priv->roughness = value;
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_ROUGHNESS]);
+  emit_changed(self);
+}
+
+double
+gworld_scene_node_get_roughness(GWorldSceneNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_NODE(self), -1.0);
+  return node_priv(self)->roughness;
+}
+
+void
+gworld_scene_node_set_metallic(GWorldSceneNode *self, double metallic)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_NODE(self));
+  auto *priv = node_priv(self);
+  const double value = !std::isfinite(metallic) || metallic < 0.0 ? -1.0 : std::min(metallic, 1.0);
+  if (priv->metallic == value) return;
+  priv->metallic = value;
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_METALLIC]);
+  emit_changed(self);
+}
+
+double
+gworld_scene_node_get_metallic(GWorldSceneNode *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_NODE(self), -1.0);
+  return node_priv(self)->metallic;
 }
 
 void

@@ -47,10 +47,16 @@ gworldscene_headers = [
 ]
 
 gworldscene_core_sources = [
+  'gworld-scene-atmosphere.cpp',
+  'gworld-scene-atmosphere-private.h',
   'gworld-scene-camera.cpp',
   'gworld-scene-camera-private.h',
+  'gworld-scene-terrain.cpp',
+  'gworld-scene-terrain-private.h',
   'gworld-scene-geo.cpp',
   'gworld-scene-geo-private.h',
+  'gworld-scene-shadow.cpp',
+  'gworld-scene-shadow-private.h',
   'gworld-scene-light.cpp',
   'gworld-scene-light-private.h',
   'gworld-scene-lod.cpp',
@@ -62,6 +68,11 @@ gworldscene_core_sources = [
 ]
 
 gworldscene_view_sources = [
+  'gworld-scene-atmosphere-glsl-private.h',
+  'gworld-scene-render.cpp',
+  'gworld-scene-render-private.h',
+  'gworld-scene-water.cpp',
+  'gworld-scene-water-private.h',
   'gworld-scene-view.cpp',
   'gworld-scene-view-private.h',
   'gworld-scene-view-shaders.cpp',

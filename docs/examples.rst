@@ -329,17 +329,21 @@ SQGI
 Lighting and atmosphere
 -----------------------
 
+The default atmosphere and material lighting need no setup. These examples
+adjust haze and opt into shadows and automatic OSM-derived water. The controls
+demo exposes the same toggles, density, haze, and wave strength interactively.
+
 C
 ~
 
 .. code-block:: c
 
    gworld_scene_view_set_sun_time_of_day(view, 15.25);
-   gworld_scene_view_set_fog_enabled(view, TRUE);
-   gworld_scene_view_set_fog_range(view, 9000.0, 90000.0);
-   gworld_scene_view_set_fog_color(view, 0.60, 0.72, 0.86);
+   gworld_scene_view_set_atmosphere_haze(view, 0.7);
    gworld_scene_view_set_shadows_enabled(view, TRUE);
-   gworld_scene_view_set_terrain_normal_smoothing(view, 0.92);
+   gworld_scene_view_set_water_enabled(view, TRUE);
+   gworld_scene_view_set_water_wave_strength(view, 0.35);
+   gworld_scene_node_set_roughness(GWORLD_SCENE_NODE(cube), 0.3);
 
 Vala
 ~~~~
@@ -347,11 +351,11 @@ Vala
 .. code-block:: vala
 
    view.set_sun_time_of_day(15.25);
-   view.set_fog_enabled(true);
-   view.set_fog_range(9000.0, 90000.0);
-   view.set_fog_color(0.60, 0.72, 0.86);
+   view.set_atmosphere_haze(0.7);
    view.set_shadows_enabled(true);
-   view.set_terrain_normal_smoothing(0.92);
+   view.set_water_enabled(true);
+   view.set_water_wave_strength(0.35);
+   cube.set_roughness(0.3);
 
 SQGI
 ~~~~
@@ -359,11 +363,16 @@ SQGI
 .. code-block:: text
 
    view.set_sun_time_of_day(15.25)
-   view.set_fog_enabled(true)
-   view.set_fog_range(9000.0, 90000.0)
-   view.set_fog_color(0.60, 0.72, 0.86)
+   view.set_atmosphere_haze(0.7)
    view.set_shadows_enabled(true)
-   view.set_terrain_normal_smoothing(0.92)
+   view.set_water_enabled(true)
+   view.set_water_wave_strength(0.35)
+   cube.set_roughness(0.3)
+
+Water uses the built-in provider unless ``set_water_tile_url_template()`` is
+called. ``set_water_wave_strength(0)`` stops the waves. To add distance fog on
+top of atmospheric haze, enable ``set_fog_enabled(true)`` and configure
+``set_fog_range(start_m, end_m)`` and ``set_fog_color(red, green, blue)``.
 
 Picking
 -------

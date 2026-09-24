@@ -2,6 +2,7 @@
 
 #include <glib.h>
 #include <utility>
+#include <cmath>
 
 namespace {
 
@@ -41,6 +42,22 @@ test_getters_accept_optional_outputs()
   auto *view = GWORLD_SCENE_VIEW(gworld_scene_view_new());
   g_object_ref_sink(view);
   gworld_scene_view_set_cache_enabled(view, FALSE);
+  g_assert_true(gworld_scene_view_get_atmosphere_enabled(view));
+  g_assert_false(gworld_scene_view_get_fog_enabled(view));
+  g_assert_false(gworld_scene_view_get_shadows_enabled(view));
+  g_assert_false(gworld_scene_view_get_water_enabled(view));
+  g_object_set(view, "atmosphere-density", 0.5, "atmosphere-haze", 2.0, "water-wave-strength", 0.0, nullptr);
+  g_assert_cmpfloat(gworld_scene_view_get_atmosphere_density(view), ==, 0.5);
+  g_assert_cmpfloat(gworld_scene_view_get_atmosphere_haze(view), ==, 2.0);
+  g_assert_cmpfloat(gworld_scene_view_get_water_wave_strength(view), ==, 0.0);
+  gworld_scene_view_set_atmosphere_density(view, NAN);
+  g_assert_cmpfloat(gworld_scene_view_get_atmosphere_density(view), ==, 1.0);
+  gworld_scene_view_set_water_tile_url_template(view, "https://example.invalid/{z}/{x}/{y}.pbf");
+  gworld_scene_view_set_water_tile_url_template(view, gworld_scene_view_get_water_tile_url_template(view));
+  g_assert_cmpstr(gworld_scene_view_get_water_tile_url_template(view), ==, "https://example.invalid/{z}/{x}/{y}.pbf");
+  gworld_scene_view_set_water_tile_url_template(view, nullptr);
+  g_assert_nonnull(g_strstr_len(gworld_scene_view_get_water_tile_url_template(view), -1, "openfreemap.org"));
+
   gworld_scene_view_set_free_camera_position(view, -35.0, 149.0, 600.0);
   gworld_scene_view_set_free_camera_orientation(view, 25.0, -10.0);
   auto *cube = gworld_scene_view_add_cube(view, -34.0, 148.0, 725.0, 11.0, 23.0, 37.0);

@@ -96,6 +96,12 @@ Lighting and atmosphere:
   ``gworld_scene_view_get_fog_range()``,
   ``gworld_scene_view_set_fog_color()``,
   ``gworld_scene_view_get_fog_color()``,
+  ``gworld_scene_view_set_atmosphere_enabled()``, ``gworld_scene_view_get_atmosphere_enabled()``,
+  ``gworld_scene_view_set_atmosphere_density()``, ``gworld_scene_view_get_atmosphere_density()``,
+  ``gworld_scene_view_set_atmosphere_haze()``, ``gworld_scene_view_get_atmosphere_haze()``,
+  ``gworld_scene_view_set_water_enabled()``, ``gworld_scene_view_get_water_enabled()``,
+  ``gworld_scene_view_set_water_wave_strength()``, ``gworld_scene_view_get_water_wave_strength()``,
+  ``gworld_scene_view_set_water_tile_url_template()``, ``gworld_scene_view_get_water_tile_url_template()``,
   ``gworld_scene_view_set_shadows_enabled()``,
   ``gworld_scene_view_get_shadows_enabled()``,
   ``gworld_scene_view_set_terrain_normal_smoothing()``,
@@ -114,7 +120,9 @@ Properties:
   ``latitude``, ``longitude``, ``altitude-amsl``, ``terrain-server``,
   ``map-tile-url-template``, ``cache-directory``, ``cache-enabled``,
   ``sun-azimuth-deg``, ``sun-elevation-deg``, ``sun-time-of-day``,
-  ``fog-enabled``, ``shadows-enabled``, and
+  ``fog-enabled``, ``shadows-enabled``, ``atmosphere-enabled``,
+  ``atmosphere-density``, ``atmosphere-haze``, ``water-enabled``,
+  ``water-wave-strength``, ``water-tile-url-template``, and
   ``terrain-normal-smoothing``.
 
 Signals:
@@ -143,7 +151,9 @@ Common methods:
   ``gworld_scene_node_set_scale()``,
   ``gworld_scene_node_get_scale()``,
   ``gworld_scene_node_set_color()``,
-  ``gworld_scene_node_get_color()``.
+  ``gworld_scene_node_get_color()``,
+  ``gworld_scene_node_set_roughness()``, ``gworld_scene_node_get_roughness()``,
+  ``gworld_scene_node_set_metallic()``, ``gworld_scene_node_get_metallic()``.
 
 Compatibility helpers:
   ``gworld_scene_node_set_dimensions()``,
@@ -152,7 +162,8 @@ Compatibility helpers:
   ``gworld_scene_node_get_model_path()``.
 
 Properties:
-  ``id`` and ``primitive`` are read-only.
+  ``id`` and ``primitive`` are read-only. ``roughness`` and ``metallic``
+  are read/write doubles in ``[-1, 1]``; ``-1`` inherits material defaults.
 
 Signals:
   ``changed()`` is emitted when a node mutation affects rendering.

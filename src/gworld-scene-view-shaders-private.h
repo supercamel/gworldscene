@@ -9,4 +9,6 @@ GLuint gworld_scene_view_create_billboard_program(void);
 GLuint gworld_scene_view_create_sun_program(void);
 GLuint gworld_scene_view_create_sky_program(void);
 
+GLuint gworld_scene_view_create_present_program(void);
+
 #endif /* GWORLD_SCENE_VIEW_SHADERS_PRIVATE_H */

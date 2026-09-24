@@ -7,13 +7,21 @@ positioned with latitude, longitude, altitude, and local NED orientation.
 It is currently an experimental geospatial rendering library with a C API,
 GObject Introspection metadata, generated Vala bindings, and SQGI examples.
 
-![GWorldScene scene nodes over Cairns terrain](screenshots/cairns-scene-nodes.png)
+![Cairns coastline with atmospheric haze and reflective ocean and river surfaces](screenshots/cairns-coastal-water.png)
 
 ## Screenshots
 
-| Scene nodes over terrain | Orbit/globe view | Sunlit mountainous terrain |
+Captured from the GTK 4 build, with atmospheric scattering enabled. Water and
+shadows are optional; these views show them enabled where appropriate.
+
+| Scene objects and shadows | Mountain terrain and distance haze | Atmospheric globe and ocean reflections |
 | --- | --- | --- |
-| ![Scene nodes over Cairns terrain](screenshots/cairns-scene-nodes.png) | ![Orbital globe view](screenshots/orbital-globe.png) | ![Mountain terrain with sunlight](screenshots/mountain-terrain-sunlight.png) |
+| ![Scene objects and shadows over Cairns](screenshots/cairns-scene-nodes.png) | ![Sunlit mountain terrain west of Cairns](screenshots/mountain-terrain-sunlight.png) | ![Australia and the Pacific from orbit](screenshots/orbital-globe.png) |
+
+Screenshot imagery: [Esri World Imagery](https://services.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer),
+Vantor, Earthstar Geographics, and the GIS User Community. Water boundaries:
+[OpenFreeMap](https://openfreemap.org/), [OpenMapTiles](https://openmaptiles.org/),
+and [OpenStreetMap contributors](https://www.openstreetmap.org/copyright).
 
 ## Features
 
@@ -21,7 +29,7 @@ GObject Introspection metadata, generated Vala bindings, and SQGI examples.
 - Automatic desktop OpenGL 3.3 / OpenGL ES 3.0 context and shader selection.
 - Shared core library for scene nodes, camera math, picking, and geodesy.
 - Local terrain rendering from HGT-style elevation tiles.
-- Slippy-map texture imagery with disk caching.
+- Slippy-map imagery with disk caching, trilinear mipmaps, and anisotropic filtering where available.
 - Earth-scale globe rendering when zoomed far out.
 - Default Google-Earth-style camera plus free camera mode.
 - Scene graph nodes positioned by geodetic coordinates.
@@ -30,7 +38,12 @@ GObject Introspection metadata, generated Vala bindings, and SQGI examples.
 - Assimp-backed model loading, including common formats such as GLB/glTF and OBJ.
 - Billboards, ground overlays, polylines, polygons, circles, and text labels.
 - AMSL, AGL, and clamp-to-ground altitude modes where supported.
-- Fog, sun position/time-of-day lighting, shadows, and terrain normal smoothing.
+- Atmospheric sky, horizon haze, and distance scattering from ground level to orbit.
+- Elevation-derived terrain normals, linear-light rendering, and tone mapping.
+- Roughness/metallic material lighting for primitives and imported models.
+- Optional cascaded shadows with filtered edges and stable camera tracking.
+- Optional reflective water with animated surface detail and automatic coastline/lake/river loading.
+- Configurable sun position/time of day and additional distance fog.
 - Picking signals for terrain and renderable scene nodes.
 - C, Vala, and SQGI examples.
 
@@ -85,9 +98,11 @@ GTK 4.12 and later applications can restrict selection with
 GTK 3's X11 backend may require `GDK_GL=gles` at process startup to select
 GLES for its shared contexts.
 
-The rendering tests exercise both APIs, shadows, scaled viewports, and context
-recreation. They skip when no display is available. To run them with Mesa
-software rendering on a headless Linux machine:
+The rendering tests exercise both APIs, atmospheric lighting, imported materials,
+shadows, water masks and caching, scaled viewports, and context recreation. They
+also check that staged imagery uploads finish while the camera is stationary.
+They skip when no display is available. To run them with Mesa software rendering
+on a headless Linux machine:
 
 ```sh
 xvfb-run -a env LIBGL_ALWAYS_SOFTWARE=1 GSK_RENDERER=cairo GTK_A11Y=none \
@@ -96,9 +111,9 @@ xvfb-run -a env LIBGL_ALWAYS_SOFTWARE=1 GSK_RENDERER=cairo GTK_A11Y=none \
 
 The binding tests check scalar output direction, ownership, optionality, and
 parameter order in both generated GIRs. When `sqgi` is available at configure
-time, they also run all 25 multi-output getters against the build's typelibs and
-libraries, using a separate process for each GTK version. These runtime tests
-skip without a display:
+time, they also exercise multi-output getters and material, atmosphere, and water
+controls against the build's typelibs and libraries, using a separate process
+for each GTK version. These runtime tests skip without a display:
 
 ```sh
 xvfb-run -a env GSK_RENDERER=cairo GTK_A11Y=none \
@@ -120,7 +135,7 @@ For example, on aarch64 Linux the typelibs are installed under
 ## Run The Demos
 
 The main C demo starts near Cairns, Queensland, with terrain, satellite imagery,
-fog, sun lighting, shadows, and a mix of scene nodes:
+atmospheric lighting, and a mix of scene nodes:
 
 ```sh
 ./builddir/examples/gworldscene-demo-gtk4
@@ -128,8 +143,8 @@ fog, sun lighting, shadows, and a mix of scene nodes:
 ./builddir/examples/gworldscene-demo-gtk3
 ```
 
-The Vala control panel exposes map provider, terrain, fog, sun, shadow, and
-picking controls:
+The Vala control panel exposes map provider, terrain, atmosphere density/haze,
+fog, sun, shadow, water/wave, and picking controls:
 
 ```sh
 ./builddir/examples/gworldscene-controls-gtk4
@@ -223,8 +238,54 @@ Each two-level zoom step increases ground pixel size by 4×. Adjacent bands blen
 at their edges and keep coarser imagery visible while finer tiles load. Altitude
 above ground adjusts the zoom levels; latitude, texture-memory presets, and GPU
 texture limits determine each band's coverage. Larger presets extend coverage
-at the same resolution. The extra far band uses up to 16 MiB of resident texture
-memory with the default 64-tile limit, plus temporary upload storage.
+at the same resolution. With the default 64-tile limit, the extra far band uses
+about 21.3 MiB of resident texture memory including its mip chain, plus temporary
+upload storage. Mipmaps and up to 8× anisotropic filtering preserve detail at
+oblique viewing angles; linear-light filtering avoids dark seams around missing
+tiles.
+
+## Graphics And Optional Effects
+
+The default appearance includes atmospheric scattering, terrain lighting,
+roughness/metallic materials, filtered imagery, and linear-light tone mapping.
+Shadows, reflective water, and extra distance fog are disabled by default.
+
+| Control | Default | Effect |
+| --- | --- | --- |
+| `atmosphere-enabled` | `true` | Sky, curved horizon, and aerial perspective |
+| `atmosphere-density` / `atmosphere-haze` | `1` / `1` | Air density and aerosol haze, each adjustable from 0 to 4 |
+| `shadows-enabled` | `false` | Three filtered shadow cascades for terrain and scene objects |
+| `water-enabled` | `false` | Automatic water boundaries, sky reflections, and sun highlights |
+| `water-wave-strength` | `0.35` | Animated surface detail; set to 0 for still water |
+| `fog-enabled` | `false` | Additional configurable distance fog |
+
+For example, in C:
+
+```c
+gworld_scene_view_set_atmosphere_haze(view, 0.7);
+gworld_scene_view_set_shadows_enabled(view, TRUE);
+gworld_scene_view_set_water_enabled(view, TRUE);
+gworld_scene_view_set_water_wave_strength(view, 0.35);
+```
+
+The equivalent SQGI/Vala methods are `view.set_atmosphere_haze(0.7)`,
+`view.set_shadows_enabled(true)`, and `view.set_water_enabled(true)`.
+The controls demo provides interactive toggles for these effects.
+
+Water boundaries load asynchronously from OSM-derived OpenFreeMap vector tiles;
+no API key is required. Oceans, lakes, and river polygons retain islands, and
+missing data leaves the imagery visible. Flat terrain is never treated as proof
+of water. The widget displays clickable data-source credits when water is enabled.
+
+Water tiles use a separate `water/<provider-hash>/<z>/<x>/<y>.pbf` cache under the
+view's cache directory. A custom OpenMapTiles-compatible provider can be selected
+with `set_water_tile_url_template()`; passing `NULL` restores the default.
+The provider's URL is hashed for cache isolation, including any query parameters.
+
+Water currently reflects the sky and sun and follows the elevation mesh; it does
+not flatten lake levels or reflect scene objects. Optional effects add rendering
+and memory cost. See [graphics settings and tradeoffs](docs/concepts.rst) for
+resource use, cache behavior, and material-import limitations.
 
 ## Coordinates
 
@@ -263,6 +324,13 @@ Common node operations include:
 - `rotate_ned()`
 - `set_scale()`
 - `set_color()`
+- `set_roughness()`
+- `set_metallic()`
+
+Roughness and metallic overrides accept values from 0 to 1. Set either to `-1`
+(the default) to use the imported material or primitive defaults. Imported scalar
+material factors are supported; normal and packed material textures are not yet
+sampled.
 
 Current renderable node types:
 

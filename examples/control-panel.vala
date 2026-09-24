@@ -204,8 +204,23 @@ namespace GWorldSceneControls {
       fog_grid.column_spacing = 10;
       row = 0;
 
-      fog_enabled = new Gtk.CheckButton.with_label ("Enable fog");
-      fog_enabled.active = true;
+      var atmosphere_enabled = new Gtk.CheckButton.with_label ("Atmospheric scattering");
+      atmosphere_enabled.active = true;
+      atmosphere_enabled.toggled.connect (() => scene.set_atmosphere_enabled (atmosphere_enabled.active));
+      add_row (fog_grid, row++, "", atmosphere_enabled);
+      var atmosphere_haze = new Gtk.Scale.with_range (Gtk.Orientation.HORIZONTAL, 0.0, 4.0, 0.05);
+      atmosphere_haze.set_value (1.0);
+      atmosphere_haze.hexpand = true;
+      atmosphere_haze.value_changed.connect (() => scene.set_atmosphere_haze (atmosphere_haze.get_value ()));
+      add_row (fog_grid, row++, "Aerosol haze", atmosphere_haze);
+      var atmosphere_density = new Gtk.Scale.with_range (Gtk.Orientation.HORIZONTAL, 0.0, 4.0, 0.05);
+      atmosphere_density.set_value (1.0);
+      atmosphere_density.hexpand = true;
+      atmosphere_density.value_changed.connect (() => scene.set_atmosphere_density (atmosphere_density.get_value ()));
+      add_row (fog_grid, row++, "Air density", atmosphere_density);
+
+      fog_enabled = new Gtk.CheckButton.with_label ("Additional distance fog");
+      fog_enabled.active = false;
       fog_enabled.toggled.connect (() => apply_fog ());
       add_row (fog_grid, row++, "", fog_enabled);
 
@@ -264,7 +279,7 @@ namespace GWorldSceneControls {
       add_row (sun_grid, row++, "Elevation", sun_elevation);
 
       shadows_enabled = new Gtk.CheckButton.with_label ("Enable shadows");
-      shadows_enabled.active = true;
+      shadows_enabled.active = false;
       shadows_enabled.toggled.connect (() => apply_lighting ());
       add_row (sun_grid, row++, "", shadows_enabled);
 
@@ -285,6 +300,20 @@ namespace GWorldSceneControls {
       normal_smoothing.value_changed.connect (() => apply_lighting ());
       add_row (terrain_lighting_grid, row++, "Smoothing", normal_smoothing);
       box.append (terrain_lighting_grid);
+
+      box.append (section_label ("Water"));
+      var water_grid = new Gtk.Grid ();
+      water_grid.row_spacing = 8;
+      water_grid.column_spacing = 10;
+      var water_enabled = new Gtk.CheckButton.with_label ("Reflective water (loads OSM boundaries)");
+      water_enabled.toggled.connect (() => scene.set_water_enabled (water_enabled.active));
+      add_row (water_grid, 0, "", water_enabled);
+      var water_waves = new Gtk.Scale.with_range (Gtk.Orientation.HORIZONTAL, 0.0, 2.0, 0.05);
+      water_waves.set_value (0.35);
+      water_waves.hexpand = true;
+      water_waves.value_changed.connect (() => scene.set_water_wave_strength (water_waves.get_value ()));
+      add_row (water_grid, 1, "Wave strength", water_waves);
+      box.append (water_grid);
 
       box.append (section_label ("Camera"));
       var camera_grid = new Gtk.Grid ();

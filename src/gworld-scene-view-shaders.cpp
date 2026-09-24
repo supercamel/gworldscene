@@ -3,19 +3,31 @@
 #endif
 
 #include "gworld-scene-view-shaders-private.h"
+#include "gworld-scene-atmosphere-glsl-private.h"
 
 #include <glib.h>
 
 namespace {
 
 GLuint
-compile_shader(GLenum type, const char *source)
+compile_shader(GLenum type, const char *source, const char *helpers = "")
 {
   GLuint shader = glCreateShader(type);
   const char *preamble = epoxy_is_desktop_gl()
     ? "#version 330 core\n"
-    : "#version 300 es\nprecision highp float;\nprecision highp int;\nprecision highp sampler2D;\n";
-  const char *sources[] = {preamble, source};
+    : "#version 300 es\nprecision highp float;\nprecision highp int;\nprecision highp sampler2D;\nprecision highp sampler2DArray;\n";
+  static const char *color_functions = R"GLSL(
+vec3 srgb_to_linear(vec3 value) {
+  return mix(value / 12.92, pow((value + 0.055) / 1.055, vec3(2.4)),
+             greaterThan(value, vec3(0.04045)));
+}
+vec3 linear_to_srgb(vec3 value) {
+  value = max(value, vec3(0.0));
+  return mix(value * 12.92, 1.055 * pow(value, vec3(1.0 / 2.4)) - 0.055,
+             greaterThan(value, vec3(0.0031308)));
+}
+)GLSL";
+  const char *sources[] = {preamble, color_functions, helpers, source};
   glShaderSource(shader, G_N_ELEMENTS(sources), sources, nullptr);
   glCompileShader(shader);
 
@@ -33,10 +45,11 @@ compile_shader(GLenum type, const char *source)
 }
 
 GLuint
-create_linked_program(const char *label, const char *vertex_source, const char *fragment_source)
+create_linked_program(const char *label, const char *vertex_source, const char *fragment_source,
+                      const char *fragment_helpers = "")
 {
   GLuint vertex = compile_shader(GL_VERTEX_SHADER, vertex_source);
-  GLuint fragment = compile_shader(GL_FRAGMENT_SHADER, fragment_source);
+  GLuint fragment = compile_shader(GL_FRAGMENT_SHADER, fragment_source, fragment_helpers);
   if (vertex == 0 || fragment == 0) {
     if (vertex)
       glDeleteShader(vertex);
@@ -79,8 +92,8 @@ layout(location = 4) in vec2 ultra_texcoord;
 layout(location = 5) in vec3 normal;
 layout(location = 6) in vec4 vertex_color;
 layout(location = 7) in float material;
+layout(location = 8) in vec2 surface;
 uniform mat4 mvp;
-uniform mat4 light_mvp;
 uniform bool ultra_atlas_valid;
 uniform vec4 ultra_atlas_range;
 uniform vec2 ultra_atlas_size;
@@ -99,6 +112,18 @@ uniform vec2 base_atlas_size;
 uniform bool globe_atlas_valid;
 uniform vec4 globe_atlas_range;
 uniform vec2 globe_atlas_size;
+uniform bool water_near_valid;
+uniform vec4 water_near_range;
+uniform vec2 water_near_size;
+out vec2 v_water_near;
+uniform bool water_mid_valid;
+uniform vec4 water_mid_range;
+uniform vec2 water_mid_size;
+out vec2 v_water_mid;
+uniform bool water_far_valid;
+uniform vec4 water_far_range;
+uniform vec2 water_far_size;
+out vec2 v_water_far;
 out vec2 v_detail_texcoord;
 out vec2 v_mid_texcoord;
 out vec2 v_far_texcoord;
@@ -107,9 +132,9 @@ out vec2 v_ultra_texcoord;
 out vec3 v_normal;
 out vec4 v_color;
 out float v_material;
+out vec2 v_surface;
 out float v_height;
 out vec3 v_world_position;
-out vec4 v_light_position;
 
 const float MERCATOR_MAX_LATITUDE = 85.05112878;
 const float PI = 3.14159265358979323846;
@@ -153,16 +178,42 @@ void main() {
     v_base_texcoord = base_texcoord;
     v_ultra_texcoord = ultra_texcoord;
   }
+  v_water_near = water_near_valid && (is_terrain || is_globe)
+    ? atlas_uv_for_lat_lon(detail_texcoord, water_near_range, water_near_size) : vec2(-1.0);
+  v_water_mid = water_mid_valid && (is_terrain || is_globe)
+    ? atlas_uv_for_lat_lon(detail_texcoord, water_mid_range, water_mid_size) : vec2(-1.0);
+  v_water_far = water_far_valid && (is_terrain || is_globe)
+    ? atlas_uv_for_lat_lon(detail_texcoord, water_far_range, water_far_size) : vec2(-1.0);
   v_normal = normal;
-  v_color = vertex_color;
+  v_color = vec4(srgb_to_linear(vertex_color.rgb), vertex_color.a);
   v_material = material;
+  v_surface = surface;
   v_height = position.y;
   v_world_position = position;
-  v_light_position = light_mvp * world_position;
 }
 )GLSL";
 
   static const char *fragment_source = R"GLSL(
+uniform bool water_near_valid;
+uniform vec4 water_near_range;
+uniform vec2 water_near_size;
+in vec2 v_water_near;
+uniform sampler2D water_near_texture;
+uniform bool water_mid_valid;
+uniform vec4 water_mid_range;
+uniform vec2 water_mid_size;
+in vec2 v_water_mid;
+uniform sampler2D water_mid_texture;
+uniform bool water_far_valid;
+uniform vec4 water_far_range;
+uniform vec2 water_far_size;
+in vec2 v_water_far;
+uniform sampler2D water_far_texture;
+uniform bool water_enabled;
+uniform float water_wave_strength;
+uniform vec3 water_wave_phase;
+uniform vec2 water_wave_origin;
+uniform float water_tile_meters;
 in vec2 v_detail_texcoord;
 in vec2 v_mid_texcoord;
 in vec2 v_far_texcoord;
@@ -171,9 +222,9 @@ in vec2 v_ultra_texcoord;
 in vec3 v_normal;
 in vec4 v_color;
 in float v_material;
+in vec2 v_surface;
 in float v_height;
 in vec3 v_world_position;
-in vec4 v_light_position;
 uniform bool ultra_atlas_valid;
 uniform vec4 ultra_atlas_range;
 uniform vec2 ultra_atlas_size;
@@ -197,7 +248,11 @@ uniform sampler2D detail_texture;
 uniform sampler2D mid_texture;
 uniform sampler2D far_texture;
 uniform sampler2D base_texture;
-uniform sampler2D shadow_texture;
+uniform sampler2DArray shadow_texture;
+uniform mat4 shadow_matrices[3];
+uniform vec3 shadow_splits;
+uniform vec3 shadow_texel_meters;
+uniform vec3 camera_forward;
 uniform sampler2D model_texture;
 uniform bool has_ultra_texture;
 uniform bool has_detail_texture;
@@ -244,41 +299,150 @@ vec4 blend_imagery(vec4 coarse, vec4 fine, vec2 uv, vec2 atlas_size) {
   return vec4(mix(coarse.rgb, fine.rgb, weight), mix(coarse.a, 1.0, weight));
 }
 
+// Gradients come from continuous coordinates, before longitude wrapping.
+// Filtering premultiplied linear RGB avoids dark borders at missing tiles.
+vec4 sample_imagery(sampler2D source, vec2 uv, vec2 continuous_uv, bool valid) {
+  vec4 texel = textureGrad(source, uv, dFdx(continuous_uv), dFdy(continuous_uv));
+  if (!valid || texel.a <= 0.0001) return vec4(0.0);
+  return vec4(texel.rgb / texel.a, texel.a);
+}
+
 vec3 lighting_normal() {
   vec3 normal = normalize(v_normal);
-  if (v_material < 0.5 && terrain_normal_smoothing > 0.0) {
-    vec3 local_up = vec3(0.0, 1.0, 0.0);
-    float slope = 1.0 - clamp(abs(dot(normal, local_up)), 0.0, 1.0);
-    float smoothing = clamp(terrain_normal_smoothing * (1.0 - slope * 0.28), 0.0, 1.0);
-    normal = normalize(mix(normal, local_up, smoothing));
+  vec3 face = cross(dFdx(v_world_position), dFdy(v_world_position));
+  if (v_material < 0.5 && dot(face, face) > 0.00000001) {
+    face = normalize(face);
+    if (dot(face, normal) < 0.0) face = -face;
+    normal = normalize(mix(face, normal, clamp(terrain_normal_smoothing, 0.0, 1.0)));
   }
   return normal;
 }
 
-float shadow_visibility(vec3 normal) {
-  if (!has_shadow_texture || (v_material > 1.5 && v_material < 2.5))
-    return 1.0;
-
-  vec3 projected = v_light_position.xyz / v_light_position.w;
-  projected = projected * 0.5 + 0.5;
-  if (projected.z > 1.0 ||
-      projected.x < 0.0 || projected.x > 1.0 ||
-      projected.y < 0.0 || projected.y > 1.0)
-    return 1.0;
-
-  vec2 texel_size = 1.0 / vec2(textureSize(shadow_texture, 0));
-  float bias = max(0.0012 * (1.0 - dot(normal, sun_direction)), 0.00035);
-  float lit = 0.0;
-  for (int y = -1; y <= 1; ++y) {
-    for (int x = -1; x <= 1; ++x) {
-      vec2 uv = projected.xy + vec2(x, y) * texel_size;
+float cascade_visibility(int cascade, vec3 normal) {
+  float slope = 1.0 - max(dot(normal, normalize(sun_direction)), 0.0);
+  vec3 offset = normal * shadow_texel_meters[cascade] * (0.35 + slope * 1.5);
+  vec4 light = shadow_matrices[cascade] * vec4(v_world_position + offset, 1.0);
+  vec3 projected = light.xyz / light.w * 0.5 + 0.5;
+  if (any(lessThan(projected, vec3(0.0))) || any(greaterThan(projected, vec3(1.0)))) return 1.0;
+  vec2 size = vec2(textureSize(shadow_texture, 0).xy);
+  vec2 texel = 1.0 / size;
+  float lit = 0.0, weights = 0.0;
+  for (int y = -2; y <= 2; ++y) {
+    for (int x = -2; x <= 2; ++x) {
+      vec2 uv = projected.xy + vec2(x, y) * texel;
+      float weight = float((3 - abs(x)) * (3 - abs(y)));
       float depth = (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0))))
-        ? 1.0 : texture(shadow_texture, uv).r;
-      lit += projected.z - bias <= depth ? 1.0 : 0.0;
+        ? 1.0 : texture(shadow_texture, vec3(uv, float(cascade))).r;
+      lit += (projected.z - 0.000005 <= depth ? 1.0 : 0.0) * weight;
+      weights += weight;
     }
   }
+  return lit / weights;
+}
 
-  return mix(0.42, 1.0, lit / 9.0);
+float shadow_visibility(vec3 normal) {
+  if (!has_shadow_texture || (v_material > 1.5 && v_material < 2.5)) return 1.0;
+  float depth = max(dot(v_world_position - camera_position, camera_forward), 0.0);
+  int cascade = depth < shadow_splits.x ? 0 : (depth < shadow_splits.y ? 1 : 2);
+  if (depth >= shadow_splits.z) return 1.0;
+  float current = cascade_visibility(cascade, normal);
+  float blend = smoothstep(shadow_splits[cascade] * 0.85, shadow_splits[cascade], depth);
+  if (blend > 0.0) {
+    float next = cascade < 2 ? cascade_visibility(cascade + 1, normal) : 1.0;
+    current = mix(current, next, blend);
+  }
+  return current;
+}
+
+// GGX/Cook-Torrance direct light and a hemispherical environment approximation.
+// Roughness is perceptual; the lower bound keeps tiny sun highlights stable.
+vec3 material_lighting(vec3 base, vec3 normal, float visibility, vec2 surface, float reflectance, float variance) {
+  vec3 view_delta = camera_position - v_world_position;
+  vec3 view = view_delta / max(length(view_delta), 0.0001);
+  vec3 sun = normalize(sun_direction);
+  vec3 half_delta = view + sun;
+  vec3 half_vector = half_delta / max(length(half_delta), 0.0001);
+  float nv = clamp(dot(normal, view), 0.0001, 1.0);
+  float nl = max(dot(normal, sun), 0.0);
+  float nh = max(dot(normal, half_vector), 0.0);
+  float vh = clamp(dot(view, half_vector), 0.0, 1.0);
+  float roughness = clamp(surface.x, 0.08, 1.0);
+  float metallic = clamp(surface.y, 0.0, 1.0);
+  // Normal variation below a pixel broadens highlights instead of sparkling.
+  float a2 = clamp(pow(roughness, 4.0) + variance * 0.25, 0.00004, 1.0);
+  float denominator = nh * nh * (a2 - 1.0) + 1.0;
+  float distribution = a2 / max(3.14159265 * denominator * denominator, 0.000001);
+  float gv = nl * sqrt(nv * nv * (1.0 - a2) + a2);
+  float gl = nv * sqrt(nl * nl * (1.0 - a2) + a2);
+  float geometry = 0.5 / max(gv + gl, 0.0001);
+  vec3 f0 = mix(vec3(reflectance), base, metallic);
+  vec3 fresnel = f0 + (vec3(1.0) - f0) * pow(1.0 - vh, 5.0);
+  vec3 diffuse = base * (vec3(1.0) - fresnel) * (1.0 - metallic);
+  vec3 direct = (diffuse + distribution * geometry * fresnel * 3.14159265) *
+                srgb_to_linear(direct_light_color) * sun_strength * nl * visibility;
+  vec3 up = atmosphere_enabled ? normalize(v_world_position - planet_center) : vec3(0, 1, 0);
+  float sky_weight = dot(normal, up) * 0.5 + 0.5;
+  vec3 ambient = srgb_to_linear(ambient_color) * ambient_strength * mix(0.38, 1.0, sky_weight);
+  vec3 reflected = reflect(-view, normal);
+  float reflection_sky = clamp(dot(reflected, up) * 0.5 + 0.5, 0.0, 1.0);
+  vec3 environment = mix(srgb_to_linear(vec3(0.24, 0.22, 0.19)),
+                          srgb_to_linear(ambient_color), reflection_sky) * ambient_strength;
+  vec3 environment_fresnel = f0 + (max(vec3(1.0 - roughness), f0) - f0) * pow(1.0 - nv, 5.0);
+  return direct + base * ambient * (1.0 - metallic) +
+         environment * environment_fresnel * (1.0 - roughness * 0.45);
+}
+
+vec2 water_mask(sampler2D source, vec2 uv, vec2 continuous_uv, bool valid) {
+  vec2 value = textureGrad(source, uv, dFdx(continuous_uv), dFdy(continuous_uv)).rg;
+  bool inside = all(greaterThanEqual(uv, vec2(0.0))) && all(lessThanEqual(uv, vec2(1.0)));
+  return valid && inside ? value : vec2(0.0);
+}
+
+float water_layer(float coarse, vec2 mask, vec2 uv, vec2 size) {
+  vec2 edge = min(uv, vec2(1.0) - uv) * size;
+  float blend = smoothstep(0.0, 0.5, min(edge.x, edge.y)) * mask.g;
+  return mix(coarse, mask.r / max(mask.g, 0.0001), blend);
+}
+
+float water_coverage() {
+  vec2 near_uv = wrap_atlas_uv(v_water_near, water_near_range, water_near_size);
+  vec2 near_mask = water_mask(water_near_texture, near_uv, v_water_near, water_near_valid);
+  vec2 mid_uv = wrap_atlas_uv(v_water_mid, water_mid_range, water_mid_size);
+  vec2 mid_mask = water_mask(water_mid_texture, mid_uv, v_water_mid, water_mid_valid);
+  vec2 far_uv = wrap_atlas_uv(v_water_far, water_far_range, water_far_size);
+  vec2 far_mask = water_mask(water_far_texture, far_uv, v_water_far, water_far_valid);
+  float coverage = water_layer(0.0, far_mask, far_uv, water_far_size);
+  coverage = water_layer(coverage, mid_mask, mid_uv, water_mid_size);
+  return clamp(water_layer(coverage, near_mask, near_uv, water_near_size), 0.0, 1.0);
+}
+
+vec3 water_lighting(vec3 base, float visibility, float footprint) {
+  vec3 up = normalize(v_world_position - planet_center);
+  vec3 axis = abs(up.x) > 0.9 ? vec3(0, 0, 1) : vec3(1, 0, 0);
+  vec3 tangent = normalize(axis - up * dot(axis, up));
+  vec3 bitangent = normalize(cross(tangent, up));
+  vec2 position = v_water_near * water_near_size * water_tile_meters + water_wave_origin;
+  position *= 6.28318530718 / (40075016.68557849 / 9784.0);
+  vec2 gradient = vec2(0.0);
+  gradient += vec2(0.9, 0.3) * cos(dot(position, vec2(171, 63)) + water_wave_phase.x);
+  gradient += vec2(0.4, -0.7) * cos(dot(position, vec2(89, -149)) + water_wave_phase.y);
+  gradient += vec2(0.2, 0.15) * cos(dot(position, vec2(367, 277)) + water_wave_phase.z);
+  float distance_m = length(camera_position - v_world_position);
+  float wave_fade = 1.0 - smoothstep(3000.0, 20000.0, distance_m);
+  // Filter waves whose period projects below a pixel instead of sparkling.
+  wave_fade *= 1.0 - smoothstep(0.5, 3.0, footprint);
+  vec3 normal = normalize(up - (tangent * gradient.x + bitangent * gradient.y) *
+                                water_wave_strength * 0.18 * wave_fade);
+  vec3 delta = camera_position - v_world_position;
+  vec3 view = delta / max(length(delta), 0.0001);
+  float nv = clamp(dot(normal, view), 0.0, 1.0);
+  float fresnel = 0.02 + 0.98 * pow(1.0 - nv, 5.0);
+  vec3 reflection = reflect(-view, normal);
+  vec3 sky = atmosphere_enabled ? atmosphere_sky(v_world_position + up * 2.0, reflection, sun_direction) :
+    srgb_to_linear(mix(vec3(0.55, 0.69, 0.82), vec3(0.22, 0.42, 0.72), max(dot(reflection, up), 0.0))) * ambient_strength;
+  vec3 tint = mix(base, srgb_to_linear(vec3(0.025, 0.13, 0.17)), 0.25);
+  vec3 surface = material_lighting(tint, normal, visibility, vec2(0.16, 0.0), 0.02, min(footprint * footprint, 1.0) * 0.01);
+  return mix(surface, sky, fresnel);
 }
 
 float fog_amount() {
@@ -289,17 +453,17 @@ float fog_amount() {
   float range = max(fog_end - fog_start, 1.0);
   float linear_fog = clamp((distance_to_camera - fog_start) / range, 0.0, 1.0);
   float density_fog = 1.0 - exp(-distance_to_camera * max(fog_density, 0.0));
-  return clamp(max(linear_fog, density_fog), 0.0, 1.0);
+  return atmosphere_enabled ? linear_fog : clamp(max(linear_fog, density_fog), 0.0, 1.0);
 }
 
 void main() {
   vec3 normal = lighting_normal();
   float diffuse = clamp(dot(normal, normalize(sun_direction)), 0.0, 1.0);
   float visibility = shadow_visibility(normal);
-  vec3 light = ambient_color * ambient_strength +
-               direct_light_color * diffuse * sun_strength * visibility;
-  vec3 low = vec3(0.26, 0.36, 0.24);
-  vec3 high = vec3(0.76, 0.72, 0.62);
+  vec3 light = srgb_to_linear(ambient_color) * ambient_strength +
+               srgb_to_linear(direct_light_color) * diffuse * sun_strength * visibility;
+  vec3 low = srgb_to_linear(vec3(0.26, 0.36, 0.24));
+  vec3 high = srgb_to_linear(vec3(0.76, 0.72, 0.62));
   vec3 terrain_tint = mix(low, high, clamp(v_height / 1800.0, 0.0, 1.0));
   vec2 detail_uv = v_detail_texcoord;
   vec2 mid_uv = v_mid_texcoord;
@@ -320,11 +484,11 @@ void main() {
   bool in_mid = mid_uv.x >= 0.0 && mid_uv.x <= 1.0 && mid_uv.y >= 0.0 && mid_uv.y <= 1.0;
   bool in_base = base_uv.x >= 0.0 && base_uv.x <= 1.0 && base_uv.y >= 0.0 && base_uv.y <= 1.0;
   bool in_ultra = ultra_uv.x >= 0.0 && ultra_uv.x <= 1.0 && ultra_uv.y >= 0.0 && ultra_uv.y <= 1.0;
-  vec4 base_texel = (has_base_texture && in_base) ? texture(base_texture, base_uv) : vec4(0.0);
-  vec4 far_texel = (has_far_texture && in_far) ? texture(far_texture, far_uv) : vec4(0.0);
-  vec4 mid_texel = (has_mid_texture && in_mid) ? texture(mid_texture, mid_uv) : vec4(0.0);
-  vec4 detail_texel = (has_detail_texture && in_detail) ? texture(detail_texture, detail_uv) : vec4(0.0);
-  vec4 ultra_texel = (has_ultra_texture && in_ultra) ? texture(ultra_texture, ultra_uv) : vec4(0.0);
+  vec4 base_texel = sample_imagery(base_texture, base_uv, v_base_texcoord, has_base_texture && in_base);
+  vec4 far_texel = sample_imagery(far_texture, far_uv, v_far_texcoord, has_far_texture && in_far);
+  vec4 mid_texel = sample_imagery(mid_texture, mid_uv, v_mid_texcoord, has_mid_texture && in_mid);
+  vec4 detail_texel = sample_imagery(detail_texture, detail_uv, v_detail_texcoord, has_detail_texture && in_detail);
+  vec4 ultra_texel = sample_imagery(ultra_texture, ultra_uv, v_ultra_texcoord, has_ultra_texture && in_ultra);
   vec4 texture_stack = blend_imagery(base_texel, far_texel, far_uv, far_atlas_size);
   texture_stack = blend_imagery(texture_stack, mid_texel, mid_uv, mid_atlas_size);
   texture_stack = blend_imagery(texture_stack, detail_texel, detail_uv, detail_atlas_size);
@@ -336,7 +500,8 @@ void main() {
                                       ultra_lateral_distance);
   ultra_blend *= ultra_texel.a > 0.01 ? 1.0 : 0.0;
   vec4 texel = (has_ultra_texture && ultra_texture_radius > 1.0)
-                 ? mix(texture_stack, ultra_texel, ultra_blend)
+                 ? (texture_stack.a <= 0.01 && ultra_texel.a > 0.01 ? ultra_texel :
+                    mix(texture_stack, ultra_texel, ultra_blend * ultra_texel.a))
                  : texture_stack;
   vec3 terrain_base = mix(terrain_tint, texel.rgb, texel.a * 0.88);
   vec3 globe_base = texel.a > 0.01 ? texel.rgb : v_color.rgb;
@@ -347,13 +512,35 @@ void main() {
                        ? mix(v_color.rgb, model_texel.rgb * v_color.rgb, model_texel.a)
                        : v_color.rgb;
   vec3 base = is_globe ? globe_base : (v_material > 0.5 ? object_base : terrain_base);
-  vec3 lit_color = base * clamp(light, vec3(0.0), vec3(1.45));
+  float normal_variance = dot(dFdx(normal), dFdx(normal)) + dot(dFdy(normal), dFdy(normal));
+  vec3 lit_color = (v_material > 0.5 && !is_globe)
+    ? material_lighting(base, normal, visibility, v_surface, 0.04, normal_variance) : base * max(light, vec3(0.0));
+  if (water_enabled) {
+    // Derivatives precede the spatially varying coastline branch.
+    float coverage = water_coverage();
+    vec2 wave_position = v_water_near * water_near_size * water_tile_meters * (6.28318530718 / (40075016.68557849 / 9784.0));
+    float footprint = max(length(dFdx(wave_position)), length(dFdy(wave_position))) * 367.0;
+    if ((v_material < 0.5 || is_globe) && coverage > 0.001)
+      lit_color = mix(lit_color, water_lighting(base, visibility, footprint), coverage);
+  }
   float alpha = (v_material > 0.5 && !is_globe) ? v_color.a : 1.0;
-  color = vec4(mix(lit_color, fog_color, fog_amount()), alpha);
+  if (atmosphere_enabled)
+    lit_color = atmosphere_surface(lit_color, camera_position, v_world_position, sun_direction);
+  float fog = atmosphere_enabled && is_globe ? 0.0 : fog_amount();
+  color = vec4(mix(lit_color, srgb_to_linear(fog_color), fog), alpha);
 }
 )GLSL";
 
-  return create_linked_program("Scene", vertex_source, fragment_source);
+  const GLuint program = create_linked_program("Scene", vertex_source, fragment_source, kAtmosphereGlsl);
+  if (program) {
+    // Different sampler types must use distinct units even while shadows are off.
+    GLint previous = 0;
+    glGetIntegerv(GL_CURRENT_PROGRAM, &previous);
+    glUseProgram(program);
+    glUniform1i(glGetUniformLocation(program, "shadow_texture"), 3);
+    glUseProgram(static_cast<GLuint>(previous));
+  }
+  return program;
 }
 
 GLuint
@@ -361,14 +548,30 @@ gworld_scene_view_create_shadow_program(void)
 {
   static const char *vertex_source = R"GLSL(
 layout(location = 0) in vec3 position;
+layout(location = 1) in vec2 texcoord;
+layout(location = 6) in vec4 vertex_color;
+layout(location = 7) in float material;
 uniform mat4 light_mvp;
+out vec2 v_uv;
+out float v_alpha;
+out float v_material;
 void main() {
   gl_Position = light_mvp * vec4(position, 1.0);
+  v_uv = texcoord;
+  v_alpha = vertex_color.a;
+  v_material = material;
 }
 )GLSL";
 
   static const char *fragment_source = R"GLSL(
+in vec2 v_uv;
+in float v_alpha;
+in float v_material;
+uniform sampler2D model_texture;
+uniform bool has_model_texture;
 void main() {
+  if (v_alpha < 0.5) discard;
+  if (has_model_texture && v_material > 2.5 && texture(model_texture, v_uv).a < 0.5) discard;
 }
 )GLSL";
 
@@ -434,8 +637,8 @@ void main() {
   float inner_glow = 1.0 - smoothstep(core_ratio, min(core_ratio * 2.4, 1.0), distance_from_center);
   float halo = pow(clamp(1.0 - distance_from_center, 0.0, 1.0), 2.2);
   float alpha = max(core, max(inner_glow * 0.42, halo * 0.28)) * intensity;
-  vec3 white_hot = vec3(1.0, 0.98, 0.86);
-  vec3 rgb = mix(sun_color, white_hot, clamp(core + inner_glow * 0.35, 0.0, 1.0));
+  vec3 white_hot = srgb_to_linear(vec3(1.0, 0.98, 0.86));
+  vec3 rgb = mix(srgb_to_linear(sun_color), white_hot, clamp(core + inner_glow * 0.35, 0.0, 1.0));
   color = vec4(rgb, alpha);
 }
 )GLSL";
@@ -473,12 +676,16 @@ void main() {
   vec4 far_world = inverse_mvp * vec4(v_ndc, 1.0, 1.0);
   far_world /= far_world.w;
   vec3 ray = normalize(far_world.xyz - camera_position);
+  if (atmosphere_enabled) {
+    color = vec4(atmosphere_sky(camera_position, ray, sun_direction), 1.0);
+    return;
+  }
   float up = ray.y;
 
   float sky_mix = smoothstep(-0.04, 0.82, up);
-  vec3 day_sky = mix(day_horizon_color, day_zenith_color, sky_mix);
-  vec3 twilight_sky = mix(twilight_color, day_sky, clamp(daylight, 0.0, 1.0));
-  vec3 sky = mix(night_color, twilight_sky, clamp(daylight + twilight * 0.75, 0.0, 1.0));
+  vec3 day_sky = mix(srgb_to_linear(day_horizon_color), srgb_to_linear(day_zenith_color), sky_mix);
+  vec3 twilight_sky = mix(srgb_to_linear(twilight_color), day_sky, clamp(daylight, 0.0, 1.0));
+  vec3 sky = mix(srgb_to_linear(night_color), twilight_sky, clamp(daylight + twilight * 0.75, 0.0, 1.0));
 
   vec2 ray_horizontal = ray.xz;
   vec2 sun_horizontal = sun_direction.xz;
@@ -492,8 +699,8 @@ void main() {
   float broad_lobe = pow(azimuth_alignment, 5.5);
   float core_lobe = pow(azimuth_alignment, 22.0);
   float glow = horizon_band * (broad_lobe * 0.45 + core_lobe * 0.75) * horizon_glow_strength;
-  vec3 amber = vec3(1.00, 0.35, 0.13);
-  vec3 rose = vec3(0.90, 0.18, 0.16);
+  vec3 amber = srgb_to_linear(vec3(1.00, 0.35, 0.13));
+  vec3 rose = srgb_to_linear(vec3(0.90, 0.18, 0.16));
   vec3 glow_color = mix(amber, rose, clamp(twilight * 0.65, 0.0, 1.0));
   sky = mix(sky, glow_color, clamp(glow, 0.0, 0.82));
 
@@ -501,5 +708,35 @@ void main() {
 }
 )GLSL";
 
-  return create_linked_program("Sky", vertex_source, fragment_source);
+  return create_linked_program("Sky", vertex_source, fragment_source, kAtmosphereGlsl);
+}
+
+GLuint
+gworld_scene_view_create_present_program(void)
+{
+  static const char *vertex_source = R"GLSL(
+out vec2 uv;
+void main() {
+  uv = vec2(float((gl_VertexID << 1) & 2), float(gl_VertexID & 2));
+  gl_Position = vec4(uv * 2.0 - 1.0, 0.0, 1.0);
+}
+)GLSL";
+  static const char *fragment_source = R"GLSL(
+in vec2 uv;
+uniform sampler2D scene_texture;
+uniform bool encode_srgb;
+out vec4 color;
+void main() {
+  vec3 linear = max(texture(scene_texture, uv).rgb, vec3(0.0));
+  // A neutral shoulder preserves midtones and hue while retaining highlights
+  // above display white in the floating-point render target.
+  float peak = max(linear.r, max(linear.g, linear.b));
+  if (peak > 0.8) {
+    float mapped = 0.8 + 0.2 * (1.0 - exp(-(peak - 0.8) / 0.2));
+    linear *= mapped / peak;
+  }
+  color = vec4(encode_srgb ? linear_to_srgb(linear) : linear, 1.0);
+}
+)GLSL";
+  return create_linked_program("Presentation", vertex_source, fragment_source);
 }

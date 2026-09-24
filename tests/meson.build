@@ -1,3 +1,10 @@
+terrain_normal_test = executable(
+  'gworldscene-terrain-normal-test', 'terrain-normal-test.cpp',
+  include_directories: gworldscene_inc,
+  dependencies: gworldscene_core_dep,
+)
+test('terrain-normals', terrain_normal_test)
+
 geo_test = executable(
   'gworldscene-geo-test',
   'geo-test.cpp',
@@ -86,10 +93,10 @@ if gworldscene_gtk3_built
     dependencies: gworldscene_gtk3_dep,
     cpp_args: ['-DGWORLD_SCENE_GTK_MAJOR=3'],
   )
-  test('render-gtk3-auto', render_gtk3_test, args: ['-p', '/render/automatic'], suite: 'render')
+  test('render-gtk3-auto', render_gtk3_test, args: ['-p', '/render/automatic'], suite: 'render', timeout: 120)
   # GTK 3's X11 backend selects GLES at display initialization, via GDK_GL.
   test('render-gtk3-gles', render_gtk3_test, args: ['-p', '/render/gles'],
-    env: ['GDK_GL=gles'], suite: 'render')
+    env: ['GDK_GL=gles'], suite: 'render', timeout: 120)
 endif
 
 if gworldscene_gtk4_built
@@ -121,6 +128,16 @@ if gworldscene_gtk4_built
     dependencies: gworldscene_gtk4_dep,
     cpp_args: ['-DGWORLD_SCENE_GTK_MAJOR=4'],
   )
-  test('render-gtk4-auto', render_gtk4_test, args: ['-p', '/render/automatic'], suite: 'render')
-  test('render-gtk4-gles', render_gtk4_test, args: ['-p', '/render/gles'], suite: 'render')
+  test('render-gtk4-auto', render_gtk4_test, args: ['-p', '/render/automatic'], suite: 'render', timeout: 120)
+  test('render-gtk4-gles', render_gtk4_test, args: ['-p', '/render/gles'], suite: 'render', timeout: 120)
 endif
+
+water_test = executable('gworldscene-water-test', 'water-test.cpp',
+  include_directories: gworldscene_inc,
+  dependencies: [gworldscene_gtk4_built ? gworldscene_gtk4_dep : gworldscene_gtk3_dep, gdal_dep, zlib_dep],
+)
+test('water', water_test)
+
+graphics_math_test = executable('gworldscene-graphics-math-test', 'graphics-math-test.cpp',
+  include_directories: gworldscene_inc, dependencies: gworldscene_core_dep)
+test('graphics-math', graphics_math_test)

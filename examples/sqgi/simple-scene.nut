@@ -169,7 +169,7 @@ function activate() {
   view.set_camera_orientation(72.0, -66.0)
   view.set_sun_time_of_day(15.25)
   view.set_fog_range(9000.0, 90000.0)
-  view.set_shadows_enabled(true)
+  view.set_shadows_enabled(false)
   view.set_terrain_normal_smoothing(0.92)
   add_scene_nodes(view)
 

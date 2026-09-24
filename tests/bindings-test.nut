@@ -25,6 +25,10 @@ view.set_free_camera_orientation(25, -10)
 view.set_sun_position(213, 37)
 view.set_fog_range(120, 3400)
 view.set_fog_color(0.13, 0.47, 0.81)
+view.set_atmosphere_density(0.6)
+view.set_atmosphere_haze(1.5)
+view.set_water_wave_strength(0.25)
+view.set_water_tile_url_template(null)
 
 local cube = view.add_cube(-35, 149, 600, 1, 2, 3)
 cube.set_position(-34, 148, 725)
@@ -32,6 +36,8 @@ cube.set_orientation_ned(450, 12, -7)
 cube.set_scale(1.25, 2.5, 3.75)
 cube.set_color(-0.2, 0.35, 1.2)
 cube.set_dimensions(11, 23, 37)
+cube.set_roughness(0.2)
+cube.set_metallic(0.8)
 local cylinder = view.add_cylinder(-35, 149, 600, 1, 2)
 cylinder.set_size(19, 43)
 local billboard = view.add_billboard("unused.png", -35, 149, 600)
@@ -52,6 +58,11 @@ label.set_size_limits(21, 153)
 label.set_reference_size(67, 3900)
 
 local cases = [
+  ["atmosphere density", @() [view.get_atmosphere_density()], [0.6]],
+  ["atmosphere haze", @() [view.get_atmosphere_haze()], [1.5]],
+  ["water waves", @() [view.get_water_wave_strength()], [0.25]],
+  ["material roughness", @() [cube.get_roughness()], [0.2]],
+  ["material metallic", @() [cube.get_metallic()], [0.8]],
   ["view camera", @() view.get_camera(), [-35, 149, 600]],
   ["view camera orientation", @() view.get_camera_orientation(), [25, -10]],
   ["view free position", @() view.get_free_camera_position(), [-35, 149, 600]],
