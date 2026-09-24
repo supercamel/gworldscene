@@ -783,6 +783,25 @@ test_render(gconstpointer data)
   check_water_mask_priority(area);
   check_atmosphere(area);
   check_water_loading(area, server, cache_dir);
+  // Exact effect comparisons require stable imagery. The native HTTP fixture
+  // deliberately starts with incomplete downloads, which may otherwise replace
+  // an atlas between the dry and wet frames under parallel/software rendering.
+  // The explicit context-recreation check above unrealized (and unmapped) the
+  // widget. External providers correctly suspend requests until it is mapped.
+  gtk_widget_map(GTK_WIDGET(view));
+  g_autoptr(GWorldSceneTileProvider) imagery = gworld_scene_tile_provider_new(0, 0, 256);
+  g_signal_connect(imagery, "tile-requested", G_CALLBACK(+[](
+    GWorldSceneTileProvider *provider, guint64 id, gint, gint, gint, gpointer) {
+    g_autoptr(GdkPixbuf) pixels = gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, 256, 256);
+    gdk_pixbuf_fill(pixels, 0x208020ff);
+    g_assert_true(gworld_scene_tile_provider_complete_tile(provider, id, pixels));
+  }), nullptr);
+  gworld_scene_view_set_tile_provider(view, imagery);
+  g_assert_true(wait_until([&]() {
+    // This fixture drives an offscreen framebuffer explicitly after recreation.
+    render_frame(area);
+    return gworld_scene_view_get_imagery_ready(view);
+  }));
   gworld_scene_view_set_shadows_enabled(view, FALSE);
   gworld_scene_view_set_water_wave_strength(view, 0);
   const auto dry = render_frame(area);

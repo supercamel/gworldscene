@@ -31,6 +31,7 @@ zlib_dep = dependency('zlib')
 
 gworldscene_core_deps = [
   gobject_dep,
+  gdk_pixbuf_dep,
   glm_dep,
 ]
 
@@ -38,15 +39,19 @@ gworldscene_inc = include_directories('.')
 
 gworldscene_core_headers = [
   'gworld-scene-node.h',
+  'gworld-scene-tile-provider.h',
 ]
 
 gworldscene_headers = [
   'gworldscene.h',
   'gworld-scene-node.h',
+  'gworld-scene-tile-provider.h',
   'gworld-scene-view.h',
 ]
 
 gworldscene_core_sources = [
+  'gworld-scene-tile-provider.cpp',
+  'gworld-scene-tile-provider-private.h',
   'gworld-scene-atmosphere.cpp',
   'gworld-scene-atmosphere-private.h',
   'gworld-scene-camera.cpp',
@@ -109,7 +114,7 @@ pkg.generate(
   subdirs: [],
   extra_cflags: ['-I' + (gobject_introspection_includedir / ('gworldscene-core-' + gworldscene_api_version))],
   install_dir: gworldscene_pkgconfigdir,
-  requires: ['gobject-2.0'],
+  requires: ['gobject-2.0', 'gdk-pixbuf-2.0'],
   version: meson.project_version(),
 )
 
@@ -162,13 +167,13 @@ if gtk3_dep.found()
   )
 
   gworldscene_gtk3_gir = gnome.generate_gir(
-    gworldscene_gtk3_lib,
+    [gworldscene_core_lib, gworldscene_gtk3_lib],
     sources: gworldscene_headers,
     namespace: 'GWorldSceneGtk3',
     nsversion: gworldscene_api_version,
     symbol_prefix: 'gworld',
     identifier_prefix: 'GWorld',
-    includes: ['Gtk-3.0', 'GObject-2.0'],
+    includes: ['Gtk-3.0', 'GObject-2.0', 'GdkPixbuf-2.0'],
     export_packages: 'gworldscene-gtk3-' + gworldscene_api_version,
     header: 'gworldscene/gworldscene.h',
     extra_args: [
@@ -277,13 +282,13 @@ if gtk4_dep.found()
   )
 
   gworldscene_gtk4_gir = gnome.generate_gir(
-    gworldscene_gtk4_lib,
+    [gworldscene_core_lib, gworldscene_gtk4_lib],
     sources: gworldscene_headers,
     namespace: 'GWorldSceneGtk4',
     nsversion: gworldscene_api_version,
     symbol_prefix: 'gworld',
     identifier_prefix: 'GWorld',
-    includes: ['Gtk-4.0', 'GObject-2.0'],
+    includes: ['Gtk-4.0', 'GObject-2.0', 'GdkPixbuf-2.0'],
     export_packages: 'gworldscene-gtk4-' + gworldscene_api_version,
     header: 'gworldscene/gworldscene.h',
     extra_args: [

@@ -79,6 +79,8 @@ Terrain, map tiles, and cache:
   ``gworld_scene_view_get_terrain_server()``,
   ``gworld_scene_view_set_map_tile_url_template()``,
   ``gworld_scene_view_get_map_tile_url_template()``,
+  ``gworld_scene_view_set_tile_provider()``,
+  ``gworld_scene_view_get_imagery_ready()``,
   ``gworld_scene_view_set_cache_directory()``,
   ``gworld_scene_view_get_cache_directory()``,
   ``gworld_scene_view_set_cache_enabled()``,
@@ -329,6 +331,34 @@ Methods:
   ``gworld_scene_text_label_node_set_altitude_mode()``,
   ``gworld_scene_text_label_node_get_altitude_mode()``.
 
+``GWorldSceneTileProvider``
+---------------------------
+
+An application imagery source in the shared core library, exposed by both GTK
+namespaces. Attach it to one view with ``gworld_scene_view_set_tile_provider()``.
+See :ref:`application-imagery` for threading, ownership, and resource limits.
+
+Creation and lifetime:
+  ``gworld_scene_tile_provider_new(minimum_zoom, maximum_zoom, tile_size)``,
+  ``gworld_scene_tile_provider_clear()``, ``gworld_scene_tile_provider_close()``.
+
+Completion and demand:
+  ``gworld_scene_tile_provider_complete_tile()`` supplies exact-level pixels;
+  ``gworld_scene_tile_provider_complete_annotated()`` also accepts regional
+  ancestors and an opaque attribution ID. ``gworld_scene_tile_provider_dup_demand()``
+  returns an owned string array; C callers release it with ``g_strfreev()``.
+
+State getters (all prefixed ``gworld_scene_tile_provider_``):
+  ``get_min_zoom()``, ``get_max_zoom()``, ``get_tile_size()``, ``get_tile_count()``,
+  ``get_ready_count()``, ``get_failed_count()``, ``get_held_count()``,
+  ``get_worker_count()``, ``get_annotation_count()``, ``get_overflow_count()``,
+  ``get_unsupported_count()``, ``get_reduced_detail()``, ``get_closed()``.
+
+Signals:
+  ``tile-requested(request_id, zoom, x, y)``, ``tile-released(request_id)``,
+  ``annotation-released(annotation)``, ``demand-changed(revision)``,
+  ``coverage-changed()``, ``changed()``, ``drained()``.
+
 Binding notes
 -------------
 
@@ -351,10 +381,11 @@ SQGI classes:
   ``GWorldSceneGtk4.SceneTextLabelNode``. Use ``GWorldSceneGtk3`` instead for
   GTK 3 builds.
 
-Some generated Vala getters for multiple ``double*`` outputs currently lack
-``out`` annotations in the generated VAPI. Prefer the setters in new examples,
-or use the C API directly for exhaustive getter tests until the annotations are
-tightened.
+Scalar output getters expose ``out`` parameters in C/Vala and multiple results
+in SQGI. Both generated GIRs are checked for direction, ownership and optionality.
+``SceneTileProvider`` is available alongside ``SceneView`` in each namespace;
+the provider's nullable completions, demand arrays and signals are covered by
+GIR checks and SQGI runtime tests.
 
 Full public C declarations
 --------------------------
@@ -378,4 +409,10 @@ The complete C declarations are included here as the final source of truth.
 ~~~~~~~~~~~~~~~~~~~~~~~
 
 .. literalinclude:: ../src/gworld-scene-node.h
+   :language: c
+
+``gworld-scene-tile-provider.h``
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. literalinclude:: ../src/gworld-scene-tile-provider.h
    :language: c

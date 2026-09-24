@@ -141,3 +141,43 @@ test('water', water_test)
 graphics_math_test = executable('gworldscene-graphics-math-test', 'graphics-math-test.cpp',
   include_directories: gworldscene_inc, dependencies: gworldscene_core_dep)
 test('graphics-math', graphics_math_test)
+
+provider_test = executable('gworldscene-tile-provider-test', 'tile-provider-test.cpp',
+  include_directories: gworldscene_inc, dependencies: gworldscene_core_dep)
+test('tile-provider', provider_test, suite: 'imagery')
+
+if gworldscene_gtk3_built
+  imagery_gtk3_test = executable('gworldscene-imagery-gtk3-test', 'imagery-scene-test.cpp',
+    include_directories: gworldscene_inc, dependencies: gworldscene_gtk3_dep,
+    cpp_args: ['-DGWORLD_SCENE_GTK_MAJOR=3'])
+  test('imagery-gtk3', imagery_gtk3_test, suite: 'imagery', timeout: 120)
+  test('imagery-gtk3-gles', imagery_gtk3_test,
+    env: ['GDK_GL=gles', 'GWORLD_SCENE_TEST_GLES=1'], suite: 'imagery', timeout: 120)
+  test('imagery-gtk3-headless', python,
+    args: [files('headless-imagery-test.py'), imagery_gtk3_test],
+    env: bindings_env, suite: 'imagery')
+  if sqgi.found()
+    test('provider-bindings-gtk3', sqgi,
+      args: [files('provider-bindings-test.nut'), '3', bindings_dir],
+      depends: gworldscene_gtk3_gir, env: bindings_env, protocol: 'tap',
+      suite: ['bindings', 'imagery'], timeout: 30)
+  endif
+endif
+
+if gworldscene_gtk4_built
+  imagery_gtk4_test = executable('gworldscene-imagery-gtk4-test', 'imagery-scene-test.cpp',
+    include_directories: gworldscene_inc, dependencies: gworldscene_gtk4_dep,
+    cpp_args: ['-DGWORLD_SCENE_GTK_MAJOR=4'])
+  test('imagery-gtk4', imagery_gtk4_test, suite: 'imagery', timeout: 120)
+  test('imagery-gtk4-gles', imagery_gtk4_test,
+    env: ['GWORLD_SCENE_TEST_GLES=1'], suite: 'imagery', timeout: 120)
+  test('imagery-gtk4-headless', python,
+    args: [files('headless-imagery-test.py'), imagery_gtk4_test],
+    env: bindings_env, suite: 'imagery')
+  if sqgi.found()
+    test('provider-bindings-gtk4', sqgi,
+      args: [files('provider-bindings-test.nut'), '4', bindings_dir],
+      depends: gworldscene_gtk4_gir, env: bindings_env, protocol: 'tap',
+      suite: ['bindings', 'imagery'], timeout: 30)
+  endif
+endif

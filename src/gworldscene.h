@@ -2,6 +2,7 @@
 #define GWORLD_SCENE_H
 
 #include "gworld-scene-node.h"
+#include "gworld-scene-tile-provider.h"
 #include "gworld-scene-view.h"
 
 #endif /* GWORLD_SCENE_H */

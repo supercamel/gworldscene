@@ -1,6 +1,51 @@
 Examples
 ========
 
+Application-supplied imagery
+----------------------------
+
+This C provider generates a solid tile without network or disk access. Replace
+the pixel producer with the application's asynchronous loader, delivering the
+result on the provider's creating GTK thread. Published pixels must remain
+immutable. Request identities can retire during loading, so an asynchronous
+loader must handle completion returning ``FALSE`` and cancel work when it
+receives ``tile-released``.
+
+.. code-block:: c
+
+   static void
+   supply_tile(GWorldSceneTileProvider *provider, guint64 request_id,
+               gint zoom, gint x, gint y, gpointer data)
+   {
+     g_autoptr(GdkPixbuf) image =
+       gdk_pixbuf_new(GDK_COLORSPACE_RGB, TRUE, 8, 256, 256);
+     gdk_pixbuf_fill(image, 0x307040ff);
+     gworld_scene_tile_provider_complete_tile(provider, request_id, image);
+   }
+
+   /* Retain this application reference until shutdown. The view also owns one. */
+   GWorldSceneTileProvider *provider = gworld_scene_tile_provider_new(0, 22, 256);
+   g_signal_connect(provider, "tile-requested", G_CALLBACK(supply_tile), NULL);
+   gworld_scene_view_set_tile_provider(view, provider);
+
+   /* Shutdown: retire the source while keeping the creating context running. */
+   gworld_scene_view_set_tile_provider(view, NULL);
+   gworld_scene_tile_provider_close(provider);
+   g_object_unref(provider);
+
+The example has no application callback state to release. A transport/cache
+owner should connect ``drained`` before closing and retain its callback state
+until that signal. Annotated imagery also retains credit records until
+``annotation-released``; see :ref:`application-imagery`.
+
+``tests/provider-bindings-test.nut`` provides a complete SQGI example of demand
+signals, annotated completion, retry, GPU readiness, and shutdown for either
+GTK namespace. Run its registered tests against the build's own typelibs:
+
+.. code-block:: sh
+
+   xvfb-run -a meson test -C builddir provider-bindings-gtk3 provider-bindings-gtk4
+
 Minimal application
 -------------------
 

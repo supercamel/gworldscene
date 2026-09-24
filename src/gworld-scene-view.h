@@ -4,6 +4,7 @@
 #include <gtk/gtk.h>
 
 #include "gworld-scene-node.h"
+#include "gworld-scene-tile-provider.h"
 
 G_BEGIN_DECLS
 
@@ -161,6 +162,27 @@ void gworld_scene_view_set_map_tile_url_template(GWorldSceneView *self,
                                                  const char *url_template);
 
 const char *gworld_scene_view_get_map_tile_url_template(GWorldSceneView *self);
+
+/**
+ * gworld_scene_view_set_tile_provider:
+ * @self: a scene view
+ * @provider: (nullable) (transfer none): application imagery provider for this view
+ *
+ * Use application-supplied imagery, bypassing native imagery HTTP/disk access.
+ * Null leaves a neutral imagery background. The old provider is cleared, but
+ * worker-held leases may release later. Terrain and water retain independent
+ * settings. Calling set_map_tile_url_template explicitly returns to legacy mode.
+ */
+void gworld_scene_view_set_tile_provider(GWorldSceneView *self, GWorldSceneTileProvider *provider);
+
+/**
+ * gworld_scene_view_get_imagery_ready:
+ * @self: a scene view
+ *
+ * Returns: whether external visible coverage is complete and all requested
+ * atlases have reached the active GPU textures for this source revision
+ */
+gboolean gworld_scene_view_get_imagery_ready(GWorldSceneView *self);
 
 void gworld_scene_view_set_cache_directory(GWorldSceneView *self,
                                            const char *cache_directory);

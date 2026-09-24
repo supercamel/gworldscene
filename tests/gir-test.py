@@ -2,7 +2,8 @@
 import sys
 import xml.etree.ElementTree as ET
 
-NS = {"gi": "http://www.gtk.org/introspection/core/1.0"}
+NS = {"gi": "http://www.gtk.org/introspection/core/1.0",
+      "glib": "http://www.gtk.org/introspection/glib/1.0"}
 C = "{http://www.gtk.org/introspection/c/1.0}"
 OUTPUTS = {
     "gworld_scene_node_get_position": ["latitude", "longitude", "altitude_amsl"],
@@ -64,7 +65,44 @@ def check(path):
     assert params[2].get("caller-allocates") == "0"
     assert params[2].get("transfer-ownership") == "none"
     assert params[2].get("optional", "0") == "0"
-    print(f"{path}: all {len(OUTPUTS)} getter contracts and terrain sampling passed")
+
+    provider = root.find("gi:namespace/gi:class[@name='SceneTileProvider']", NS)
+    assert provider is not None
+    libraries = root.find("gi:namespace", NS).get("shared-library").split(",")
+    assert "gworldscene-core" in libraries[0], libraries
+    constructor = provider.find("gi:constructor[@name='new']/gi:return-value", NS)
+    assert constructor.get("transfer-ownership") == "full"
+    assert constructor.get("nullable") == "1"
+    demand = methods["gworld_scene_tile_provider_dup_demand"].find("gi:return-value", NS)
+    assert demand.get("transfer-ownership") == "full"
+    array = demand.find("gi:array", NS)
+    assert array.get("zero-terminated", "1") == "1"
+    assert array.find("gi:type", NS).get("name") == "utf8"
+    for symbol, names, nullable in [
+        ("gworld_scene_tile_provider_complete_tile", ["request_id", "image"], {"image"}),
+        ("gworld_scene_tile_provider_complete_annotated",
+         ["request_id", "image", "source_zoom", "annotation"], {"image", "annotation"}),
+        ("gworld_scene_view_set_tile_provider", ["provider"], {"provider"}),
+    ]:
+        method = methods[symbol]
+        assert method.get("introspectable", "1") == "1", symbol
+        params = method.findall("gi:parameters/gi:parameter", NS)
+        assert [p.get("name") for p in params] == names, symbol
+        for param in params:
+            assert param.get("direction", "in") == "in", symbol
+            assert param.get("transfer-ownership") == "none", symbol
+            assert (param.get("nullable", "0") == "1") == (param.get("name") in nullable), symbol
+    for name, types in {
+        "tile-requested": ["guint64", "gint", "gint", "gint"],
+        "tile-released": ["guint64"], "annotation-released": ["utf8"],
+        "demand-changed": ["guint64"], "drained": [],
+        "coverage-changed": [], "changed": [],
+    }.items():
+        signal = provider.find(f"glib:signal[@name='{name}']", NS)
+        assert signal is not None, name
+        params = signal.findall("gi:parameters/gi:parameter/gi:type", NS)
+        assert [p.get("name") for p in params] == types, name
+    print(f"{path}: all {len(OUTPUTS)} getter contracts, terrain sampling, and imagery provider contracts passed")
 
 
 for path in sys.argv[1:]:

@@ -14,6 +14,72 @@ borrowed handles: keep them while you want to modify a node, but do not unref
 them. Remove nodes with ``gworld_scene_view_remove_node()`` or clear them all
 with ``gworld_scene_view_clear_nodes()``.
 
+.. _application-imagery:
+
+Application-supplied imagery
+----------------------------
+
+Attach a ``GWorldSceneTileProvider`` with ``set_tile_provider()`` when the
+application owns imagery transport, credentials, caching, or offline data.
+This bypasses the view's native imagery HTTP and disk paths. Terrain and water
+keep their independent settings. Passing ``NULL`` selects a neutral imagery
+background; explicitly calling ``set_map_tile_url_template()`` restores URL
+imagery. Hidden external views make no new requests and retire their imagery
+references; mapping them again requests fresh coverage.
+
+Create one provider per view on the GTK thread and call its public methods on
+that thread. Deferred notifications run on its creating main context, which
+must continue to be iterated until cleanup finishes. Connect handlers before
+attaching the provider. ``tile-requested(id, zoom, x, y)`` asks for an immutable
+RGB/RGBA, 8-bit ``GdkPixbuf`` of the provider's declared size, 256 or 512 pixels
+square. Complete each live identity once, using ``complete_tile()`` or
+``complete_annotated()``. ``NULL`` pixels mean unavailable; malformed dimensions
+also mark the request unavailable. Stale, duplicate, and closed identities are
+rejected. ``clear()`` retires the current requests and allows retry with new IDs.
+
+Zoom limits are inclusive, from 0 through 22. Demand above the maximum uses
+ancestors and reports reduced detail; demand below the minimum is unsupported.
+``dup_demand()`` returns all accepted coordinates as a newly allocated,
+null-terminated array of ``z/x/y`` strings, including queued requests.
+``demand-changed(revision)`` announces changes before dispatching requests, so
+the application can prepare regional metadata. The set is sorted numerically
+by zoom, X, and Y; X wraps at the dateline.
+
+``complete_annotated(id, image, source_zoom, annotation)`` can supply an ancestor
+of the requested cell. Its pixels are sampled only inside that cell, even if
+the source image covers a larger area. The source zoom must lie between the
+provider minimum and the requested zoom. This permits regional resolution
+limits without expanding the region for which the application supplied data.
+
+Attribution is separate from pixel ownership. An annotation is an opaque,
+case-sensitive ID of 1--128 printable ASCII bytes without spaces; ``NULL`` means
+no annotation. Publish its credit in the application's UI before completing
+the tile. Reuse an ID only for the same immutable credit record.
+``tile-released(id)`` ends ownership of the original pixels, but derived atlas
+pixels may still be visible. Keep the credit until
+``annotation-released(id)``: atlas workers, uploads, active GPU textures, and the
+last presented frame retain it independently. Successful replacement retires
+presentation references after GTK paints; hiding or destroying the view also
+retires them. Ongoing workers finish releasing asynchronously.
+
+When retiring a provider, detach it, call ``close()``, and keep application
+callback state alive until ``drained``. This signal can fire during ``close()``
+when nothing remains, so connect first. Closed providers cannot be reopened.
+Keep iterating the creating context while waiting for deferred releases.
+
+The provider limits unfinished dispatched requests to 16 and retained request
+records to 1024, including retired records still held by workers. Overflow and
+unsupported counters expose incomplete coverage. Source pixels require CPU
+memory in addition to the view's GPU texture budget: 1024 distinct 512-pixel
+RGBA images alone occupy about 1 GiB. Applications should bound their own
+transport and cache memory as well.
+
+``get_imagery_ready()`` becomes true only when accepted coverage is complete
+and the current requested atlases have reached active GPU textures, with no
+overflow or unsupported demand. It can be true for reduced-detail ancestors.
+It reports upload readiness; applications requiring a presented frame should
+observe the frame clock's ``after-paint`` phase.
+
 Coordinates
 -----------
 

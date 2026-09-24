@@ -3,6 +3,7 @@
 #endif
 
 #include "gworld-scene-view.h"
+#include "gworld-scene-tile-provider-private.h"
 #include "gworld-scene-camera-private.h"
 #include "gworld-scene-atmosphere-private.h"
 #include "gworld-scene-geo-private.h"
@@ -37,6 +38,7 @@
 #include <zlib.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -203,6 +205,7 @@ struct TextureCapacityConfig {
 };
 
 struct TextureUploadSlot {
+  gworld_scene::ImageryAnnotations annotations;
   GLuint texture = 0;
   int width = 0;
   int height = 0;
@@ -331,6 +334,13 @@ struct AttributionLink {
 };
 
 struct GWorldSceneViewState {
+  // Independent of source pixels: copied GPU atlases still need attribution.
+  std::array<gworld_scene::ImageryAnnotations, 6> active_annotations;
+  gworld_scene::ImageryAnnotations presented_annotations;
+  gworld_scene::ImageryAnnotations next_presented_annotations;
+  bool presentation_pending = false;
+  GdkFrameClock *presentation_clock = nullptr;
+  gulong presentation_handler = 0;
   std::mutex mutex;
 
   double latitude = -35.0024;
@@ -366,6 +376,11 @@ struct GWorldSceneViewState {
 
   std::string terrain_server = kDefaultTerrainServer;
   std::string map_tile_template = kDefaultMapTileTemplate;
+  GWorldSceneTileProvider *tile_provider = nullptr;
+  gulong tile_provider_changed = 0;
+  gulong tile_provider_coverage = 0;
+  bool external_imagery = false;
+  bool disposing = false;
   std::string cache_directory;
   bool cache_enabled = true;
   guint texture_memory_budget_mib = kDefaultTextureMemoryBudgetMib;
@@ -568,9 +583,12 @@ struct TextureAtlasBuildJob {
   std::string pending_key;
   guint64 source_revision = 0;
   gint64 queued_at_us = 0;
+  bool external = false;
+  gworld_scene::ImagerySnapshot imagery;
 };
 
 struct TextureAtlasBuildResult {
+  gworld_scene::ImageryAnnotations annotations;
   AtlasRange range;
   TextureLayer layer = TextureLayer::Detail;
   std::string pending_key;
@@ -6705,6 +6723,10 @@ delete_gl_resources(GWorldSceneViewState *state)
   state->mesh_dirty = true;
   state->globe_mesh_dirty = true;
   state->model_texture_dirty = true;
+  for (auto &annotations : state->active_annotations) annotations.clear();
+  state->presented_annotations.clear();
+  state->next_presented_annotations.clear();
+  state->presentation_pending = false;
   // Atlas pixels are released after upload, so rebuild them after context recreation.
   for (TextureLayer layer : {TextureLayer::Ultra, TextureLayer::Detail,
                              TextureLayer::Mid, TextureLayer::Far, TextureLayer::Base, TextureLayer::Globe}) {
@@ -6991,6 +7013,7 @@ upload_atlas_texture_chunk_if_needed(GWorldSceneViewState *state,
     }
     upload = TextureUploadSlot();
     active_range = AtlasRange();
+    state->active_annotations[static_cast<unsigned>(layer)].clear();
     dirty = false;
     return false;
   }
@@ -7028,6 +7051,7 @@ upload_atlas_texture_chunk_if_needed(GWorldSceneViewState *state,
     upload.uploaded_rows = 0;
     upload.key.clear();
     upload.range = AtlasRange();
+    upload.annotations.clear();
     dirty = false;
     return false;
   }
@@ -7137,6 +7161,7 @@ upload_atlas_texture_chunk_if_needed(GWorldSceneViewState *state,
   upload.texture = 0;
   active_range = upload.range;
   loaded_key = upload.key;
+  state->active_annotations[static_cast<unsigned>(layer)] = std::move(upload.annotations);
   upload = TextureUploadSlot();
   pixels.clear();
   dirty = false;
@@ -7757,6 +7782,7 @@ texture_atlas_build_thread(GTask *task, gpointer source_object, gpointer task_da
   result->width = width;
   result->height = height;
 
+  std::unordered_set<gworld_scene::ImageryAnnotation *> used_annotations;
   for (int ty = job->range.y_min; ty <= job->range.y_max; ++ty) {
     for (int tx = job->range.x_min; tx <= job->range.x_max; ++tx) {
       if (cancellable != nullptr && g_cancellable_is_cancelled(cancellable)) {
@@ -7772,6 +7798,16 @@ texture_atlas_build_thread(GTask *task, gpointer source_object, gpointer task_da
       }
 
       TileCoord tile{job->range.z, gworld_scene::wrap_tile_x(tx, job->range.z), ty};
+      std::vector<unsigned char> tile_pixels;
+      if (job->external) {
+        std::shared_ptr<gworld_scene::ImageryAnnotation> annotation;
+        if (!gworld_scene::imagery_sample(job->imagery, tile.z, tile.x, tile.y, tile_pixels, &annotation)) {
+          ++result->missing_count;
+          continue;
+        }
+        if (annotation && used_annotations.insert(annotation.get()).second)
+          result->annotations.push_back(std::move(annotation));
+      } else {
       const std::string uri = texture_uri_from_template(job->texture_template, tile);
       const std::string path = texture_cache_path(job->cache_dir, uri, job->texture_template, tile);
       const gint64 file_check_start_us = perf_now_us();
@@ -7782,7 +7818,6 @@ texture_atlas_build_thread(GTask *task, gpointer source_object, gpointer task_da
       }
       result->file_check_duration_us += perf_now_us() - file_check_start_us;
 
-      std::vector<unsigned char> tile_pixels;
       std::string load_error;
       const gint64 decode_start_us = perf_now_us();
       if (!load_image_rgba_256(path, tile_pixels, &load_error)) {
@@ -7798,6 +7833,7 @@ texture_atlas_build_thread(GTask *task, gpointer source_object, gpointer task_da
         continue;
       }
       result->decode_duration_us += perf_now_us() - decode_start_us;
+      }
 
       if (cancellable != nullptr && g_cancellable_is_cancelled(cancellable)) {
         texture_atlas_build_result_free(result);
@@ -7935,6 +7971,7 @@ texture_atlas_build_done(GObject *source_object, GAsyncResult *result, gpointer 
       upload.uploaded_rows = 0;
       upload.key = range_key;
       upload.range = atlas_result->range;
+      upload.annotations = std::move(atlas_result->annotations);
       // Cache the empty result too, until a download invalidates it. Otherwise
       // queue_scene_requests immediately starts the same build again.
       if (pixels.empty())
@@ -8038,6 +8075,7 @@ request_texture_atlas_build(GWorldSceneView *self, const AtlasRange &range, Text
     wanted_key.clear();
     pending_key.clear();
     active_range = AtlasRange();
+    texture_layer_upload_slot(state, layer).annotations.clear();
     return;
   }
 
@@ -8101,6 +8139,7 @@ request_texture_atlas_build(GWorldSceneView *self, const AtlasRange &range, Text
       upload.uploaded_rows = 0;
       upload.key.clear();
       upload.range = AtlasRange();
+      upload.annotations.clear();
     }
     if (!pending_layer_key.empty()) {
       if (pending_layer_key == pending_key) {
@@ -8160,6 +8199,9 @@ request_texture_atlas_build(GWorldSceneView *self, const AtlasRange &range, Text
   job->pending_key = pending_key;
   job->source_revision = source_revision;
   job->queued_at_us = queued_at_us;
+  job->external = state->external_imagery;
+  if (job->external && state->tile_provider != nullptr)
+    job->imagery = gworld_scene::imagery_snapshot(state->tile_provider);
 
   GTask *task = g_task_new(self, cancellable, texture_atlas_build_done, nullptr);
   g_task_set_return_on_cancel(task, TRUE);
@@ -8280,10 +8322,27 @@ flush_pending_texture_refresh_locked(GWorldSceneViewState *state, gint64 now_us)
   const bool cooldown_elapsed =
     state->last_texture_refresh_us == 0 ||
     now_us - state->last_texture_refresh_us >= kTextureAtlasRefreshMinIntervalUs;
-  if (pending_textures > 0 && !cooldown_elapsed)
+  if ((pending_textures > 0 || state->external_imagery) && !cooldown_elapsed)
     return false;
 
   clear_loaded_texture_keys_locked(state);
+  if (state->external_imagery) {
+    // An older snapshot must not replace pixels supplied since its capture.
+    cancel_all_texture_builds_locked(state);
+    ++state->texture_source_revision;
+    for (auto layer : {TextureLayer::Ultra, TextureLayer::Detail, TextureLayer::Mid,
+                       TextureLayer::Far, TextureLayer::Base, TextureLayer::Globe}) {
+      texture_layer_pixels(state, layer).clear();
+      texture_layer_dirty(state, layer) = false;
+      auto &upload = texture_layer_upload_slot(state, layer);
+      upload.key.clear();
+      upload.uploaded_rows = 0;
+      upload.height = 0;
+      upload.width = 0;
+      upload.range = AtlasRange();
+      upload.annotations.clear();
+    }
+  }
   state->texture_refresh_pending = false;
   state->last_texture_refresh_us = now_us;
   return true;
@@ -8860,6 +8919,10 @@ queue_scene_requests(GWorldSceneView *self)
   const gint64 request_start_us = perf_now_us();
   auto *state = get_state(self);
 
+  if (state->disposing || (state->external_imagery && !gtk_widget_get_mapped(GTK_WIDGET(self))))
+    return;
+  const bool external_imagery = state->external_imagery;
+
   double latitude = 0.0;
   double longitude = 0.0;
   double altitude = 0.0;
@@ -9109,6 +9172,9 @@ queue_scene_requests(GWorldSceneView *self)
     }
     terrain_queue_ms = perf_elapsed_ms(terrain_start_us);
 
+  }
+
+  if (cache_enabled && !external_imagery) {
     const gint64 texture_start_us = perf_now_us();
     std::unordered_set<std::string> wanted_texture_pending_keys;
     std::unordered_set<std::string> candidate_texture_keys;
@@ -9253,6 +9319,27 @@ queue_scene_requests(GWorldSceneView *self)
     }
   }
 
+  if (external_imagery && state->tile_provider != nullptr) {
+    // Take a strong reference across application release/coverage callbacks.
+    g_autoptr(GWorldSceneTileProvider) provider =
+      GWORLD_SCENE_TILE_PROVIDER(g_object_ref(state->tile_provider));
+    std::vector<gworld_scene::ImageryTile> wanted;
+    auto add = [&](const AtlasRange &range) {
+      if (!range.valid()) return;
+      for (int y = range.y_min; y <= range.y_max; ++y)
+        for (int x = range.x_min; x <= range.x_max; ++x)
+          wanted.push_back({range.z, x, y});
+    };
+    if (include_terrain) {
+      add(base_atlas_range); add(ultra_atlas_range); add(far_atlas_range);
+      add(mid_atlas_range); add(atlas_range);
+    }
+    if (render_globe) add(globe_range);
+    gworld_scene::imagery_update(provider, wanted);
+    if (state->disposing || state->tile_provider != provider ||
+        !gtk_widget_get_mapped(GTK_WIDGET(self))) return;
+  }
+
   {
     const gint64 mesh_start_us = perf_now_us();
     // Render the available terrain and scene immediately; each completed tile
@@ -9284,10 +9371,11 @@ queue_scene_requests(GWorldSceneView *self)
     request_texture_atlas_build(self, mid_atlas_range, TextureLayer::Mid);
     request_texture_atlas_build(self, atlas_range, TextureLayer::Detail);
   } else {
-    request_texture_atlas_build(self, AtlasRange(), TextureLayer::Ultra);
+    for (auto layer : {TextureLayer::Ultra, TextureLayer::Base, TextureLayer::Far,
+                       TextureLayer::Mid, TextureLayer::Detail})
+      request_texture_atlas_build(self, AtlasRange(), layer);
   }
-  if (render_globe)
-    request_texture_atlas_build(self, globe_range, TextureLayer::Globe);
+  request_texture_atlas_build(self, render_globe ? globe_range : AtlasRange(), TextureLayer::Globe);
   atlas_request_ms = perf_elapsed_ms(atlas_start_us);
   const double total_ms = perf_elapsed_ms(request_start_us);
   if (perf_enabled() &&
@@ -9532,6 +9620,12 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
       frame_gap_ms = perf_elapsed_ms(state->last_render_start_us, frame_start_us);
     state->last_render_start_us = frame_start_us;
     frame_number = ++state->perf_frame_counter;
+    // Invalidation can happen between frames. Keep credits for the previous
+    // framebuffer until this replacement frame will stop using its images.
+    for (auto layer : {TextureLayer::Ultra, TextureLayer::Detail, TextureLayer::Mid,
+                       TextureLayer::Far, TextureLayer::Base, TextureLayer::Globe})
+      if (!texture_layer_active_range(state, layer).valid())
+        state->active_annotations[static_cast<unsigned>(layer)].clear();
     latitude = state->latitude;
     longitude = state->longitude;
     altitude = std::max(25.0, state->altitude_amsl);
@@ -9927,6 +10021,19 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
     }
   }
 
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    // GTK may still present the previous framebuffer after this callback.
+    // Publish its successor only at the frame clock's after-paint boundary.
+    state->next_presented_annotations.clear();
+    state->presentation_pending = true;
+    for (auto layer : {TextureLayer::Ultra, TextureLayer::Detail, TextureLayer::Mid,
+                       TextureLayer::Far, TextureLayer::Base, TextureLayer::Globe}) {
+      if (!texture_layer_active_range(state, layer).valid()) continue;
+      const auto &annotations = state->active_annotations[static_cast<unsigned>(layer)];
+      state->next_presented_annotations.insert(state->next_presented_annotations.end(), annotations.begin(), annotations.end());
+    }
+  }
   if (more_texture_uploads_pending)
     gtk_widget_queue_draw(GTK_WIDGET(area));
 
@@ -10590,14 +10697,93 @@ gworld_scene_view_get_property(GObject *object,
 }
 
 static void
+on_view_after_paint(GdkFrameClock *, gpointer data)
+{
+  auto *state = get_state(GWORLD_SCENE_VIEW(data));
+  std::lock_guard<std::mutex> lock(state->mutex);
+  if (!state->presentation_pending) return;
+  state->presented_annotations = std::move(state->next_presented_annotations);
+  state->presentation_pending = false;
+}
+
+static void
+on_view_map(GtkWidget *widget, gpointer)
+{
+  auto *state = get_state(GWORLD_SCENE_VIEW(widget));
+  auto *clock = gtk_widget_get_frame_clock(widget);
+  if (clock && !state->presentation_clock) {
+    state->presentation_clock = GDK_FRAME_CLOCK(g_object_ref(clock));
+    state->presentation_handler = g_signal_connect(clock, "after-paint", G_CALLBACK(on_view_after_paint), widget);
+  }
+  ensure_scene_requests_scheduled(GWORLD_SCENE_VIEW(widget), 20);
+}
+
+static void
+on_view_unmap(GtkWidget *widget, gpointer)
+{
+  auto *self = GWORLD_SCENE_VIEW(widget);
+  auto *state = get_state(self);
+  if (state->presentation_clock) {
+    g_signal_handler_disconnect(state->presentation_clock, state->presentation_handler);
+    g_clear_object(&state->presentation_clock);state->presentation_handler = 0;
+  }
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->external_imagery)
+      cancel_all_texture_builds_locked(state);
+    // A switch to URL imagery can precede unmapping without another paint.
+    // Retire the previous external frame's credits regardless of the new mode.
+    for (auto &annotations : state->active_annotations) annotations.clear();
+    state->presented_annotations.clear();
+    state->next_presented_annotations.clear();
+    state->presentation_pending = false;
+    for (auto layer : {TextureLayer::Ultra, TextureLayer::Detail, TextureLayer::Mid,
+                       TextureLayer::Far, TextureLayer::Base, TextureLayer::Globe})
+      texture_layer_upload_slot(state, layer).annotations.clear();
+  }
+  if (!state->external_imagery) return;
+  if (state->tile_provider != nullptr) {
+    g_autoptr(GWorldSceneTileProvider) provider =
+      GWORLD_SCENE_TILE_PROVIDER(g_object_ref(state->tile_provider));
+    gworld_scene_tile_provider_clear(provider);
+  }
+}
+
+static void
 gworld_scene_view_dispose(GObject *object)
 {
   auto *priv = static_cast<GWorldSceneViewPrivate *>(
     gworld_scene_view_get_instance_private(GWORLD_SCENE_VIEW(object)));
   if (priv->backend != nullptr) {
     GWorldSceneViewState &state = priv->backend->state();
-    std::lock_guard<std::mutex> lock(state.mutex);
-    cancel_view_async_work_locked(&state);
+    if (state.presentation_clock) {
+      g_signal_handler_disconnect(state.presentation_clock, state.presentation_handler);
+      g_clear_object(&state.presentation_clock);state.presentation_handler = 0;
+    }
+    auto *provider = state.tile_provider;
+    if (provider != nullptr) {
+      if (state.tile_provider_changed != 0) g_signal_handler_disconnect(provider, state.tile_provider_changed);
+      if (state.tile_provider_coverage != 0) g_signal_handler_disconnect(provider, state.tile_provider_coverage);
+    }
+    {
+      std::lock_guard<std::mutex> lock(state.mutex);
+      state.disposing = true;
+      for (auto &annotations : state.active_annotations) annotations.clear();
+      state.presented_annotations.clear();
+      state.next_presented_annotations.clear();
+      state.presentation_pending = false;
+      for (auto layer : {TextureLayer::Ultra, TextureLayer::Detail, TextureLayer::Mid,
+                         TextureLayer::Far, TextureLayer::Base, TextureLayer::Globe})
+        texture_layer_upload_slot(&state, layer).annotations.clear();
+      state.tile_provider = nullptr;
+      state.tile_provider_changed = 0;
+      state.tile_provider_coverage = 0;
+      cancel_view_async_work_locked(&state);
+    }
+    if (provider != nullptr) {
+      gworld_scene_tile_provider_clear(provider);
+      g_object_unref(provider);
+    }
   }
 
   G_OBJECT_CLASS(gworld_scene_view_parent_class)->dispose(object);
@@ -10883,6 +11069,8 @@ gworld_scene_view_init(GWorldSceneView *self)
 
   gtk_widget_add_tick_callback(GTK_WIDGET(self), on_tick, nullptr, nullptr);
 
+  g_signal_connect(self, "map", G_CALLBACK(on_view_map), nullptr);
+  g_signal_connect(self, "unmap", G_CALLBACK(on_view_unmap), nullptr);
   g_signal_connect(self, "realize", G_CALLBACK(on_realize), nullptr);
   g_signal_connect(self, "unrealize", G_CALLBACK(on_unrealize), nullptr);
   g_signal_connect(self, "render", G_CALLBACK(on_render), nullptr);
@@ -11161,72 +11349,152 @@ gworld_scene_view_get_terrain_server(GWorldSceneView *self)
   return get_state(self)->terrain_server.c_str();
 }
 
+static void
+reset_imagery_locked(GWorldSceneViewState *state)
+{
+  cancel_pending_downloads_with_prefix_locked(state, "texture:");
+  cancel_all_texture_builds_locked(state);
+  for (auto layer : {TextureLayer::Ultra, TextureLayer::Detail, TextureLayer::Mid,
+                     TextureLayer::Far, TextureLayer::Base, TextureLayer::Globe}) {
+    texture_layer_pixels(state, layer).clear();
+    texture_layer_width(state, layer) = 0;
+    texture_layer_height(state, layer) = 0;
+    texture_layer_dirty(state, layer) = true;
+    texture_layer_loaded_key(state, layer).clear();
+    texture_layer_wanted_key(state, layer).clear();
+    texture_layer_pending_key(state, layer).clear();
+    texture_layer_active_range(state, layer) = AtlasRange();
+    auto &upload = texture_layer_upload_slot(state, layer);
+    upload.width = 0; upload.height = 0; upload.uploaded_rows = 0;
+    upload.key.clear(); upload.range = AtlasRange();
+    upload.annotations.clear();
+  }
+  state->texture_refresh_pending = false;
+  state->last_texture_refresh_us = 0;
+  ++state->texture_source_revision;
+}
+
+static void
+on_provider_changed(GWorldSceneTileProvider *provider, gpointer data)
+{
+  auto *self = GWORLD_SCENE_VIEW(data);
+  auto *state = get_state(self);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->disposing || state->tile_provider != provider) return;
+    // Clear/retry/close must remove the old source even without replacements.
+    if (gworld_scene_tile_provider_get_tile_count(provider) == 0)
+      reset_imagery_locked(state);
+    else
+      state->texture_refresh_pending = true;
+  }
+  if (gtk_widget_get_mapped(GTK_WIDGET(self)))
+    ensure_scene_requests_scheduled(self, 20);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+static void
+on_provider_coverage(GWorldSceneTileProvider *provider, gpointer data)
+{
+  auto *self = GWORLD_SCENE_VIEW(data);
+  auto *state = get_state(self);
+  // Retired worker-held entries can have blocked new demand at the native cap.
+  // When they drain, retry demand without marking unchanged atlas pixels dirty.
+  if (!state->disposing && state->tile_provider == provider &&
+      gworld_scene_tile_provider_get_overflow_count(provider) > 0 &&
+      gworld_scene_tile_provider_get_held_count(provider) < 1024 &&
+      gtk_widget_get_mapped(GTK_WIDGET(self)))
+    ensure_scene_requests_scheduled(self, 20);
+}
+
+void
+gworld_scene_view_set_tile_provider(GWorldSceneView *self, GWorldSceneTileProvider *provider)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+  g_return_if_fail(provider == nullptr || GWORLD_IS_SCENE_TILE_PROVIDER(provider));
+  auto *state = get_state(self);
+  if (state->disposing) return;
+  auto *old = state->tile_provider;
+  if (old == provider && state->external_imagery) return;
+  if (provider != nullptr) g_object_ref(provider);
+  if (old != nullptr) {
+    if (state->tile_provider_changed != 0) g_signal_handler_disconnect(old, state->tile_provider_changed);
+    if (state->tile_provider_coverage != 0) g_signal_handler_disconnect(old, state->tile_provider_coverage);
+  }
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->tile_provider = provider;
+    state->external_imagery = true;
+    state->tile_provider_changed = provider == nullptr ? 0 :
+      g_signal_connect(provider, "changed", G_CALLBACK(on_provider_changed), self);
+    state->tile_provider_coverage = provider == nullptr ? 0 :
+      g_signal_connect(provider, "coverage-changed", G_CALLBACK(on_provider_coverage), self);
+    reset_imagery_locked(state);
+  }
+  if (old != nullptr) {
+    gworld_scene_tile_provider_clear(old);
+    g_object_unref(old);
+  }
+  schedule_scene_requests(self, 20);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+gboolean
+gworld_scene_view_get_imagery_ready(GWorldSceneView *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), FALSE);
+  auto *state = get_state(self);
+  auto *provider = state->tile_provider;
+  if (!state->external_imagery || provider == nullptr || state->disposing ||
+      !gtk_widget_get_mapped(GTK_WIDGET(self)) || gworld_scene_tile_provider_get_closed(provider)) return FALSE;
+  const guint total = gworld_scene_tile_provider_get_tile_count(provider);
+  if (total == 0 || gworld_scene_tile_provider_get_ready_count(provider) != total ||
+      gworld_scene_tile_provider_get_overflow_count(provider) != 0 ||
+      gworld_scene_tile_provider_get_unsupported_count(provider) != 0) return FALSE;
+  std::lock_guard<std::mutex> lock(state->mutex);
+  if (state->texture_refresh_pending || !state->pending_texture_build_cancellables.empty()) return FALSE;
+  bool any = false;
+  for (auto layer : {TextureLayer::Ultra, TextureLayer::Detail, TextureLayer::Mid,
+                     TextureLayer::Far, TextureLayer::Base, TextureLayer::Globe}) {
+    const auto &wanted = texture_layer_wanted_key(state, layer);
+    if (wanted.empty()) continue;
+    any = true;
+    if (texture_layer_dirty(state, layer) || texture_layer_gl_texture(state, layer) == 0 ||
+        texture_layer_loaded_key(state, layer) != wanted ||
+        texture_layer_active_range(state, layer).key() != wanted) return FALSE;
+  }
+  return any;
+}
+
 void
 gworld_scene_view_set_map_tile_url_template(GWorldSceneView *self, const char *url_template)
 {
   g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
-
   auto *state = get_state(self);
+  if (state->disposing) return;
+  auto *old = state->tile_provider;
+  if (old != nullptr) {
+    if (state->tile_provider_changed != 0) g_signal_handler_disconnect(old, state->tile_provider_changed);
+    if (state->tile_provider_coverage != 0) g_signal_handler_disconnect(old, state->tile_provider_coverage);
+  }
   {
     std::lock_guard<std::mutex> lock(state->mutex);
+    state->tile_provider = nullptr;
+    state->tile_provider_changed = 0;
+    state->tile_provider_coverage = 0;
+    state->external_imagery = false;
     state->map_tile_template = url_template ? url_template : kDefaultMapTileTemplate;
-    cancel_pending_downloads_with_prefix_locked(state, "texture:");
-    cancel_all_texture_builds_locked(state);
-    state->ultra_texture_pixels.clear();
-    state->ultra_texture_width = 0;
-    state->ultra_texture_height = 0;
-    state->ultra_texture_dirty = true;
-    state->loaded_ultra_texture_key.clear();
-    state->texture_pixels.clear();
-    state->texture_width = 0;
-    state->texture_height = 0;
-    state->texture_dirty = true;
-    state->loaded_texture_key.clear();
-    state->mid_texture_pixels.clear();
-    state->mid_texture_width = 0;
-    state->mid_texture_height = 0;
-    state->mid_texture_dirty = true;
-    state->loaded_mid_texture_key.clear();
-    state->far_texture_pixels.clear();
-    state->far_texture_width = 0;
-    state->far_texture_height = 0;
-    state->far_texture_dirty = true;
-    state->loaded_far_texture_key.clear();
-    state->loaded_base_texture_key.clear();
-    state->base_texture_pixels.clear();
-    state->base_texture_width = 0;
-    state->base_texture_height = 0;
-    state->base_texture_dirty = true;
-    state->loaded_globe_texture_key.clear();
-    state->globe_texture_pixels.clear();
-    state->globe_texture_width = 0;
-    state->globe_texture_height = 0;
-    state->globe_texture_dirty = true;
-    state->wanted_ultra_texture_key.clear();
-    state->wanted_texture_key.clear();
-    state->wanted_mid_texture_key.clear();
-    state->wanted_far_texture_key.clear();
-    state->wanted_base_texture_key.clear();
-    state->wanted_globe_texture_key.clear();
-    state->pending_ultra_texture_build_key.clear();
-    state->pending_texture_build_key.clear();
-    state->pending_mid_texture_build_key.clear();
-    state->pending_far_texture_build_key.clear();
-    state->pending_base_texture_build_key.clear();
-    state->pending_globe_texture_build_key.clear();
-    state->texture_refresh_pending = false;
-    state->last_texture_refresh_us = 0;
-    state->ultra_texture_atlas_range = AtlasRange();
-    state->texture_atlas_range = AtlasRange();
-    state->mid_texture_atlas_range = AtlasRange();
-    state->far_texture_atlas_range = AtlasRange();
-    state->base_texture_atlas_range = AtlasRange();
-    state->globe_texture_atlas_range = AtlasRange();
-    ++state->texture_source_revision;
+    reset_imagery_locked(state);
   }
-
+  // Complete the state transition before outward callbacks: a reentrant source
+  // replacement from tile-released must remain the newest accepted transition.
+  if (old != nullptr) {
+    gworld_scene_tile_provider_clear(old);
+    g_object_unref(old);
+  }
   g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_MAP_TILE_URL_TEMPLATE]);
   schedule_scene_requests(self, 20);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
 }
 
 const char *
@@ -11252,57 +11520,7 @@ gworld_scene_view_set_cache_directory(GWorldSceneView *self, const char *cache_d
       ++state->terrain_revision;
     }
     clear_terrain_download_state_locked(state);
-    state->ultra_texture_pixels.clear();
-    state->ultra_texture_width = 0;
-    state->ultra_texture_height = 0;
-    state->ultra_texture_dirty = true;
-    state->loaded_ultra_texture_key.clear();
-    state->texture_pixels.clear();
-    state->texture_width = 0;
-    state->texture_height = 0;
-    state->texture_dirty = true;
-    state->loaded_texture_key.clear();
-    state->mid_texture_pixels.clear();
-    state->mid_texture_width = 0;
-    state->mid_texture_height = 0;
-    state->mid_texture_dirty = true;
-    state->loaded_mid_texture_key.clear();
-    state->far_texture_pixels.clear();
-    state->far_texture_width = 0;
-    state->far_texture_height = 0;
-    state->far_texture_dirty = true;
-    state->loaded_far_texture_key.clear();
-    state->loaded_base_texture_key.clear();
-    state->base_texture_pixels.clear();
-    state->base_texture_width = 0;
-    state->base_texture_height = 0;
-    state->base_texture_dirty = true;
-    state->loaded_globe_texture_key.clear();
-    state->globe_texture_pixels.clear();
-    state->globe_texture_width = 0;
-    state->globe_texture_height = 0;
-    state->globe_texture_dirty = true;
-    state->wanted_ultra_texture_key.clear();
-    state->wanted_texture_key.clear();
-    state->wanted_mid_texture_key.clear();
-    state->wanted_far_texture_key.clear();
-    state->wanted_base_texture_key.clear();
-    state->wanted_globe_texture_key.clear();
-    state->pending_ultra_texture_build_key.clear();
-    state->pending_texture_build_key.clear();
-    state->pending_mid_texture_build_key.clear();
-    state->pending_far_texture_build_key.clear();
-    state->pending_base_texture_build_key.clear();
-    state->pending_globe_texture_build_key.clear();
-    state->texture_refresh_pending = false;
-    state->last_texture_refresh_us = 0;
-    state->ultra_texture_atlas_range = AtlasRange();
-    state->texture_atlas_range = AtlasRange();
-    state->mid_texture_atlas_range = AtlasRange();
-    state->far_texture_atlas_range = AtlasRange();
-    state->base_texture_atlas_range = AtlasRange();
-    state->globe_texture_atlas_range = AtlasRange();
-    ++state->texture_source_revision;
+    reset_imagery_locked(state);
     state->mesh_key.clear();
   }
 

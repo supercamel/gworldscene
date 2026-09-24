@@ -30,6 +30,7 @@ and [OpenStreetMap contributors](https://www.openstreetmap.org/copyright).
 - Shared core library for scene nodes, camera math, picking, and geodesy.
 - Local terrain rendering from HGT-style elevation tiles.
 - Slippy-map imagery with disk caching, trilinear mipmaps, and anisotropic filtering where available.
+- Application-supplied imagery with regional fallback and attribution lifetime tracking.
 - Earth-scale globe rendering when zoomed far out.
 - Default Google-Earth-style camera plus free camera mode.
 - Scene graph nodes positioned by geodetic coordinates.
@@ -182,6 +183,14 @@ Applications can override map imagery with:
 ```c
 gworld_scene_view_set_map_tile_url_template(view, "https://server/{z}/{x}/{y}.png");
 ```
+
+Applications that own imagery transport or caching can attach a
+`GWorldSceneTileProvider` with `gworld_scene_view_set_tile_provider()`. It accepts
+immutable tile images, supports lower-resolution ancestors within each requested
+region, and tracks attribution through atlas uploads and GTK presentation.
+The application supplies the credit UI. See the
+[provider lifecycle and limits](docs/concepts.rst#application-supplied-imagery)
+and [provider example](docs/examples.rst#application-supplied-imagery).
 
 The demo programs also honor:
 
