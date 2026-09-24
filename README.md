@@ -4,8 +4,8 @@ GWorldScene is a geospatial scene widget for GTK 3 and GTK 4, built on
 `GtkGLArea`: terrain, map imagery, a globe view, and scene graph objects
 positioned with latitude, longitude, altitude, and local NED orientation.
 
-It is currently an experimental geospatial rendering library with a C API,
-GObject Introspection metadata, generated Vala bindings, and SQGI examples.
+It provides a C API, GObject Introspection metadata, generated Vala bindings,
+and SQGI examples.
 
 ![Cairns coastline with atmospheric haze and reflective ocean and river surfaces](screenshots/cairns-coastal-water.png)
 
@@ -418,9 +418,12 @@ python3 -m venv /tmp/gworldscene-docs-venv
 /tmp/gworldscene-docs-venv/bin/sphinx-build -b html -W docs /tmp/gworldscene-docs-html
 ```
 
-## Project Status
+## Production Focus
 
-This is early-stage rendering work. The API is useful enough for demos and
-experiments, but it should still be treated as evolving. Expect behavior around
-tile providers, globe LOD, terrain sampling, and model import details to keep
-improving.
+GWorldScene is developed for production GTK applications. Correct rendering,
+responsive loading, predictable resource use, and API compatibility are core
+requirements. Changes should include regression coverage appropriate to their
+impact and validation on the affected GTK and OpenGL/GLES paths.
+
+Supported behavior and current limitations are documented in the
+[concepts guide](docs/concepts.rst) and [API reference](docs/api-reference.rst).
