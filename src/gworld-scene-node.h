@@ -120,6 +120,16 @@ void gworld_scene_node_set_position(GWorldSceneNode *self,
                                     double longitude,
                                     double altitude_amsl);
 
+/**
+ * gworld_scene_node_get_position:
+ * @self: a scene node
+ * @latitude: (out) (optional) (transfer none): return location for latitude in degrees
+ * @longitude: (out) (optional) (transfer none): return location for longitude in degrees
+ * @altitude_amsl: (out) (optional) (transfer none): return location for altitude in metres above
+ *   mean sea level
+ *
+ * Reads the node's stored geodetic position.
+ */
 void gworld_scene_node_get_position(GWorldSceneNode *self,
                                     double *latitude,
                                     double *longitude,
@@ -140,6 +150,18 @@ void gworld_scene_node_set_orientation_ned(GWorldSceneNode *self,
                                            double pitch_deg,
                                            double roll_deg);
 
+/**
+ * gworld_scene_node_get_orientation_ned:
+ * @self: a scene node
+ * @yaw_deg: (out) (optional) (transfer none): return location for yaw in degrees about the local
+ *   down axis
+ * @pitch_deg: (out) (optional) (transfer none): return location for pitch in degrees about the
+ *   local east axis
+ * @roll_deg: (out) (optional) (transfer none): return location for roll in degrees about the local
+ *   north axis
+ *
+ * Reads the node's orientation in the local north-east-down frame.
+ */
 void gworld_scene_node_get_orientation_ned(GWorldSceneNode *self,
                                            double *yaw_deg,
                                            double *pitch_deg,
@@ -155,6 +177,15 @@ void gworld_scene_node_set_scale(GWorldSceneNode *self,
                                  double scale_y,
                                  double scale_z);
 
+/**
+ * gworld_scene_node_get_scale:
+ * @self: a scene node
+ * @scale_x: (out) (optional) (transfer none): return location for dimensionless X scale factor
+ * @scale_y: (out) (optional) (transfer none): return location for dimensionless Y scale factor
+ * @scale_z: (out) (optional) (transfer none): return location for dimensionless Z scale factor
+ *
+ * Reads the node's scale factors.
+ */
 void gworld_scene_node_get_scale(GWorldSceneNode *self,
                                  double *scale_x,
                                  double *scale_y,
@@ -165,6 +196,15 @@ void gworld_scene_node_set_color(GWorldSceneNode *self,
                                  double green,
                                  double blue);
 
+/**
+ * gworld_scene_node_get_color:
+ * @self: a scene node
+ * @red: (out) (optional) (transfer none): return location for red component in [0, 1]
+ * @green: (out) (optional) (transfer none): return location for green component in [0, 1]
+ * @blue: (out) (optional) (transfer none): return location for blue component in [0, 1]
+ *
+ * Reads the node's color.
+ */
 void gworld_scene_node_get_color(GWorldSceneNode *self,
                                  double *red,
                                  double *green,
@@ -175,6 +215,15 @@ void gworld_scene_cube_node_set_dimensions(GWorldSceneCubeNode *self,
                                            double depth_m,
                                            double height_m);
 
+/**
+ * gworld_scene_cube_node_get_dimensions:
+ * @self: a cube node
+ * @width_m: (out) (optional) (transfer none): return location for unscaled width in metres
+ * @depth_m: (out) (optional) (transfer none): return location for unscaled depth in metres
+ * @height_m: (out) (optional) (transfer none): return location for unscaled height in metres
+ *
+ * Reads the cube's dimensions before applying the node's scale.
+ */
 void gworld_scene_cube_node_get_dimensions(GWorldSceneCubeNode *self,
                                            double *width_m,
                                            double *depth_m,
@@ -189,6 +238,14 @@ void gworld_scene_cylinder_node_set_size(GWorldSceneCylinderNode *self,
                                          double diameter_m,
                                          double height_m);
 
+/**
+ * gworld_scene_cylinder_node_get_size:
+ * @self: a cylinder node
+ * @diameter_m: (out) (optional) (transfer none): return location for unscaled diameter in metres
+ * @height_m: (out) (optional) (transfer none): return location for unscaled height in metres
+ *
+ * Reads the cylinder's size before applying the node's scale.
+ */
 void gworld_scene_cylinder_node_get_size(GWorldSceneCylinderNode *self,
                                          double *diameter_m,
                                          double *height_m);
@@ -207,6 +264,14 @@ void gworld_scene_billboard_node_set_size_limits(GWorldSceneBillboardNode *self,
                                                  double min_px,
                                                  double max_px);
 
+/**
+ * gworld_scene_billboard_node_get_size_limits:
+ * @self: a billboard node
+ * @min_px: (out) (optional) (transfer none): return location for minimum display size in pixels
+ * @max_px: (out) (optional) (transfer none): return location for maximum display size in pixels
+ *
+ * Reads the billboard's display size limits.
+ */
 void gworld_scene_billboard_node_get_size_limits(GWorldSceneBillboardNode *self,
                                                  double *min_px,
                                                  double *max_px);
@@ -215,6 +280,15 @@ void gworld_scene_billboard_node_set_reference_size(GWorldSceneBillboardNode *se
                                                     double size_px,
                                                     double distance_m);
 
+/**
+ * gworld_scene_billboard_node_get_reference_size:
+ * @self: a billboard node
+ * @size_px: (out) (optional) (transfer none): return location for display size in pixels at the
+ *   reference distance
+ * @distance_m: (out) (optional) (transfer none): return location for reference distance in metres
+ *
+ * Reads the billboard's reference size and distance.
+ */
 void gworld_scene_billboard_node_get_reference_size(GWorldSceneBillboardNode *self,
                                                     double *size_px,
                                                     double *distance_m);
@@ -244,6 +318,29 @@ void gworld_scene_ground_overlay_node_set_corners(GWorldSceneGroundOverlayNode *
                                                   double bottom_left_latitude,
                                                   double bottom_left_longitude);
 
+/**
+ * gworld_scene_ground_overlay_node_get_corners:
+ * @self: a ground overlay node
+ * @top_left_latitude: (out) (optional) (transfer none): return location for top-left latitude in
+ *   degrees
+ * @top_left_longitude: (out) (optional) (transfer none): return location for top-left longitude in
+ *   degrees
+ * @top_right_latitude: (out) (optional) (transfer none): return location for top-right latitude in
+ *   degrees
+ * @top_right_longitude: (out) (optional) (transfer none): return location for top-right longitude
+ *   in degrees
+ * @bottom_right_latitude: (out) (optional) (transfer none): return location for bottom-right
+ *   latitude in degrees
+ * @bottom_right_longitude: (out) (optional) (transfer none): return location for bottom-right
+ *   longitude in degrees
+ * @bottom_left_latitude: (out) (optional) (transfer none): return location for bottom-left latitude
+ *   in degrees
+ * @bottom_left_longitude: (out) (optional) (transfer none): return location for bottom-left
+ *   longitude in degrees
+ *
+ * Reads the overlay's corners in top-left, top-right, bottom-right,
+ * bottom-left order.
+ */
 void gworld_scene_ground_overlay_node_get_corners(GWorldSceneGroundOverlayNode *self,
                                                   double *top_left_latitude,
                                                   double *top_left_longitude,
@@ -284,7 +381,7 @@ void gworld_scene_polyline_node_set_points(GWorldScenePolylineNode *self,
 /**
  * gworld_scene_polyline_node_get_points:
  * @self: a polyline node
- * @n_points: (out) (optional): return location for the number of points
+ * @n_points: (out) (optional) (transfer none): return location for the number of points
  *
  * Returns: (transfer none) (array length=n_points) (nullable): the node-owned
  *   point array
@@ -332,7 +429,7 @@ void gworld_scene_polygon_node_set_points(GWorldScenePolygonNode *self,
 /**
  * gworld_scene_polygon_node_get_points:
  * @self: a polygon node
- * @n_points: (out) (optional): return location for the number of points
+ * @n_points: (out) (optional) (transfer none): return location for the number of points
  *
  * Returns: (transfer none) (array length=n_points) (nullable): the node-owned
  *   point array
@@ -346,6 +443,16 @@ void gworld_scene_polygon_node_set_fill_color(GWorldScenePolygonNode *self,
                                               double blue,
                                               double alpha);
 
+/**
+ * gworld_scene_polygon_node_get_fill_color:
+ * @self: a polygon node
+ * @red: (out) (optional) (transfer none): return location for red component in [0, 1]
+ * @green: (out) (optional) (transfer none): return location for green component in [0, 1]
+ * @blue: (out) (optional) (transfer none): return location for blue component in [0, 1]
+ * @alpha: (out) (optional) (transfer none): return location for opacity in [0, 1]
+ *
+ * Reads the polygon's fill color and opacity.
+ */
 void gworld_scene_polygon_node_get_fill_color(GWorldScenePolygonNode *self,
                                               double *red,
                                               double *green,
@@ -358,6 +465,16 @@ void gworld_scene_polygon_node_set_outline_color(GWorldScenePolygonNode *self,
                                                  double blue,
                                                  double alpha);
 
+/**
+ * gworld_scene_polygon_node_get_outline_color:
+ * @self: a polygon node
+ * @red: (out) (optional) (transfer none): return location for red component in [0, 1]
+ * @green: (out) (optional) (transfer none): return location for green component in [0, 1]
+ * @blue: (out) (optional) (transfer none): return location for blue component in [0, 1]
+ * @alpha: (out) (optional) (transfer none): return location for opacity in [0, 1]
+ *
+ * Reads the polygon's outline color and opacity.
+ */
 void gworld_scene_polygon_node_get_outline_color(GWorldScenePolygonNode *self,
                                                  double *red,
                                                  double *green,
@@ -390,6 +507,16 @@ void gworld_scene_circle_node_set_fill_color(GWorldSceneCircleNode *self,
                                              double blue,
                                              double alpha);
 
+/**
+ * gworld_scene_circle_node_get_fill_color:
+ * @self: a circle node
+ * @red: (out) (optional) (transfer none): return location for red component in [0, 1]
+ * @green: (out) (optional) (transfer none): return location for green component in [0, 1]
+ * @blue: (out) (optional) (transfer none): return location for blue component in [0, 1]
+ * @alpha: (out) (optional) (transfer none): return location for opacity in [0, 1]
+ *
+ * Reads the circle's fill color and opacity.
+ */
 void gworld_scene_circle_node_get_fill_color(GWorldSceneCircleNode *self,
                                              double *red,
                                              double *green,
@@ -402,6 +529,16 @@ void gworld_scene_circle_node_set_outline_color(GWorldSceneCircleNode *self,
                                                 double blue,
                                                 double alpha);
 
+/**
+ * gworld_scene_circle_node_get_outline_color:
+ * @self: a circle node
+ * @red: (out) (optional) (transfer none): return location for red component in [0, 1]
+ * @green: (out) (optional) (transfer none): return location for green component in [0, 1]
+ * @blue: (out) (optional) (transfer none): return location for blue component in [0, 1]
+ * @alpha: (out) (optional) (transfer none): return location for opacity in [0, 1]
+ *
+ * Reads the circle's outline color and opacity.
+ */
 void gworld_scene_circle_node_get_outline_color(GWorldSceneCircleNode *self,
                                                 double *red,
                                                 double *green,
@@ -434,6 +571,16 @@ void gworld_scene_text_label_node_set_text_color(GWorldSceneTextLabelNode *self,
                                                  double blue,
                                                  double alpha);
 
+/**
+ * gworld_scene_text_label_node_get_text_color:
+ * @self: a text label node
+ * @red: (out) (optional) (transfer none): return location for red component in [0, 1]
+ * @green: (out) (optional) (transfer none): return location for green component in [0, 1]
+ * @blue: (out) (optional) (transfer none): return location for blue component in [0, 1]
+ * @alpha: (out) (optional) (transfer none): return location for opacity in [0, 1]
+ *
+ * Reads the label's text color and opacity.
+ */
 void gworld_scene_text_label_node_get_text_color(GWorldSceneTextLabelNode *self,
                                                  double *red,
                                                  double *green,
@@ -446,6 +593,16 @@ void gworld_scene_text_label_node_set_background_color(GWorldSceneTextLabelNode 
                                                        double blue,
                                                        double alpha);
 
+/**
+ * gworld_scene_text_label_node_get_background_color:
+ * @self: a text label node
+ * @red: (out) (optional) (transfer none): return location for red component in [0, 1]
+ * @green: (out) (optional) (transfer none): return location for green component in [0, 1]
+ * @blue: (out) (optional) (transfer none): return location for blue component in [0, 1]
+ * @alpha: (out) (optional) (transfer none): return location for opacity in [0, 1]
+ *
+ * Reads the label's background color and opacity.
+ */
 void gworld_scene_text_label_node_get_background_color(GWorldSceneTextLabelNode *self,
                                                        double *red,
                                                        double *green,
@@ -461,6 +618,14 @@ void gworld_scene_text_label_node_set_size_limits(GWorldSceneTextLabelNode *self
                                                   double min_px,
                                                   double max_px);
 
+/**
+ * gworld_scene_text_label_node_get_size_limits:
+ * @self: a text label node
+ * @min_px: (out) (optional) (transfer none): return location for minimum display size in pixels
+ * @max_px: (out) (optional) (transfer none): return location for maximum display size in pixels
+ *
+ * Reads the label's display size limits.
+ */
 void gworld_scene_text_label_node_get_size_limits(GWorldSceneTextLabelNode *self,
                                                   double *min_px,
                                                   double *max_px);
@@ -469,6 +634,15 @@ void gworld_scene_text_label_node_set_reference_size(GWorldSceneTextLabelNode *s
                                                      double size_px,
                                                      double distance_m);
 
+/**
+ * gworld_scene_text_label_node_get_reference_size:
+ * @self: a text label node
+ * @size_px: (out) (optional) (transfer none): return location for display size in pixels at the
+ *   reference distance
+ * @distance_m: (out) (optional) (transfer none): return location for reference distance in metres
+ *
+ * Reads the label's reference size and distance.
+ */
 void gworld_scene_text_label_node_get_reference_size(GWorldSceneTextLabelNode *self,
                                                      double *size_px,
                                                      double *distance_m);
@@ -488,6 +662,16 @@ void gworld_scene_node_set_dimensions(GWorldSceneNode *self,
                                       double depth_m,
                                       double height_m);
 
+/**
+ * gworld_scene_node_get_dimensions:
+ * @self: a scene node
+ * @width_m: (out) (optional) (transfer none): return location for unscaled width in metres
+ * @depth_m: (out) (optional) (transfer none): return location for unscaled depth in metres
+ * @height_m: (out) (optional) (transfer none): return location for unscaled height in metres
+ *
+ * Reads the primitive's dimensions before applying the node's scale.
+ * Non-primitive nodes return 1.0 for each dimension.
+ */
 void gworld_scene_node_get_dimensions(GWorldSceneNode *self,
                                       double *width_m,
                                       double *depth_m,

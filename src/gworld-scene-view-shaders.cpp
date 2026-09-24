@@ -12,7 +12,11 @@ GLuint
 compile_shader(GLenum type, const char *source)
 {
   GLuint shader = glCreateShader(type);
-  glShaderSource(shader, 1, &source, nullptr);
+  const char *preamble = epoxy_is_desktop_gl()
+    ? "#version 330 core\n"
+    : "#version 300 es\nprecision highp float;\nprecision highp int;\nprecision highp sampler2D;\n";
+  const char *sources[] = {preamble, source};
+  glShaderSource(shader, G_N_ELEMENTS(sources), sources, nullptr);
   glCompileShader(shader);
 
   GLint ok = GL_FALSE;
@@ -67,7 +71,6 @@ GLuint
 gworld_scene_view_create_program(void)
 {
   static const char *vertex_source = R"GLSL(
-#version 330 core
 layout(location = 0) in vec3 position;
 layout(location = 1) in vec2 detail_texcoord;
 layout(location = 2) in vec2 mid_texcoord;
@@ -87,6 +90,9 @@ uniform vec2 detail_atlas_size;
 uniform bool mid_atlas_valid;
 uniform vec4 mid_atlas_range;
 uniform vec2 mid_atlas_size;
+uniform bool far_atlas_valid;
+uniform vec4 far_atlas_range;
+uniform vec2 far_atlas_size;
 uniform bool base_atlas_valid;
 uniform vec4 base_atlas_range;
 uniform vec2 base_atlas_size;
@@ -95,6 +101,7 @@ uniform vec4 globe_atlas_range;
 uniform vec2 globe_atlas_size;
 out vec2 v_detail_texcoord;
 out vec2 v_mid_texcoord;
+out vec2 v_far_texcoord;
 out vec2 v_base_texcoord;
 out vec2 v_ultra_texcoord;
 out vec3 v_normal;
@@ -129,17 +136,20 @@ void main() {
     vec2 lat_lon = detail_texcoord;
     v_detail_texcoord = detail_atlas_valid ? atlas_uv_for_lat_lon(lat_lon, detail_atlas_range, detail_atlas_size) : vec2(-1.0, -1.0);
     v_mid_texcoord = mid_atlas_valid ? atlas_uv_for_lat_lon(lat_lon, mid_atlas_range, mid_atlas_size) : vec2(-1.0, -1.0);
+    v_far_texcoord = far_atlas_valid ? atlas_uv_for_lat_lon(lat_lon, far_atlas_range, far_atlas_size) : vec2(-1.0, -1.0);
     v_base_texcoord = base_atlas_valid ? atlas_uv_for_lat_lon(lat_lon, base_atlas_range, base_atlas_size) : vec2(-1.0, -1.0);
     v_ultra_texcoord = ultra_atlas_valid ? atlas_uv_for_lat_lon(lat_lon, ultra_atlas_range, ultra_atlas_size) : vec2(-1.0, -1.0);
   } else if (is_globe) {
     vec2 lat_lon = detail_texcoord;
     v_detail_texcoord = vec2(-1.0, -1.0);
     v_mid_texcoord = vec2(-1.0, -1.0);
+    v_far_texcoord = vec2(-1.0, -1.0);
     v_base_texcoord = globe_atlas_valid ? atlas_uv_for_lat_lon(lat_lon, globe_atlas_range, globe_atlas_size) : vec2(-1.0, -1.0);
     v_ultra_texcoord = vec2(-1.0, -1.0);
   } else {
     v_detail_texcoord = detail_texcoord;
     v_mid_texcoord = mid_texcoord;
+    v_far_texcoord = vec2(-1.0, -1.0);
     v_base_texcoord = base_texcoord;
     v_ultra_texcoord = ultra_texcoord;
   }
@@ -153,9 +163,9 @@ void main() {
 )GLSL";
 
   static const char *fragment_source = R"GLSL(
-#version 330 core
 in vec2 v_detail_texcoord;
 in vec2 v_mid_texcoord;
+in vec2 v_far_texcoord;
 in vec2 v_base_texcoord;
 in vec2 v_ultra_texcoord;
 in vec3 v_normal;
@@ -164,15 +174,35 @@ in float v_material;
 in float v_height;
 in vec3 v_world_position;
 in vec4 v_light_position;
+uniform bool ultra_atlas_valid;
+uniform vec4 ultra_atlas_range;
+uniform vec2 ultra_atlas_size;
+uniform bool detail_atlas_valid;
+uniform vec4 detail_atlas_range;
+uniform vec2 detail_atlas_size;
+uniform bool mid_atlas_valid;
+uniform vec4 mid_atlas_range;
+uniform vec2 mid_atlas_size;
+uniform bool far_atlas_valid;
+uniform vec4 far_atlas_range;
+uniform vec2 far_atlas_size;
+uniform bool base_atlas_valid;
+uniform vec4 base_atlas_range;
+uniform vec2 base_atlas_size;
+uniform bool globe_atlas_valid;
+uniform vec4 globe_atlas_range;
+uniform vec2 globe_atlas_size;
 uniform sampler2D ultra_texture;
 uniform sampler2D detail_texture;
 uniform sampler2D mid_texture;
+uniform sampler2D far_texture;
 uniform sampler2D base_texture;
 uniform sampler2D shadow_texture;
 uniform sampler2D model_texture;
 uniform bool has_ultra_texture;
 uniform bool has_detail_texture;
 uniform bool has_mid_texture;
+uniform bool has_far_texture;
 uniform bool has_base_texture;
 uniform bool has_shadow_texture;
 uniform bool has_model_texture;
@@ -191,6 +221,28 @@ uniform float fog_end;
 uniform float fog_density;
 uniform float terrain_normal_smoothing;
 out vec4 color;
+
+// Wrap after interpolation: wrapping individual vertices would interpolate
+// through the atlas across the longitude discontinuity on the far side of Earth.
+vec2 wrap_atlas_uv(vec2 uv, vec4 range, vec2 size) {
+  float tiles = exp2(range.x);
+  if (size.x > 0.0) {
+    float period = tiles / size.x;
+    uv.x -= floor((uv.x - 0.5) / period + 0.5) * period;
+  }
+  return uv;
+}
+
+// Blend through the outer part of each distance band's coverage. An absent
+// finer tile keeps the coarser image; an absent coarser tile keeps all available
+// fine detail rather than fading it into an untextured surface.
+vec4 blend_imagery(vec4 coarse, vec4 fine, vec2 uv, vec2 atlas_size) {
+  if (fine.a <= 0.01) return coarse;
+  if (coarse.a <= 0.01) return fine;
+  vec2 edge_tiles = min(uv, vec2(1.0) - uv) * atlas_size;
+  float weight = smoothstep(0.0, 0.75, min(edge_tiles.x, edge_tiles.y)) * fine.a;
+  return vec4(mix(coarse.rgb, fine.rgb, weight), mix(coarse.a, 1.0, weight));
+}
 
 vec3 lighting_normal() {
   vec3 normal = normalize(v_normal);
@@ -219,7 +271,9 @@ float shadow_visibility(vec3 normal) {
   float lit = 0.0;
   for (int y = -1; y <= 1; ++y) {
     for (int x = -1; x <= 1; ++x) {
-      float depth = texture(shadow_texture, projected.xy + vec2(x, y) * texel_size).r;
+      vec2 uv = projected.xy + vec2(x, y) * texel_size;
+      float depth = (any(lessThan(uv, vec2(0.0))) || any(greaterThan(uv, vec2(1.0))))
+        ? 1.0 : texture(shadow_texture, uv).r;
       lit += projected.z - bias <= depth ? 1.0 : 0.0;
     }
   }
@@ -247,15 +301,33 @@ void main() {
   vec3 low = vec3(0.26, 0.36, 0.24);
   vec3 high = vec3(0.76, 0.72, 0.62);
   vec3 terrain_tint = mix(low, high, clamp(v_height / 1800.0, 0.0, 1.0));
-  bool in_detail = v_detail_texcoord.x >= 0.0 && v_detail_texcoord.x <= 1.0 && v_detail_texcoord.y >= 0.0 && v_detail_texcoord.y <= 1.0;
-  bool in_mid = v_mid_texcoord.x >= 0.0 && v_mid_texcoord.x <= 1.0 && v_mid_texcoord.y >= 0.0 && v_mid_texcoord.y <= 1.0;
-  bool in_base = v_base_texcoord.x >= 0.0 && v_base_texcoord.x <= 1.0 && v_base_texcoord.y >= 0.0 && v_base_texcoord.y <= 1.0;
-  bool in_ultra = v_ultra_texcoord.x >= 0.0 && v_ultra_texcoord.x <= 1.0 && v_ultra_texcoord.y >= 0.0 && v_ultra_texcoord.y <= 1.0;
-  vec4 base_texel = (has_base_texture && in_base) ? texture(base_texture, v_base_texcoord) : vec4(0.0);
-  vec4 mid_texel = (has_mid_texture && in_mid) ? texture(mid_texture, v_mid_texcoord) : vec4(0.0);
-  vec4 detail_texel = (has_detail_texture && in_detail) ? texture(detail_texture, v_detail_texcoord) : vec4(0.0);
-  vec4 ultra_texel = (has_ultra_texture && in_ultra) ? texture(ultra_texture, v_ultra_texcoord) : vec4(0.0);
-  vec4 texture_stack = detail_texel.a > 0.01 ? detail_texel : (mid_texel.a > 0.01 ? mid_texel : base_texel);
+  vec2 detail_uv = v_detail_texcoord;
+  vec2 mid_uv = v_mid_texcoord;
+  vec2 far_uv = v_far_texcoord;
+  vec2 base_uv = v_base_texcoord;
+  vec2 ultra_uv = v_ultra_texcoord;
+  if (v_material < 0.5) {
+    if (detail_atlas_valid) detail_uv = wrap_atlas_uv(detail_uv, detail_atlas_range, detail_atlas_size);
+    if (mid_atlas_valid) mid_uv = wrap_atlas_uv(mid_uv, mid_atlas_range, mid_atlas_size);
+    if (far_atlas_valid) far_uv = wrap_atlas_uv(far_uv, far_atlas_range, far_atlas_size);
+    if (base_atlas_valid) base_uv = wrap_atlas_uv(base_uv, base_atlas_range, base_atlas_size);
+    if (ultra_atlas_valid) ultra_uv = wrap_atlas_uv(ultra_uv, ultra_atlas_range, ultra_atlas_size);
+  } else if (v_material > 1.5 && v_material < 2.5 && globe_atlas_valid) {
+    base_uv = wrap_atlas_uv(base_uv, globe_atlas_range, globe_atlas_size);
+  }
+  bool in_detail = detail_uv.x >= 0.0 && detail_uv.x <= 1.0 && detail_uv.y >= 0.0 && detail_uv.y <= 1.0;
+  bool in_far = far_uv.x >= 0.0 && far_uv.x <= 1.0 && far_uv.y >= 0.0 && far_uv.y <= 1.0;
+  bool in_mid = mid_uv.x >= 0.0 && mid_uv.x <= 1.0 && mid_uv.y >= 0.0 && mid_uv.y <= 1.0;
+  bool in_base = base_uv.x >= 0.0 && base_uv.x <= 1.0 && base_uv.y >= 0.0 && base_uv.y <= 1.0;
+  bool in_ultra = ultra_uv.x >= 0.0 && ultra_uv.x <= 1.0 && ultra_uv.y >= 0.0 && ultra_uv.y <= 1.0;
+  vec4 base_texel = (has_base_texture && in_base) ? texture(base_texture, base_uv) : vec4(0.0);
+  vec4 far_texel = (has_far_texture && in_far) ? texture(far_texture, far_uv) : vec4(0.0);
+  vec4 mid_texel = (has_mid_texture && in_mid) ? texture(mid_texture, mid_uv) : vec4(0.0);
+  vec4 detail_texel = (has_detail_texture && in_detail) ? texture(detail_texture, detail_uv) : vec4(0.0);
+  vec4 ultra_texel = (has_ultra_texture && in_ultra) ? texture(ultra_texture, ultra_uv) : vec4(0.0);
+  vec4 texture_stack = blend_imagery(base_texel, far_texel, far_uv, far_atlas_size);
+  texture_stack = blend_imagery(texture_stack, mid_texel, mid_uv, mid_atlas_size);
+  texture_stack = blend_imagery(texture_stack, detail_texel, detail_uv, detail_atlas_size);
   float ultra_lateral_distance = length((v_world_position - ultra_texture_center).xz);
   float ultra_radius = max(ultra_texture_radius, 1.0);
   float ultra_fade_width = clamp(ultra_radius * 0.22, 80.0, 220.0);
@@ -288,7 +360,6 @@ GLuint
 gworld_scene_view_create_shadow_program(void)
 {
   static const char *vertex_source = R"GLSL(
-#version 330 core
 layout(location = 0) in vec3 position;
 uniform mat4 light_mvp;
 void main() {
@@ -297,7 +368,6 @@ void main() {
 )GLSL";
 
   static const char *fragment_source = R"GLSL(
-#version 330 core
 void main() {
 }
 )GLSL";
@@ -309,7 +379,6 @@ GLuint
 gworld_scene_view_create_billboard_program(void)
 {
   static const char *vertex_source = R"GLSL(
-#version 330 core
 layout(location = 0) in vec3 position;
 layout(location = 1) in vec2 texcoord;
 uniform mat4 mvp;
@@ -321,7 +390,6 @@ void main() {
 )GLSL";
 
   static const char *fragment_source = R"GLSL(
-#version 330 core
 in vec2 v_texcoord;
 uniform sampler2D billboard_texture;
 uniform float opacity;
@@ -342,7 +410,6 @@ GLuint
 gworld_scene_view_create_sun_program(void)
 {
   static const char *vertex_source = R"GLSL(
-#version 330 core
 layout(location = 0) in vec2 position;
 layout(location = 1) in vec2 local_coord;
 out vec2 v_local_coord;
@@ -353,7 +420,6 @@ void main() {
 )GLSL";
 
   static const char *fragment_source = R"GLSL(
-#version 330 core
 in vec2 v_local_coord;
 uniform vec3 sun_color;
 uniform float intensity;
@@ -381,7 +447,6 @@ GLuint
 gworld_scene_view_create_sky_program(void)
 {
   static const char *vertex_source = R"GLSL(
-#version 330 core
 layout(location = 0) in vec2 position;
 out vec2 v_ndc;
 void main() {
@@ -391,7 +456,6 @@ void main() {
 )GLSL";
 
   static const char *fragment_source = R"GLSL(
-#version 330 core
 in vec2 v_ndc;
 uniform mat4 inverse_mvp;
 uniform vec3 camera_position;

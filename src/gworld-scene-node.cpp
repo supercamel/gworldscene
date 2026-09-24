@@ -98,6 +98,15 @@ set_points(GArray *points, const GWorldSceneGeoPoint *source, gsize n_points)
 }
 
 void
+replace_string(char *&target, const char *value)
+{
+  // The caller may pass a getter result, including a substring of target.
+  char *copy = g_strdup(value);
+  g_free(target);
+  target = copy;
+}
+
+void
 emit_changed(GWorldSceneNode *node)
 {
   g_signal_emit(node, signals[CHANGED], 0);
@@ -997,8 +1006,7 @@ void
 gworld_scene_model_node_set_model_path(GWorldSceneModelNode *self, const char *model_path)
 {
   g_return_if_fail(GWORLD_IS_SCENE_MODEL_NODE(self));
-  g_free(self->model_path);
-  self->model_path = g_strdup(model_path ? model_path : "");
+  replace_string(self->model_path, model_path ? model_path : "");
   emit_changed(GWORLD_SCENE_NODE(self));
 }
 
@@ -1013,8 +1021,7 @@ void
 gworld_scene_billboard_node_set_image_path(GWorldSceneBillboardNode *self, const char *image_path)
 {
   g_return_if_fail(GWORLD_IS_SCENE_BILLBOARD_NODE(self));
-  g_free(self->image_path);
-  self->image_path = g_strdup(image_path ? image_path : "");
+  replace_string(self->image_path, image_path ? image_path : "");
   emit_changed(GWORLD_SCENE_NODE(self));
 }
 
@@ -1110,8 +1117,7 @@ gworld_scene_ground_overlay_node_set_image_path(GWorldSceneGroundOverlayNode *se
                                                 const char *image_path)
 {
   g_return_if_fail(GWORLD_IS_SCENE_GROUND_OVERLAY_NODE(self));
-  g_free(self->image_path);
-  self->image_path = g_strdup(image_path ? image_path : "");
+  replace_string(self->image_path, image_path ? image_path : "");
   emit_changed(GWORLD_SCENE_NODE(self));
 }
 
@@ -1539,8 +1545,7 @@ void
 gworld_scene_text_label_node_set_text(GWorldSceneTextLabelNode *self, const char *text)
 {
   g_return_if_fail(GWORLD_IS_SCENE_TEXT_LABEL_NODE(self));
-  g_free(self->text);
-  self->text = g_strdup(text ? text : "");
+  replace_string(self->text, text ? text : "");
   emit_changed(GWORLD_SCENE_NODE(self));
 }
 
@@ -1555,8 +1560,7 @@ void
 gworld_scene_text_label_node_set_font(GWorldSceneTextLabelNode *self, const char *font)
 {
   g_return_if_fail(GWORLD_IS_SCENE_TEXT_LABEL_NODE(self));
-  g_free(self->font);
-  self->font = g_strdup(font && font[0] != '\0' ? font : "Sans Bold 18");
+  replace_string(self->font, font && font[0] != '\0' ? font : "Sans Bold 18");
   emit_changed(GWORLD_SCENE_NODE(self));
 }
 

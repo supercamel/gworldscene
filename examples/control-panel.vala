@@ -17,6 +17,13 @@ namespace GWorldSceneControls {
   private const string THUNDERFOREST_OUTDOORS =
     "https://tile.thunderforest.com/outdoors/{z}/{x}/{y}.png?apikey={key}";
 
+  private static void prefer_desktop_gl_for_gtk4 () {
+    var debug = GLib.Environment.get_variable ("GDK_DEBUG");
+    if (debug == null || debug == "") {
+      GLib.Environment.set_variable ("GDK_DEBUG", "gl-prefer-gl", false);
+    }
+  }
+
   public class ControlPanelWindow : Gtk.ApplicationWindow {
     private GWorld.SceneView scene;
     private Gtk.TextView pick_terminal;
@@ -30,6 +37,7 @@ namespace GWorldSceneControls {
     private Gtk.Entry terrain_entry;
     private Gtk.Label terrain_status;
     private Gtk.CheckButton cache_enabled;
+    private Gtk.ComboBoxText texture_memory_budget;
     private Gtk.CheckButton fog_enabled;
     private Gtk.Scale fog_density;
     private Gtk.ComboBoxText fog_color;
@@ -79,6 +87,7 @@ namespace GWorldSceneControls {
       apply_map_provider ();
       apply_terrain_provider ();
       apply_cache ();
+      apply_texture_memory_budget ();
       apply_fog ();
       apply_sun ();
       apply_lighting ();
@@ -175,6 +184,15 @@ namespace GWorldSceneControls {
       cache_enabled.active = true;
       cache_enabled.toggled.connect (() => apply_cache ());
       add_row (terrain_grid, row++, "", cache_enabled);
+
+      texture_memory_budget = new Gtk.ComboBoxText ();
+      texture_memory_budget.append ("0", "Default");
+      texture_memory_budget.append ("2048", "2 GB");
+      texture_memory_budget.append ("8192", "8 GB");
+      texture_memory_budget.append ("16384", "16 GB");
+      texture_memory_budget.active_id = "0";
+      texture_memory_budget.changed.connect (() => apply_texture_memory_budget ());
+      add_row (terrain_grid, row++, "Texture memory", texture_memory_budget);
 
       terrain_status = status_label ();
       add_row (terrain_grid, row++, "", terrain_status);
@@ -398,6 +416,19 @@ namespace GWorldSceneControls {
 
     private void apply_cache () {
       scene.set_cache_enabled (cache_enabled.active);
+    }
+
+    private void apply_texture_memory_budget () {
+      var id = active_id (texture_memory_budget, "0");
+      uint budget_mib = 0;
+      if (id == "2048") {
+        budget_mib = 2048;
+      } else if (id == "8192") {
+        budget_mib = 8192;
+      } else if (id == "16384") {
+        budget_mib = 16384;
+      }
+      scene.set_texture_memory_budget_mib (budget_mib);
     }
 
     private void apply_fog () {
@@ -636,6 +667,8 @@ namespace GWorldSceneControls {
   }
 
   public static int main (string[] args) {
+    prefer_desktop_gl_for_gtk4 ();
+
     var app = new Gtk.Application ("com.supercamel.GWorldScene.ValaControls",
                                    GLib.ApplicationFlags.DEFAULT_FLAGS);
     app.activate.connect (() => {

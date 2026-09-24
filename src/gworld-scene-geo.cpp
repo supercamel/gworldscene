@@ -14,6 +14,17 @@ constexpr double kWgs84E2 = 1.0 - (kWgs84B * kWgs84B) / (kWgs84A * kWgs84A);
 } // namespace
 
 double
+wrap_longitude(double longitude)
+{
+  double wrapped = std::fmod(longitude, 360.0);
+  if (wrapped >= 180.0)
+    wrapped -= 360.0;
+  else if (wrapped < -180.0)
+    wrapped += 360.0;
+  return wrapped;
+}
+
+double
 deg_to_rad(double degrees)
 {
   return degrees * 3.14159265358979323846 / 180.0;
@@ -83,7 +94,7 @@ translate_geodetic_ned(double latitude,
   if (translated_latitude)
     *translated_latitude = std::clamp(latitude + north_m / kEarthMetersPerDegree, -90.0, 90.0);
   if (translated_longitude)
-    *translated_longitude = std::clamp(longitude + east_m / (kEarthMetersPerDegree * lon_scale), -180.0, 180.0);
+    *translated_longitude = wrap_longitude(longitude + east_m / (kEarthMetersPerDegree * lon_scale));
   if (translated_altitude_amsl)
     *translated_altitude_amsl = altitude_amsl - down_m;
 }

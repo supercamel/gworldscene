@@ -144,3 +144,9 @@ default per-user cache location is not appropriate:
 
    gworld_scene_view_set_cache_directory(view, "/tmp/gworldscene-cache");
    gworld_scene_view_set_cache_enabled(view, TRUE);
+
+Terrain cache files are namespaced by the SHA-256 digest of the complete
+``terrain-server`` string: ``terrain/<digest>/<tile>.hgt`` or
+``terrain/<digest>/<tile>.hgt.zip``. Changing providers keeps their elevations
+separate. Legacy files directly in ``terrain/`` are preserved but ignored because
+their source is unknown; tiles are downloaded again into the new directories.

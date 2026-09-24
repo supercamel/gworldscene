@@ -8,6 +8,10 @@ local gtk_major = ("GWORLD_SCENE_SQGI_GTK_MAJOR" in getroottable())
 if (gtk_major != 3 && gtk_major != 4)
   throw "GWORLD_SCENE_SQGI_GTK_MAJOR must be 3 or 4"
 
+local gdk_debug = GLib.getenv("GDK_DEBUG")
+if (gtk_major == 4 && (gdk_debug == null || gdk_debug == ""))
+  GLib.setenv("GDK_DEBUG", "gl-prefer-gl", false)
+
 local Gtk = import("Gtk", gtk_major + ".0")
 local GWorldScene = import("GWorldSceneGtk" + gtk_major, "0.1")
 

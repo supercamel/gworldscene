@@ -3,6 +3,7 @@
 #include <glib.h>
 
 #include <cmath>
+#include <initializer_list>
 
 namespace {
 
@@ -85,12 +86,40 @@ test_ned_translation_round_trips_to_scene_offset()
   assert_near(offset.z, -1000.0, 20.0);
 }
 
+void
+test_translation_crosses_dateline()
+{
+  for (double direction : {-1.0, 1.0}) {
+    const double start = direction * 179.999;
+    double latitude = 0.0;
+    double longitude = start;
+    double altitude = 1000.0;
+    for (int step = 0; step < 3; ++step) {
+      gworld_scene::translate_geodetic_ned(latitude, longitude, altitude,
+                                           0.0, direction * 500.0, 10.0,
+                                           &latitude, &longitude, &altitude);
+      g_assert_cmpfloat(longitude, >=, -180.0);
+      g_assert_cmpfloat(longitude, <, 180.0);
+      const auto position = gworld_scene::geodetic_to_scene(latitude, longitude, altitude,
+                                                           0.0, start, 1000.0);
+      assert_near(position.x, direction * 500.0 * (step + 1), 1.0);
+    }
+    g_assert_cmpfloat(direction * longitude, <, 0.0);
+    assert_near(altitude, 970.0, 0.001);
+  }
+  assert_near(gworld_scene::wrap_longitude(180.0), -180.0, 1e-10);
+  assert_near(gworld_scene::wrap_longitude(-180.0), -180.0, 1e-10);
+  assert_near(gworld_scene::wrap_longitude(1081.0), 1.0, 1e-10);
+  assert_near(gworld_scene::wrap_longitude(-1081.0), -1.0, 1e-10);
+}
+
 } // namespace
 
 int
 main(int argc, char **argv)
 {
   g_test_init(&argc, &argv, nullptr);
+  g_test_add_func("/geo/translation-crosses-dateline", test_translation_crosses_dateline);
   g_test_add_func("/geo/same-position-is-origin", test_same_position_is_origin);
   g_test_add_func("/geo/lat-lon-map-to-scene-axes", test_lat_lon_map_to_scene_axes);
   g_test_add_func("/geo/ned-maps-to-scene-axes", test_ned_maps_to_scene_axes);

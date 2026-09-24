@@ -47,7 +47,23 @@ test('camera', camera_test)
 test('light', light_test)
 test('picking', picking_test)
 
+python = import('python').find_installation()
+sqgi = find_program('sqgi', required: false)
+bindings_env = environment()
+bindings_dir = meson.project_build_root() / 'src'
+bindings_env.set('GI_TYPELIB_PATH', bindings_dir)
+bindings_env.prepend('LD_LIBRARY_PATH', bindings_dir)
+bindings_env.prepend('DYLD_LIBRARY_PATH', bindings_dir)
+bindings_env.prepend('PATH', bindings_dir)
+bindings_env.set('GTK_A11Y', 'none')
+
 if gworldscene_gtk3_built
+  test('gir-gtk3', python, args: [files('gir-test.py'), gworldscene_gtk3_gir[0]], suite: 'bindings')
+  if sqgi.found()
+    test('bindings-sqgi-gtk3', sqgi,
+      args: [files('bindings-test.nut'), '3', bindings_dir],
+      depends: gworldscene_gtk3_gir, env: bindings_env, protocol: 'tap', suite: 'bindings')
+  endif
   view_gtk3_test = executable(
     'gworldscene-view-gtk3-test',
     'view-test.cpp',
@@ -56,9 +72,33 @@ if gworldscene_gtk3_built
     cpp_args: ['-DGWORLD_SCENE_GTK_MAJOR=3'],
   )
   test('scene-view-gtk3', view_gtk3_test)
+  terrain_gtk3_test = executable(
+    'gworldscene-terrain-gtk3-test', 'terrain-test.cpp',
+    include_directories: gworldscene_inc,
+    dependencies: gworldscene_gtk3_dep,
+    cpp_args: ['-DGWORLD_SCENE_GTK_MAJOR=3'],
+  )
+  test('terrain-gtk3', terrain_gtk3_test)
+  render_gtk3_test = executable(
+    'gworldscene-render-gtk3-test',
+    'render-test.cpp',
+    include_directories: gworldscene_inc,
+    dependencies: gworldscene_gtk3_dep,
+    cpp_args: ['-DGWORLD_SCENE_GTK_MAJOR=3'],
+  )
+  test('render-gtk3-auto', render_gtk3_test, args: ['-p', '/render/automatic'], suite: 'render')
+  # GTK 3's X11 backend selects GLES at display initialization, via GDK_GL.
+  test('render-gtk3-gles', render_gtk3_test, args: ['-p', '/render/gles'],
+    env: ['GDK_GL=gles'], suite: 'render')
 endif
 
 if gworldscene_gtk4_built
+  test('gir-gtk4', python, args: [files('gir-test.py'), gworldscene_gtk4_gir[0]], suite: 'bindings')
+  if sqgi.found()
+    test('bindings-sqgi-gtk4', sqgi,
+      args: [files('bindings-test.nut'), '4', bindings_dir],
+      depends: gworldscene_gtk4_gir, env: bindings_env, protocol: 'tap', suite: 'bindings')
+  endif
   view_gtk4_test = executable(
     'gworldscene-view-gtk4-test',
     'view-test.cpp',
@@ -67,4 +107,20 @@ if gworldscene_gtk4_built
     cpp_args: ['-DGWORLD_SCENE_GTK_MAJOR=4'],
   )
   test('scene-view-gtk4', view_gtk4_test)
+  terrain_gtk4_test = executable(
+    'gworldscene-terrain-gtk4-test', 'terrain-test.cpp',
+    include_directories: gworldscene_inc,
+    dependencies: gworldscene_gtk4_dep,
+    cpp_args: ['-DGWORLD_SCENE_GTK_MAJOR=4'],
+  )
+  test('terrain-gtk4', terrain_gtk4_test)
+  render_gtk4_test = executable(
+    'gworldscene-render-gtk4-test',
+    'render-test.cpp',
+    include_directories: gworldscene_inc,
+    dependencies: gworldscene_gtk4_dep,
+    cpp_args: ['-DGWORLD_SCENE_GTK_MAJOR=4'],
+  )
+  test('render-gtk4-auto', render_gtk4_test, args: ['-p', '/render/automatic'], suite: 'render')
+  test('render-gtk4-gles', render_gtk4_test, args: ['-p', '/render/gles'], suite: 'render')
 endif

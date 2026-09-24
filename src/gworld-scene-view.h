@@ -23,6 +23,17 @@ void gworld_scene_view_set_camera(GWorldSceneView *self,
                                   double longitude,
                                   double altitude_amsl);
 
+/**
+ * gworld_scene_view_get_camera:
+ * @self: a scene view
+ * @latitude: (out) (optional) (transfer none): return location for latitude in degrees
+ * @longitude: (out) (optional) (transfer none): return location for longitude in degrees
+ * @altitude_amsl: (out) (optional) (transfer none): return location for altitude in metres above
+ *   mean sea level
+ *
+ * Reads the stored camera position. In default mode this is the orbit
+ * reference position; in free mode it is the eye position.
+ */
 void gworld_scene_view_get_camera(GWorldSceneView *self,
                                   double *latitude,
                                   double *longitude,
@@ -32,6 +43,16 @@ void gworld_scene_view_set_camera_orientation(GWorldSceneView *self,
                                               double heading_deg,
                                               double pitch_deg);
 
+/**
+ * gworld_scene_view_get_camera_orientation:
+ * @self: a scene view
+ * @heading_deg: (out) (optional) (transfer none): return location for heading in degrees clockwise
+ *   from geographic north
+ * @pitch_deg: (out) (optional) (transfer none): return location for elevation angle in degrees,
+ *   positive upward
+ *
+ * Reads the stored camera orientation.
+ */
 void gworld_scene_view_get_camera_orientation(GWorldSceneView *self,
                                               double *heading_deg,
                                               double *pitch_deg);
@@ -61,6 +82,17 @@ void gworld_scene_view_set_free_camera_position(GWorldSceneView *self,
                                                 double longitude,
                                                 double altitude_amsl);
 
+/**
+ * gworld_scene_view_get_free_camera_position:
+ * @self: a scene view
+ * @latitude: (out) (optional) (transfer none): return location for latitude in degrees
+ * @longitude: (out) (optional) (transfer none): return location for longitude in degrees
+ * @altitude_amsl: (out) (optional) (transfer none): return location for altitude in metres above
+ *   mean sea level
+ *
+ * Reads the stored camera position without changing camera mode.
+ * In free mode this is the eye position.
+ */
 void gworld_scene_view_get_free_camera_position(GWorldSceneView *self,
                                                 double *latitude,
                                                 double *longitude,
@@ -78,6 +110,16 @@ void gworld_scene_view_set_free_camera_orientation(GWorldSceneView *self,
                                                    double azimuth_deg,
                                                    double pitch_deg);
 
+/**
+ * gworld_scene_view_get_free_camera_orientation:
+ * @self: a scene view
+ * @azimuth_deg: (out) (optional) (transfer none): return location for azimuth in degrees clockwise
+ *   from geographic north
+ * @pitch_deg: (out) (optional) (transfer none): return location for elevation angle in degrees,
+ *   positive upward
+ *
+ * Reads the stored camera orientation without changing camera mode.
+ */
 void gworld_scene_view_get_free_camera_orientation(GWorldSceneView *self,
                                                    double *azimuth_deg,
                                                    double *pitch_deg);
@@ -130,10 +172,25 @@ void gworld_scene_view_set_cache_enabled(GWorldSceneView *self,
 
 gboolean gworld_scene_view_get_cache_enabled(GWorldSceneView *self);
 
+void gworld_scene_view_set_texture_memory_budget_mib(GWorldSceneView *self,
+                                                     guint budget_mib);
+
+guint gworld_scene_view_get_texture_memory_budget_mib(GWorldSceneView *self);
+
 void gworld_scene_view_set_sun_position(GWorldSceneView *self,
                                         double azimuth_deg,
                                         double elevation_deg);
 
+/**
+ * gworld_scene_view_get_sun_position:
+ * @self: a scene view
+ * @azimuth_deg: (out) (optional) (transfer none): return location for azimuth in degrees clockwise
+ *   from geographic north
+ * @elevation_deg: (out) (optional) (transfer none): return location for elevation in degrees above
+ *   the horizon
+ *
+ * Reads the current sun position, including time-of-day lighting.
+ */
 void gworld_scene_view_get_sun_position(GWorldSceneView *self,
                                         double *azimuth_deg,
                                         double *elevation_deg);
@@ -152,6 +209,14 @@ void gworld_scene_view_set_fog_range(GWorldSceneView *self,
                                      double start_m,
                                      double end_m);
 
+/**
+ * gworld_scene_view_get_fog_range:
+ * @self: a scene view
+ * @start_m: (out) (optional) (transfer none): return location for fog start distance in metres
+ * @end_m: (out) (optional) (transfer none): return location for fog end distance in metres
+ *
+ * Reads the fog distance range.
+ */
 void gworld_scene_view_get_fog_range(GWorldSceneView *self,
                                      double *start_m,
                                      double *end_m);
@@ -161,6 +226,15 @@ void gworld_scene_view_set_fog_color(GWorldSceneView *self,
                                      double green,
                                      double blue);
 
+/**
+ * gworld_scene_view_get_fog_color:
+ * @self: a scene view
+ * @red: (out) (optional) (transfer none): return location for red component in [0, 1]
+ * @green: (out) (optional) (transfer none): return location for green component in [0, 1]
+ * @blue: (out) (optional) (transfer none): return location for blue component in [0, 1]
+ *
+ * Reads the fog color.
+ */
 void gworld_scene_view_get_fog_color(GWorldSceneView *self,
                                      double *red,
                                      double *green,
@@ -181,7 +255,7 @@ double gworld_scene_view_get_terrain_normal_smoothing(GWorldSceneView *self);
  * @self: a scene view
  * @latitude: latitude in degrees
  * @longitude: longitude in degrees
- * @altitude_amsl: (out): terrain altitude above mean sea level in metres
+ * @altitude_amsl: (out) (transfer none): terrain altitude above mean sea level in metres
  *
  * Samples already-loaded terrain. Returns %FALSE when the corresponding
  * terrain tile has not loaded yet.

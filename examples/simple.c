@@ -17,6 +17,15 @@ env_is_set(const char *value)
   return value != NULL && value[0] != '\0';
 }
 
+static void
+prefer_desktop_gl_for_gtk4(void)
+{
+#if GWORLD_SCENE_GTK_MAJOR == 4
+  if (!env_is_set(g_getenv("GDK_DEBUG")))
+    g_setenv("GDK_DEBUG", "gl-prefer-gl", FALSE);
+#endif
+}
+
 static char *
 extract_json_string(const char *json, const char *field)
 {
@@ -357,6 +366,8 @@ activate(GtkApplication *app, gpointer user_data)
 int
 main(int argc, char **argv)
 {
+  prefer_desktop_gl_for_gtk4();
+
   GtkApplication *app = gtk_application_new("com.supercamel.GWorldScene.Demo",
                                            G_APPLICATION_DEFAULT_FLAGS);
   g_signal_connect(app, "activate", G_CALLBACK(activate), NULL);

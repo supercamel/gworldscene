@@ -40,6 +40,7 @@
 #include <memory>
 #include <mutex>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <utility>
@@ -60,6 +61,8 @@ constexpr double kMercatorMaxLatitude = 85.05112878;
 constexpr int kAtlasTilePixels = 256;
 constexpr int kMaxAtlasTiles = 64;
 constexpr int kMaxAtlasPixels = 4096;
+constexpr guint kDefaultTextureMemoryBudgetMib = 0;
+constexpr guint kMaxTextureMemoryBudgetMib = 65536;
 constexpr guint kSceneUpdateDelayMs = 180;
 constexpr int kMaxTerrainTileLoadsPerUpdate = 3;
 constexpr int kMaxTerrainDownloadsPerUpdate = 8;
@@ -67,6 +70,7 @@ constexpr int kMaxTextureDownloadsPerUpdate = 36;
 constexpr int kMaxPendingTerrainDownloads = 12;
 constexpr int kMaxPendingTextureDownloads = 48;
 constexpr gint64 kTextureAtlasRefreshMinIntervalUs = 650 * 1000;
+constexpr std::size_t kTextureUploadChunkBytes = 32u * 1024u * 1024u;
 constexpr gint64 kTerrainRetryBaseDelayUs = 5 * G_USEC_PER_SEC;
 constexpr gint64 kTerrainRetryMaxDelayUs = 120 * G_USEC_PER_SEC;
 constexpr double kGlobeRenderAltitudeM = 45000.0;
@@ -89,6 +93,7 @@ constexpr double kUltraTextureBubbleRadiusM = 1000.0;
 constexpr double kMeshRecenterRadiusFraction = 0.18;
 constexpr double kMeshRecenterMinDistanceM = 6000.0;
 constexpr double kMeshRecenterMaxDistanceM = 30000.0;
+constexpr double kTerrainLodRingOverlapM = 2000.0;
 constexpr double kDefaultPerfFrameThresholdMs = 24.0;
 constexpr double kDefaultPerfSceneThresholdMs = 8.0;
 constexpr double kDefaultPerfUploadThresholdMs = 3.0;
@@ -156,34 +161,7 @@ struct LatLonBounds {
   double max_lon = 0.0;
 };
 
-struct AtlasRange {
-  int z = 0;
-  int x_min = 0;
-  int x_max = -1;
-  int y_min = 0;
-  int y_max = -1;
-
-  bool valid() const
-  {
-    return z >= 0 && x_min <= x_max && y_min <= y_max;
-  }
-
-  int width_tiles() const
-  {
-    return valid() ? x_max - x_min + 1 : 0;
-  }
-
-  int height_tiles() const
-  {
-    return valid() ? y_max - y_min + 1 : 0;
-  }
-
-  std::string key() const
-  {
-    return std::to_string(z) + ":" + std::to_string(x_min) + ":" + std::to_string(x_max) +
-           ":" + std::to_string(y_min) + ":" + std::to_string(y_max);
-  }
-};
+using AtlasRange = gworld_scene::TileRange;
 
 struct TerrainTile {
   int lat = 0;
@@ -201,6 +179,34 @@ struct TerrainCandidate {
 struct TextureCandidate {
   TileCoord tile;
   double priority = 0.0;
+};
+
+struct TextureRangeTraceStats {
+  const char *label = "";
+  AtlasRange range;
+  int total = 0;
+  int cached = 0;
+  int missing = 0;
+  int candidates = 0;
+  int duplicates = 0;
+};
+
+struct TextureCapacityConfig {
+  int atlas_pixels = kMaxAtlasPixels;
+  int max_atlas_tiles = kMaxAtlasTiles;
+  int max_ultra_atlas_tiles = kMaxUltraAtlasTiles;
+  int max_texture_downloads_per_update = kMaxTextureDownloadsPerUpdate;
+  int max_pending_texture_downloads = kMaxPendingTextureDownloads;
+  double ultra_bubble_radius_m = kUltraTextureBubbleRadiusM;
+};
+
+struct TextureUploadSlot {
+  GLuint texture = 0;
+  int width = 0;
+  int height = 0;
+  int uploaded_rows = 0;
+  std::string key;
+  AtlasRange range;
 };
 
 struct ModelVertex {
@@ -291,6 +297,7 @@ enum class TextureLayer {
   Ultra,
   Detail,
   Mid,
+  Far,
   Base,
   Globe,
 };
@@ -345,11 +352,14 @@ struct GWorldSceneViewState {
   std::string map_tile_template = kDefaultMapTileTemplate;
   std::string cache_directory;
   bool cache_enabled = true;
+  guint texture_memory_budget_mib = kDefaultTextureMemoryBudgetMib;
+  int gl_max_texture_size = kMaxAtlasPixels;
 
   std::unordered_map<std::string, std::shared_ptr<const TerrainTile>> terrain_tiles;
   std::unordered_set<std::string> wanted_terrain_keys;
   std::unordered_set<std::string> pending;
   std::unordered_map<std::string, GCancellable *> pending_cancellables;
+  std::unordered_map<std::string, gint64> pending_started_us;
   std::unordered_set<std::string> unavailable_terrain_keys;
   std::unordered_map<std::string, unsigned int> terrain_failure_counts;
   std::unordered_map<std::string, gint64> terrain_retry_after_us;
@@ -383,6 +393,7 @@ struct GWorldSceneViewState {
   std::string wanted_ultra_texture_key;
   std::string pending_ultra_texture_build_key;
   AtlasRange ultra_texture_atlas_range;
+  TextureUploadSlot ultra_texture_upload;
 
   std::vector<unsigned char> texture_pixels;
   int texture_width = 0;
@@ -392,6 +403,7 @@ struct GWorldSceneViewState {
   std::string wanted_texture_key;
   std::string pending_texture_build_key;
   AtlasRange texture_atlas_range;
+  TextureUploadSlot texture_upload;
 
   std::vector<unsigned char> mid_texture_pixels;
   int mid_texture_width = 0;
@@ -401,6 +413,17 @@ struct GWorldSceneViewState {
   std::string wanted_mid_texture_key;
   std::string pending_mid_texture_build_key;
   AtlasRange mid_texture_atlas_range;
+  TextureUploadSlot mid_texture_upload;
+
+  std::vector<unsigned char> far_texture_pixels;
+  int far_texture_width = 0;
+  int far_texture_height = 0;
+  bool far_texture_dirty = false;
+  std::string loaded_far_texture_key;
+  std::string wanted_far_texture_key;
+  std::string pending_far_texture_build_key;
+  AtlasRange far_texture_atlas_range;
+  TextureUploadSlot far_texture_upload;
 
   std::vector<unsigned char> base_texture_pixels;
   int base_texture_width = 0;
@@ -410,6 +433,7 @@ struct GWorldSceneViewState {
   std::string wanted_base_texture_key;
   std::string pending_base_texture_build_key;
   AtlasRange base_texture_atlas_range;
+  TextureUploadSlot base_texture_upload;
 
   std::vector<unsigned char> globe_texture_pixels;
   int globe_texture_width = 0;
@@ -419,6 +443,7 @@ struct GWorldSceneViewState {
   std::string wanted_globe_texture_key;
   std::string pending_globe_texture_build_key;
   AtlasRange globe_texture_atlas_range;
+  TextureUploadSlot globe_texture_upload;
   guint64 texture_source_revision = 0;
   bool texture_refresh_pending = false;
   gint64 last_texture_refresh_us = 0;
@@ -439,6 +464,7 @@ struct GWorldSceneViewState {
   GLuint ultra_texture = 0;
   GLuint texture = 0;
   GLuint mid_texture = 0;
+  GLuint far_texture = 0;
   GLuint base_texture = 0;
   GLuint globe_texture = 0;
   GLuint model_texture = 0;
@@ -495,6 +521,9 @@ struct DownloadJob {
   std::string kind;
   int terrain_lat = 0;
   int terrain_lon = 0;
+  gint64 queued_at_us = 0;
+  SoupMessage *message = nullptr;
+  GBytes *bytes = nullptr;
 };
 
 struct TerrainLoadJob {
@@ -520,6 +549,7 @@ struct TextureAtlasBuildJob {
   std::string texture_template;
   std::string pending_key;
   guint64 source_revision = 0;
+  gint64 queued_at_us = 0;
 };
 
 struct TextureAtlasBuildResult {
@@ -527,7 +557,11 @@ struct TextureAtlasBuildResult {
   TextureLayer layer = TextureLayer::Detail;
   std::string pending_key;
   guint64 source_revision = 0;
+  gint64 queue_wait_us = 0;
   gint64 build_duration_us = 0;
+  gint64 file_check_duration_us = 0;
+  gint64 decode_duration_us = 0;
+  gint64 blit_duration_us = 0;
   std::vector<unsigned char> pixels;
   int width = 0;
   int height = 0;
@@ -603,6 +637,8 @@ texture_layer_name(TextureLayer layer)
     return "detail";
   case TextureLayer::Mid:
     return "mid";
+  case TextureLayer::Far:
+    return "far";
   case TextureLayer::Base:
     return "base";
   case TextureLayer::Globe:
@@ -621,6 +657,8 @@ texture_layer_pixels(GWorldSceneViewState *state, TextureLayer layer)
     return state->texture_pixels;
   case TextureLayer::Mid:
     return state->mid_texture_pixels;
+  case TextureLayer::Far:
+    return state->far_texture_pixels;
   case TextureLayer::Base:
     return state->base_texture_pixels;
   case TextureLayer::Globe:
@@ -639,6 +677,8 @@ texture_layer_width(GWorldSceneViewState *state, TextureLayer layer)
     return state->texture_width;
   case TextureLayer::Mid:
     return state->mid_texture_width;
+  case TextureLayer::Far:
+    return state->far_texture_width;
   case TextureLayer::Base:
     return state->base_texture_width;
   case TextureLayer::Globe:
@@ -657,6 +697,8 @@ texture_layer_height(GWorldSceneViewState *state, TextureLayer layer)
     return state->texture_height;
   case TextureLayer::Mid:
     return state->mid_texture_height;
+  case TextureLayer::Far:
+    return state->far_texture_height;
   case TextureLayer::Base:
     return state->base_texture_height;
   case TextureLayer::Globe:
@@ -675,12 +717,34 @@ texture_layer_dirty(GWorldSceneViewState *state, TextureLayer layer)
     return state->texture_dirty;
   case TextureLayer::Mid:
     return state->mid_texture_dirty;
+  case TextureLayer::Far:
+    return state->far_texture_dirty;
   case TextureLayer::Base:
     return state->base_texture_dirty;
   case TextureLayer::Globe:
     return state->globe_texture_dirty;
   }
   return state->texture_dirty;
+}
+
+GLuint &
+texture_layer_gl_texture(GWorldSceneViewState *state, TextureLayer layer)
+{
+  switch (layer) {
+  case TextureLayer::Ultra:
+    return state->ultra_texture;
+  case TextureLayer::Detail:
+    return state->texture;
+  case TextureLayer::Mid:
+    return state->mid_texture;
+  case TextureLayer::Far:
+    return state->far_texture;
+  case TextureLayer::Base:
+    return state->base_texture;
+  case TextureLayer::Globe:
+    return state->globe_texture;
+  }
+  return state->texture;
 }
 
 std::string &
@@ -693,6 +757,8 @@ texture_layer_loaded_key(GWorldSceneViewState *state, TextureLayer layer)
     return state->loaded_texture_key;
   case TextureLayer::Mid:
     return state->loaded_mid_texture_key;
+  case TextureLayer::Far:
+    return state->loaded_far_texture_key;
   case TextureLayer::Base:
     return state->loaded_base_texture_key;
   case TextureLayer::Globe:
@@ -711,6 +777,8 @@ texture_layer_wanted_key(GWorldSceneViewState *state, TextureLayer layer)
     return state->wanted_texture_key;
   case TextureLayer::Mid:
     return state->wanted_mid_texture_key;
+  case TextureLayer::Far:
+    return state->wanted_far_texture_key;
   case TextureLayer::Base:
     return state->wanted_base_texture_key;
   case TextureLayer::Globe:
@@ -729,6 +797,8 @@ texture_layer_pending_key(GWorldSceneViewState *state, TextureLayer layer)
     return state->pending_texture_build_key;
   case TextureLayer::Mid:
     return state->pending_mid_texture_build_key;
+  case TextureLayer::Far:
+    return state->pending_far_texture_build_key;
   case TextureLayer::Base:
     return state->pending_base_texture_build_key;
   case TextureLayer::Globe:
@@ -747,12 +817,34 @@ texture_layer_active_range(GWorldSceneViewState *state, TextureLayer layer)
     return state->texture_atlas_range;
   case TextureLayer::Mid:
     return state->mid_texture_atlas_range;
+  case TextureLayer::Far:
+    return state->far_texture_atlas_range;
   case TextureLayer::Base:
     return state->base_texture_atlas_range;
   case TextureLayer::Globe:
     return state->globe_texture_atlas_range;
   }
   return state->texture_atlas_range;
+}
+
+TextureUploadSlot &
+texture_layer_upload_slot(GWorldSceneViewState *state, TextureLayer layer)
+{
+  switch (layer) {
+  case TextureLayer::Ultra:
+    return state->ultra_texture_upload;
+  case TextureLayer::Detail:
+    return state->texture_upload;
+  case TextureLayer::Mid:
+    return state->mid_texture_upload;
+  case TextureLayer::Far:
+    return state->far_texture_upload;
+  case TextureLayer::Base:
+    return state->base_texture_upload;
+  case TextureLayer::Globe:
+    return state->globe_texture_upload;
+  }
+  return state->texture_upload;
 }
 
 gint64
@@ -797,6 +889,14 @@ perf_verbose()
          g_ascii_strcasecmp(value, "verbose") == 0;
 }
 
+bool
+texture_trace_enabled()
+{
+  static const bool enabled =
+    env_flag_enabled("GWORLD_SCENE_TEXTURE_TRACE") || perf_verbose();
+  return enabled;
+}
+
 double
 env_double_or_default(const char *name, double fallback)
 {
@@ -807,6 +907,21 @@ env_double_or_default(const char *name, double fallback)
   char *end = nullptr;
   const double parsed = g_ascii_strtod(value, &end);
   return end != value && std::isfinite(parsed) ? parsed : fallback;
+}
+
+guint
+env_uint_or_default(const char *name, guint fallback, guint maximum)
+{
+  const char *value = g_getenv(name);
+  if (value == nullptr || value[0] == '\0')
+    return fallback;
+
+  char *end = nullptr;
+  const guint64 parsed = g_ascii_strtoull(value, &end, 10);
+  if (end == value)
+    return fallback;
+
+  return static_cast<guint>(std::min<guint64>(parsed, maximum));
 }
 
 double
@@ -837,6 +952,115 @@ double
 bytes_to_mib(std::size_t bytes)
 {
   return static_cast<double>(bytes) / (1024.0 * 1024.0);
+}
+
+std::size_t
+texture_dimensions_bytes(int width, int height)
+{
+  if (width <= 0 || height <= 0)
+    return 0;
+
+  return static_cast<std::size_t>(width) *
+         static_cast<std::size_t>(height) * 4;
+}
+
+std::size_t
+texture_storage_bytes(GLuint texture, int width, int height)
+{
+  return texture != 0 ? texture_dimensions_bytes(width, height) : 0;
+}
+
+std::size_t
+estimated_active_texture_storage_bytes_locked(const GWorldSceneViewState *state)
+{
+  if (state == nullptr)
+    return 0;
+
+  return texture_storage_bytes(state->ultra_texture,
+                               state->ultra_texture_width,
+                               state->ultra_texture_height) +
+         texture_storage_bytes(state->texture,
+                               state->texture_width,
+                               state->texture_height) +
+         texture_storage_bytes(state->mid_texture,
+                               state->mid_texture_width,
+                               state->mid_texture_height) +
+         texture_storage_bytes(state->far_texture,
+                               state->far_texture_width,
+                               state->far_texture_height) +
+         texture_storage_bytes(state->base_texture,
+                               state->base_texture_width,
+                               state->base_texture_height) +
+         texture_storage_bytes(state->globe_texture,
+                               state->globe_texture_width,
+                               state->globe_texture_height) +
+         texture_storage_bytes(state->model_texture,
+                               state->model_texture_width,
+                               state->model_texture_height);
+}
+
+int
+atlas_tiles_for_pixels(int atlas_pixels)
+{
+  const int tiles_per_axis = std::max(1, atlas_pixels / kAtlasTilePixels);
+  return tiles_per_axis * tiles_per_axis;
+}
+
+int
+clamped_atlas_pixels(int requested_pixels, int gl_max_texture_size)
+{
+  const int max_texture_size =
+    gl_max_texture_size >= kAtlasTilePixels ? gl_max_texture_size : kMaxAtlasPixels;
+  const int clamped = std::clamp(requested_pixels, kAtlasTilePixels, max_texture_size);
+  return std::max(kAtlasTilePixels, (clamped / kAtlasTilePixels) * kAtlasTilePixels);
+}
+
+TextureCapacityConfig
+texture_capacity_config_for_state(const GWorldSceneViewState *state)
+{
+  TextureCapacityConfig config;
+  const guint budget_mib =
+    state != nullptr ? state->texture_memory_budget_mib : kDefaultTextureMemoryBudgetMib;
+
+  if (budget_mib >= 16384) {
+    config.atlas_pixels = 16384;
+    config.max_atlas_tiles = 4096;
+    config.max_ultra_atlas_tiles = 4096;
+    config.max_texture_downloads_per_update = 144;
+    config.max_pending_texture_downloads = 384;
+    config.ultra_bubble_radius_m = 4500.0;
+  } else if (budget_mib >= 8192) {
+    config.atlas_pixels = 12288;
+    config.max_atlas_tiles = 2304;
+    config.max_ultra_atlas_tiles = 2304;
+    config.max_texture_downloads_per_update = 108;
+    config.max_pending_texture_downloads = 288;
+    config.ultra_bubble_radius_m = 3000.0;
+  } else if (budget_mib >= 2048) {
+    config.atlas_pixels = 8192;
+    config.max_atlas_tiles = 1024;
+    config.max_ultra_atlas_tiles = 1024;
+    config.max_texture_downloads_per_update = 72;
+    config.max_pending_texture_downloads = 192;
+    config.ultra_bubble_radius_m = 2000.0;
+  }
+
+  config.atlas_pixels =
+    clamped_atlas_pixels(config.atlas_pixels,
+                         state != nullptr ? state->gl_max_texture_size : kMaxAtlasPixels);
+  const int max_tiles_for_atlas = atlas_tiles_for_pixels(config.atlas_pixels);
+  config.max_atlas_tiles = std::clamp(config.max_atlas_tiles, 1, max_tiles_for_atlas);
+  config.max_ultra_atlas_tiles = std::clamp(config.max_ultra_atlas_tiles, 1, max_tiles_for_atlas);
+  return config;
+}
+
+void
+update_gl_texture_limit_locked(GWorldSceneViewState *state)
+{
+  GLint max_texture_size = 0;
+  glGetIntegerv(GL_MAX_TEXTURE_SIZE, &max_texture_size);
+  if (max_texture_size >= kAtlasTilePixels)
+    state->gl_max_texture_size = static_cast<int>(max_texture_size);
 }
 
 std::string
@@ -884,46 +1108,6 @@ terrain_key(int lat_floor, int lon_floor)
 }
 
 int
-texture_zoom_for_altitude(double altitude_amsl)
-{
-  if (altitude_amsl < 1800.0)
-    return 16;
-  if (altitude_amsl < 6500.0)
-    return 15;
-  if (altitude_amsl < 14000.0)
-    return 14;
-  if (altitude_amsl < 32000.0)
-    return 13;
-  if (altitude_amsl < 85000.0)
-    return 12;
-  return 11;
-}
-
-int
-detail_texture_zoom_for_altitude(double altitude_amsl)
-{
-  return std::clamp(texture_zoom_for_altitude(altitude_amsl) + 1, 0, 18);
-}
-
-int
-ultra_texture_zoom_for_altitude(double altitude_amsl)
-{
-  return std::clamp(detail_texture_zoom_for_altitude(altitude_amsl) + 1, 0, 18);
-}
-
-int
-base_texture_zoom_for_altitude(double altitude_amsl)
-{
-  return std::clamp(texture_zoom_for_altitude(altitude_amsl) - 6, 4, 10);
-}
-
-int
-mid_texture_zoom_for_altitude(double altitude_amsl)
-{
-  return std::clamp(texture_zoom_for_altitude(altitude_amsl) - 3, 6, 13);
-}
-
-int
 terrain_step_for_altitude(double altitude_amsl)
 {
   if (altitude_amsl < 1200.0)
@@ -945,36 +1129,6 @@ terrain_build_radius_for_altitude(double altitude_amsl)
 }
 
 double
-texture_radius_for_altitude(double altitude_amsl)
-{
-  return std::clamp(altitude_amsl * 2.1, 5250.0, 27000.0);
-}
-
-double
-ultra_texture_lateral_radius_for_agl(double altitude_agl_m)
-{
-  const double altitude_agl = std::clamp(altitude_agl_m, 0.0, kUltraTextureBubbleRadiusM);
-  if (altitude_agl >= kUltraTextureBubbleRadiusM)
-    return 0.0;
-  return std::sqrt(kUltraTextureBubbleRadiusM * kUltraTextureBubbleRadiusM -
-                   altitude_agl * altitude_agl);
-}
-
-double
-ultra_texture_atlas_radius(double latitude, int zoom, double lateral_radius_m)
-{
-  if (lateral_radius_m <= 0.0)
-    return 0.0;
-
-  const double latitude_scale = std::max(0.05, std::cos(deg_to_rad(latitude)));
-  const double meters_per_tile =
-    360.0 * kEarthMetersPerDegree * latitude_scale / static_cast<double>(1 << zoom);
-  const double max_tile_span = std::max(1.0, static_cast<double>(kMaxUltraAtlasTilesPerAxis - 1));
-  const double max_radius_m = meters_per_tile * max_tile_span * 0.5;
-  return std::min(lateral_radius_m, max_radius_m);
-}
-
-double
 terrain_near_radius_for_altitude(double altitude_amsl, double terrain_radius)
 {
   return std::min(terrain_radius, std::clamp(altitude_amsl * 6.0, 10000.0, 45000.0));
@@ -985,12 +1139,6 @@ terrain_mid_radius_for_altitude(double altitude_amsl, double terrain_radius)
 {
   const double near_radius = terrain_near_radius_for_altitude(altitude_amsl, terrain_radius);
   return std::min(terrain_radius, std::max(near_radius, near_radius * 3.0));
-}
-
-double
-mid_texture_radius_for_altitude(double altitude_amsl, double terrain_radius)
-{
-  return std::min(terrain_radius, terrain_mid_radius_for_altitude(altitude_amsl, terrain_radius) * 1.15);
 }
 
 double
@@ -1064,10 +1212,28 @@ terrain_uri_from_template(const std::string &templ, const std::string &tile_name
 std::string
 terrain_cache_path_for_uri(const std::string &cache_dir,
                            const std::string &uri,
+                           const std::string &terrain_template,
                            const std::string &tile_name)
 {
-  const std::string extension = contains(uri, ".zip") ? ".hgt.zip" : ".hgt";
-  return join_path(join_path(cache_dir, "terrain"), tile_name + extension);
+  g_autofree char *provider_key = g_compute_checksum_for_string(
+    G_CHECKSUM_SHA256, terrain_template.c_str(), -1);
+  const std::string uri_path = uri.substr(0, uri.find_first_of("?#"));
+  const bool zipped = uri_path.size() >= 4 &&
+    g_ascii_strcasecmp(uri_path.c_str() + uri_path.size() - 4, ".zip") == 0;
+  return join_path(join_path(join_path(cache_dir, "terrain"), provider_key),
+                    tile_name + (zipped ? ".hgt.zip" : ".hgt"));
+}
+
+std::string
+existing_terrain_cache_path(const std::string &path)
+{
+  if (g_file_test(path.c_str(), G_FILE_TEST_IS_REGULAR))
+    return path;
+
+  // Both formats are accepted, but only within this source's cache directory.
+  const std::string alternate = ends_with(path, ".zip")
+    ? path.substr(0, path.size() - 4) : path + ".zip";
+  return g_file_test(alternate.c_str(), G_FILE_TEST_IS_REGULAR) ? alternate : "";
 }
 
 std::string
@@ -1125,59 +1291,10 @@ lat_to_tile_y(double lat_deg, int zoom)
 }
 
 AtlasRange
-lat_lon_bounds_to_tile_range(const LatLonBounds &bounds, int zoom)
+globe_atlas_range(double latitude, double longitude, double altitude_amsl, int max_pixels)
 {
-  const int n = 1 << zoom;
-  const double x0 = lon_to_tile_x(bounds.min_lon, zoom);
-  const double x1 = lon_to_tile_x(bounds.max_lon, zoom);
-  const double y0 = lat_to_tile_y(bounds.max_lat, zoom);
-  const double y1 = lat_to_tile_y(bounds.min_lat, zoom);
-
-  AtlasRange range;
-  range.z = zoom;
-  range.x_min = std::clamp(static_cast<int>(std::floor(std::min(x0, x1))), 0, n - 1);
-  range.x_max = std::clamp(static_cast<int>(std::floor(std::max(x0, x1))), 0, n - 1);
-  range.y_min = std::clamp(static_cast<int>(std::floor(std::min(y0, y1))), 0, n - 1);
-  range.y_max = std::clamp(static_cast<int>(std::floor(std::max(y0, y1))), 0, n - 1);
-  return range;
-}
-
-bool
-atlas_range_fits(const AtlasRange &range, int max_tiles)
-{
-  const int width = range.width_tiles();
-  const int height = range.height_tiles();
-  return width * height <= max_tiles &&
-         width * kAtlasTilePixels <= kMaxAtlasPixels &&
-         height * kAtlasTilePixels <= kMaxAtlasPixels;
-}
-
-AtlasRange
-select_atlas_range(const LatLonBounds &bounds, int desired_zoom, int max_tiles = kMaxAtlasTiles)
-{
-  AtlasRange fallback;
-  for (int zoom = std::clamp(desired_zoom, 0, 18); zoom >= 0; --zoom) {
-    AtlasRange range = lat_lon_bounds_to_tile_range(bounds, zoom);
-    fallback = range;
-    if (atlas_range_fits(range, max_tiles)) {
-      return range;
-    }
-  }
-  return fallback;
-}
-
-AtlasRange
-globe_atlas_range(double latitude, double longitude, double altitude_amsl)
-{
-  const gworld_scene::TileRange lod_range =
-    gworld_scene::globe_texture_range_for_camera(latitude, longitude, altitude_amsl);
-  AtlasRange range;
-  range.z = lod_range.z;
-  range.x_min = lod_range.x_min;
-  range.x_max = lod_range.x_max;
-  range.y_min = lod_range.y_min;
-  range.y_max = lod_range.y_max;
-  return range;
+  return gworld_scene::globe_texture_range_for_camera(latitude, longitude, altitude_amsl,
+                                                      max_pixels / kAtlasTilePixels);
 }
 
 LatLonBounds
@@ -1185,13 +1302,13 @@ bounds_around_camera(double latitude, double longitude, double radius_m)
 {
   const double lat_delta = radius_m / kEarthMetersPerDegree;
   const double lon_scale = std::max(0.05, std::cos(deg_to_rad(latitude)));
-  const double lon_delta = radius_m / (kEarthMetersPerDegree * lon_scale);
+  const double lon_delta = std::min(180.0, radius_m / (kEarthMetersPerDegree * lon_scale));
 
   LatLonBounds bounds;
   bounds.min_lat = std::clamp(latitude - lat_delta, -90.0, 90.0);
   bounds.max_lat = std::clamp(latitude + lat_delta, -90.0, 90.0);
-  bounds.min_lon = std::clamp(longitude - lon_delta, -180.0, 180.0);
-  bounds.max_lon = std::clamp(longitude + lon_delta, -180.0, 180.0);
+  bounds.min_lon = longitude - lon_delta;
+  bounds.max_lon = longitude + lon_delta;
   return bounds;
 }
 
@@ -1262,25 +1379,6 @@ altitude_mode_uses_terrain(GWorldSceneAltitudeMode altitude_mode)
 {
   return altitude_mode == GWORLD_SCENE_ALTITUDE_AGL ||
          altitude_mode == GWORLD_SCENE_ALTITUDE_CLAMP_TO_GROUND;
-}
-
-AtlasRange
-select_ultra_atlas_range(double latitude,
-                         double longitude,
-                         int zoom,
-                         double &lateral_radius_m)
-{
-  for (int attempt = 0; attempt < 6 && lateral_radius_m > 0.0; ++attempt) {
-    const LatLonBounds bounds = bounds_around_camera(latitude, longitude, lateral_radius_m);
-    AtlasRange range = lat_lon_bounds_to_tile_range(bounds, zoom);
-    if (atlas_range_fits(range, kMaxUltraAtlasTiles))
-      return range;
-
-    lateral_radius_m *= 0.88;
-  }
-
-  lateral_radius_m = 0.0;
-  return AtlasRange();
 }
 
 glm::dvec3
@@ -1652,6 +1750,7 @@ terrain_height_at_lat_lon_locked(GWorldSceneViewState *state,
                                  double longitude,
                                  double &height_amsl)
 {
+  longitude = gworld_scene::wrap_longitude(longitude);
   const int lat_floor = static_cast<int>(std::floor(latitude));
   const int lon_floor = static_cast<int>(std::floor(longitude));
   auto iter = state->terrain_tiles.find(terrain_key(lat_floor, lon_floor));
@@ -4121,7 +4220,8 @@ terrain_mesh_position_for_geo_point_locked(GWorldSceneViewState *state,
                                            glm::dvec3 &position)
 {
   const int lat_floor = static_cast<int>(std::floor(point.latitude));
-  const int lon_floor = static_cast<int>(std::floor(point.longitude));
+  const double longitude = gworld_scene::wrap_longitude(point.longitude);
+  const int lon_floor = static_cast<int>(std::floor(longitude));
   auto iter = state->terrain_tiles.find(terrain_key(lat_floor, lon_floor));
   if (iter == state->terrain_tiles.end())
     return false;
@@ -4134,7 +4234,7 @@ terrain_mesh_position_for_geo_point_locked(GWorldSceneViewState *state,
   sample_step = std::clamp(sample_step, 1, tile.dimension - 1);
 
   const double sample_scale = static_cast<double>(tile.dimension - 1);
-  const double sx = std::clamp((point.longitude - static_cast<double>(lon_floor)) * sample_scale,
+  const double sx = std::clamp((longitude - static_cast<double>(lon_floor)) * sample_scale,
                                0.0,
                                sample_scale);
   const double sy = std::clamp((static_cast<double>(lat_floor + 1) - point.latitude) * sample_scale,
@@ -5451,47 +5551,27 @@ rebuild_globe_mesh(GWorldSceneViewState *state, const AtlasRange &range)
   return true;
 }
 
-void
-append_flat_mesh(GWorldSceneViewState *state,
-                 const AtlasRange &ultra_range,
-                 const AtlasRange &detail_range,
-                 const AtlasRange &mid_range,
-                 const AtlasRange &base_range)
+bool
+terrain_cell_intersects_lod_ring(const glm::dvec3 &p00,
+                                 const glm::dvec3 &p10,
+                                 const glm::dvec3 &p01,
+                                 const glm::dvec3 &p11,
+                                 const glm::dvec3 &center,
+                                 double inner_radius_m,
+                                 double outer_radius_m)
 {
-  const double radius = terrain_build_radius_for_altitude(state->altitude_amsl);
-  const glm::dvec3 p00(-radius, 0.0, radius);
-  const glm::dvec3 p10(radius, 0.0, radius);
-  const glm::dvec3 p01(-radius, 0.0, -radius);
-  const glm::dvec3 p11(radius, 0.0, -radius);
-  const double lat_delta = radius / kEarthMetersPerDegree;
-  const double lon_scale = std::max(0.05, std::cos(deg_to_rad(state->latitude)));
-  const double lon_delta = radius / (kEarthMetersPerDegree * lon_scale);
-  auto lat_lon_uv = [](double latitude, double longitude) {
-    TexCoords uv;
-    uv.detail_u = static_cast<float>(latitude);
-    uv.detail_v = static_cast<float>(longitude);
-    uv.mid_u = -1.0f;
-    uv.mid_v = -1.0f;
-    uv.base_u = -1.0f;
-    uv.base_v = -1.0f;
-    uv.ultra_u = -1.0f;
-    uv.ultra_v = -1.0f;
-    return uv;
-  };
-  const TexCoords uv00 = lat_lon_uv(state->latitude - lat_delta, state->longitude - lon_delta);
-  const TexCoords uv10 = lat_lon_uv(state->latitude - lat_delta, state->longitude + lon_delta);
-  const TexCoords uv01 = lat_lon_uv(state->latitude + lat_delta, state->longitude - lon_delta);
-  const TexCoords uv11 = lat_lon_uv(state->latitude + lat_delta, state->longitude + lon_delta);
+  const double d00 = std::hypot(p00.x, p00.z);
+  const double d10 = std::hypot(p10.x, p10.z);
+  const double d01 = std::hypot(p01.x, p01.z);
+  const double d11 = std::hypot(p11.x, p11.z);
+  const double dc = std::hypot(center.x, center.z);
+  double min_distance = std::min(std::min(d00, d10), std::min(d01, d11));
+  double max_distance = std::max(std::max(d00, d10), std::max(d01, d11));
+  min_distance = std::min(min_distance, dc);
+  max_distance = std::max(max_distance, dc);
 
-  state->vertices.clear();
-  state->indices.clear();
-  append_triangle(state->vertices, state->indices, p00, p10, p01, uv00, uv10, uv01);
-  append_triangle(state->vertices, state->indices, p10, p11, p01, uv10, uv11, uv01);
-  state->mesh_ultra_atlas_range = ultra_range;
-  state->mesh_atlas_range = detail_range;
-  state->mesh_mid_atlas_range = mid_range;
-  state->mesh_base_atlas_range = base_range;
-  state->mesh_dirty = true;
+  return max_distance > inner_radius_m &&
+         min_distance <= outer_radius_m + kTerrainLodRingOverlapM;
 }
 
 void
@@ -5549,14 +5629,43 @@ append_terrain_tile_mesh_ring(GWorldSceneViewState *state,
 
       const double center_lat = (lat00 + lat10 + lat01 + lat11) * 0.25;
       const double center_lon = (lon00 + lon10 + lon01 + lon11) * 0.25;
+      const glm::dvec3 p00_ground = geodetic_to_enu(lat00,
+                                                    lon00,
+                                                    0.0,
+                                                    state->mesh_origin_latitude,
+                                                    state->mesh_origin_longitude,
+                                                    0.0);
+      const glm::dvec3 p10_ground = geodetic_to_enu(lat10,
+                                                    lon10,
+                                                    0.0,
+                                                    state->mesh_origin_latitude,
+                                                    state->mesh_origin_longitude,
+                                                    0.0);
+      const glm::dvec3 p01_ground = geodetic_to_enu(lat01,
+                                                    lon01,
+                                                    0.0,
+                                                    state->mesh_origin_latitude,
+                                                    state->mesh_origin_longitude,
+                                                    0.0);
+      const glm::dvec3 p11_ground = geodetic_to_enu(lat11,
+                                                    lon11,
+                                                    0.0,
+                                                    state->mesh_origin_latitude,
+                                                    state->mesh_origin_longitude,
+                                                    0.0);
       const glm::dvec3 center = geodetic_to_enu(center_lat,
                                                center_lon,
                                                0.0,
                                                state->mesh_origin_latitude,
                                                state->mesh_origin_longitude,
                                                0.0);
-      const double center_distance = std::hypot(center.x, center.z);
-      if (center_distance <= inner_radius_m || center_distance > outer_radius_m + 2000.0)
+      if (!terrain_cell_intersects_lod_ring(p00_ground,
+                                            p10_ground,
+                                            p01_ground,
+                                            p11_ground,
+                                            center,
+                                            inner_radius_m,
+                                            outer_radius_m))
         continue;
 
       const glm::dvec3 p00 = geodetic_to_enu(lat00,
@@ -5715,8 +5824,29 @@ rebuild_world_mesh(GWorldSceneViewState *state,
                                radius_m,
                                sample_step);
 
-    if (state->vertices.empty())
-      append_flat_mesh(state, ultra_range, detail_range, mid_range, base_range);
+    // Keep imagery visible in missing tiles during progressive loading (and
+    // over ocean tiles that providers do not supply). A single flat plane would
+    // overlap loaded terrain, hiding negative elevations and distant curvature.
+    const LatLonBounds bounds = bounds_around_camera(state->mesh_origin_latitude,
+                                                     state->mesh_origin_longitude,
+                                                     radius_m);
+    TerrainTile fallback;
+    fallback.dimension = 17;
+    fallback.heights.resize(fallback.dimension * fallback.dimension, 0);
+    const int lon_min = static_cast<int>(std::floor(bounds.min_lon));
+    const int lon_max = std::min(static_cast<int>(std::floor(bounds.max_lon)), lon_min + 359);
+    const int lat_min = std::max(-90, static_cast<int>(std::floor(bounds.min_lat)));
+    const int lat_max = std::min(89, static_cast<int>(std::floor(bounds.max_lat)));
+    for (int lat = lat_min; lat <= lat_max; ++lat) {
+      for (int lon = lon_min; lon <= lon_max; ++lon) {
+        fallback.lat = lat;
+        fallback.lon = static_cast<int>(gworld_scene::wrap_longitude(lon));
+        if (state->terrain_tiles.find(terrain_key(fallback.lat, fallback.lon)) != state->terrain_tiles.end())
+          continue;
+        append_terrain_tile_mesh(state, fallback, ultra_range, detail_range, mid_range,
+                                 base_range, ultra_lateral_radius_m, radius_m, 1);
+      }
+    }
   }
 
   append_scene_nodes(state);
@@ -6335,20 +6465,21 @@ ensure_shadow_resources(GWorldSceneViewState *state)
                  kShadowMapSize,
                  0,
                  GL_DEPTH_COMPONENT,
-                 GL_FLOAT,
+                 GL_UNSIGNED_INT,
                  nullptr);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_BORDER);
-    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_BORDER);
-    const float border_color[] = {1.0f, 1.0f, 1.0f, 1.0f};
-    glTexParameterfv(GL_TEXTURE_2D, GL_TEXTURE_BORDER_COLOR, border_color);
+    // PCF is performed by the shader; raw depth sampling on GLES requires nearest filtering.
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
     glBindTexture(GL_TEXTURE_2D, 0);
   }
 
   if (state->shadow_fbo == 0) {
-    GLint previous_fbo = 0;
-    glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previous_fbo);
+    GLint previous_draw_fbo = 0;
+    GLint previous_read_fbo = 0;
+    glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previous_draw_fbo);
+    glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING, &previous_read_fbo);
     glGenFramebuffers(1, &state->shadow_fbo);
     glBindFramebuffer(GL_FRAMEBUFFER, state->shadow_fbo);
     glFramebufferTexture2D(GL_FRAMEBUFFER,
@@ -6356,11 +6487,17 @@ ensure_shadow_resources(GWorldSceneViewState *state)
                            GL_TEXTURE_2D,
                            state->shadow_depth_texture,
                            0);
-    glDrawBuffer(GL_NONE);
+    const GLenum draw_buffer = GL_NONE;
+    glDrawBuffers(1, &draw_buffer);
     glReadBuffer(GL_NONE);
     const GLenum status = glCheckFramebufferStatus(GL_FRAMEBUFFER);
-    glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previous_fbo));
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(previous_draw_fbo));
+    glBindFramebuffer(GL_READ_FRAMEBUFFER, static_cast<GLuint>(previous_read_fbo));
     if (status != GL_FRAMEBUFFER_COMPLETE) {
+      glDeleteFramebuffers(1, &state->shadow_fbo);
+      glDeleteTextures(1, &state->shadow_depth_texture);
+      state->shadow_fbo = 0;
+      state->shadow_depth_texture = 0;
       g_warning("Shadow framebuffer is incomplete: 0x%x", status);
       return false;
     }
@@ -6402,10 +6539,10 @@ render_shadow_map(GWorldSceneViewState *state, const glm::mat4 &light_mvp)
     return false;
 
   GLint previous_fbo = 0;
-  glGetIntegerv(GL_FRAMEBUFFER_BINDING, &previous_fbo);
+  glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previous_fbo);
 
   glViewport(0, 0, kShadowMapSize, kShadowMapSize);
-  glBindFramebuffer(GL_FRAMEBUFFER, state->shadow_fbo);
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, state->shadow_fbo);
   glClear(GL_DEPTH_BUFFER_BIT);
   glUseProgram(state->shadow_program);
   glUniformMatrix4fv(glGetUniformLocation(state->shadow_program, "light_mvp"),
@@ -6421,7 +6558,7 @@ render_shadow_map(GWorldSceneViewState *state, const glm::mat4 &light_mvp)
   glBindVertexArray(0);
   glDisable(GL_POLYGON_OFFSET_FILL);
   glUseProgram(0);
-  glBindFramebuffer(GL_FRAMEBUFFER, static_cast<GLuint>(previous_fbo));
+  glBindFramebuffer(GL_DRAW_FRAMEBUFFER, static_cast<GLuint>(previous_fbo));
   return true;
 }
 
@@ -6430,14 +6567,28 @@ delete_gl_resources(GWorldSceneViewState *state)
 {
   if (state->ultra_texture)
     glDeleteTextures(1, &state->ultra_texture);
+  if (state->ultra_texture_upload.texture)
+    glDeleteTextures(1, &state->ultra_texture_upload.texture);
   if (state->texture)
     glDeleteTextures(1, &state->texture);
+  if (state->texture_upload.texture)
+    glDeleteTextures(1, &state->texture_upload.texture);
   if (state->mid_texture)
     glDeleteTextures(1, &state->mid_texture);
+  if (state->mid_texture_upload.texture)
+    glDeleteTextures(1, &state->mid_texture_upload.texture);
+  if (state->far_texture)
+    glDeleteTextures(1, &state->far_texture);
+  if (state->far_texture_upload.texture)
+    glDeleteTextures(1, &state->far_texture_upload.texture);
   if (state->base_texture)
     glDeleteTextures(1, &state->base_texture);
+  if (state->base_texture_upload.texture)
+    glDeleteTextures(1, &state->base_texture_upload.texture);
   if (state->globe_texture)
     glDeleteTextures(1, &state->globe_texture);
+  if (state->globe_texture_upload.texture)
+    glDeleteTextures(1, &state->globe_texture_upload.texture);
   if (state->model_texture)
     glDeleteTextures(1, &state->model_texture);
   for (auto &entry : state->scene_image_textures) {
@@ -6491,10 +6642,17 @@ delete_gl_resources(GWorldSceneViewState *state)
     glDeleteProgram(state->sun_program);
 
   state->ultra_texture = 0;
+  state->ultra_texture_upload = TextureUploadSlot();
   state->texture = 0;
+  state->texture_upload = TextureUploadSlot();
   state->mid_texture = 0;
+  state->mid_texture_upload = TextureUploadSlot();
+  state->far_texture = 0;
+  state->far_texture_upload = TextureUploadSlot();
   state->base_texture = 0;
+  state->base_texture_upload = TextureUploadSlot();
   state->globe_texture = 0;
+  state->globe_texture_upload = TextureUploadSlot();
   state->model_texture = 0;
   state->shadow_depth_texture = 0;
   state->shadow_fbo = 0;
@@ -6520,6 +6678,19 @@ delete_gl_resources(GWorldSceneViewState *state)
   state->sun_program = 0;
   state->index_count = 0;
   state->globe_index_count = 0;
+  state->mesh_dirty = true;
+  state->globe_mesh_dirty = true;
+  state->model_texture_dirty = true;
+  // Atlas pixels are released after upload, so rebuild them after context recreation.
+  for (TextureLayer layer : {TextureLayer::Ultra, TextureLayer::Detail,
+                             TextureLayer::Mid, TextureLayer::Far, TextureLayer::Base, TextureLayer::Globe}) {
+    texture_layer_loaded_key(state, layer).clear();
+    texture_layer_pixels(state, layer).clear();
+    texture_layer_width(state, layer) = 0;
+    texture_layer_height(state, layer) = 0;
+    texture_layer_active_range(state, layer) = AtlasRange();
+    texture_layer_dirty(state, layer) = false;
+  }
 }
 
 void
@@ -6737,6 +6908,16 @@ upload_texture_buffer_if_needed(GLuint &texture,
             height,
             pixels.size());
   }
+  if (texture_trace_enabled()) {
+    g_message("GWorldScene texture-trace upload layer=%s texture=%u size=%dx%d bytes=%.1fMiB duration=%.2fms error=0x%x",
+              label,
+              texture,
+              width,
+              height,
+              bytes_to_mib(expected_size),
+              duration_ms,
+              error);
+  }
 
   dirty = false;
   if (stats != nullptr) {
@@ -6752,68 +6933,261 @@ upload_texture_buffer_if_needed(GLuint &texture,
   return true;
 }
 
+void
+configure_texture_sampler()
+{
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+  glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+}
+
+bool
+upload_atlas_texture_chunk_if_needed(GWorldSceneViewState *state,
+                                     TextureLayer layer,
+                                     PerfTextureUploadStats *stats = nullptr)
+{
+  auto &pixels = texture_layer_pixels(state, layer);
+  int &width = texture_layer_width(state, layer);
+  int &height = texture_layer_height(state, layer);
+  bool &dirty = texture_layer_dirty(state, layer);
+  if (!dirty)
+    return false;
+
+  const char *label = texture_layer_name(layer);
+  GLuint &active_texture = texture_layer_gl_texture(state, layer);
+  TextureUploadSlot &upload = texture_layer_upload_slot(state, layer);
+  auto &loaded_key = texture_layer_loaded_key(state, layer);
+  auto &active_range = texture_layer_active_range(state, layer);
+  const std::string &wanted_key = texture_layer_wanted_key(state, layer);
+
+  if (pixels.empty() || width <= 0 || height <= 0) {
+    if (active_texture) {
+      glDeleteTextures(1, &active_texture);
+      active_texture = 0;
+      g_debug("Texture upload cleared: layer=%s", label);
+    }
+    if (upload.texture) {
+      glDeleteTextures(1, &upload.texture);
+      upload.texture = 0;
+    }
+    upload = TextureUploadSlot();
+    active_range = AtlasRange();
+    dirty = false;
+    return false;
+  }
+
+  const std::size_t expected_size = texture_dimensions_bytes(width, height);
+  if (pixels.size() < expected_size) {
+    g_warning("Texture upload skipped: layer=%s size=%dx%d bytes=%zu expected=%zu",
+              label,
+              width,
+              height,
+              pixels.size(),
+              expected_size);
+    if (upload.texture) {
+      glDeleteTextures(1, &upload.texture);
+      upload.texture = 0;
+    }
+    pixels.clear();
+    upload = TextureUploadSlot();
+    dirty = false;
+    return false;
+  }
+
+  if (!upload.key.empty() && !wanted_key.empty() && upload.key != wanted_key) {
+    if (texture_trace_enabled()) {
+      g_message("GWorldScene texture-trace upload layer=%s action=cancel-stale key=%s wanted=%s",
+                label,
+                upload.key.c_str(),
+                wanted_key.c_str());
+    }
+    pixels.clear();
+    width = 0;
+    height = 0;
+    upload.width = 0;
+    upload.height = 0;
+    upload.uploaded_rows = 0;
+    upload.key.clear();
+    upload.range = AtlasRange();
+    dirty = false;
+    return false;
+  }
+
+  if (upload.key.empty())
+    upload.key = wanted_key;
+  upload.width = width;
+  upload.height = height;
+
+  const gint64 start_us = perf_now_us();
+  if (upload.texture == 0)
+    glGenTextures(1, &upload.texture);
+
+  glBindTexture(GL_TEXTURE_2D, upload.texture);
+  configure_texture_sampler();
+  glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+  if (upload.uploaded_rows <= 0) {
+    glTexImage2D(GL_TEXTURE_2D,
+                 0,
+                 GL_RGBA8,
+                 width,
+                 height,
+                 0,
+                 GL_RGBA,
+                 GL_UNSIGNED_BYTE,
+                 nullptr);
+  }
+
+  const std::size_t row_bytes = static_cast<std::size_t>(width) * 4;
+  const int rows_per_chunk =
+    std::max(1, static_cast<int>(kTextureUploadChunkBytes / std::max<std::size_t>(row_bytes, 1)));
+  const int y = std::clamp(upload.uploaded_rows, 0, height);
+  const int rows = std::min(rows_per_chunk, height - y);
+  if (rows > 0) {
+    const auto *src = pixels.data() + static_cast<std::size_t>(y) * row_bytes;
+    glTexSubImage2D(GL_TEXTURE_2D,
+                    0,
+                    0,
+                    y,
+                    width,
+                    rows,
+                    GL_RGBA,
+                    GL_UNSIGNED_BYTE,
+                    src);
+    upload.uploaded_rows = y + rows;
+  }
+
+  const GLenum error = glGetError();
+  glBindTexture(GL_TEXTURE_2D, 0);
+  const double duration_ms = perf_elapsed_ms(start_us);
+  const bool complete = error == GL_NO_ERROR && upload.uploaded_rows >= height;
+
+  if (texture_trace_enabled()) {
+    g_message("GWorldScene texture-trace upload layer=%s texture=%u action=chunk row=%d/%d rows=%d size=%dx%d bytes=%.1fMiB duration=%.2fms error=0x%x complete=%d",
+              label,
+              upload.texture,
+              upload.uploaded_rows,
+              height,
+              rows,
+              width,
+              height,
+              bytes_to_mib(static_cast<std::size_t>(std::max(0, rows)) * row_bytes),
+              duration_ms,
+              error,
+              complete ? 1 : 0);
+  }
+
+  if (error != GL_NO_ERROR) {
+    g_warning("Texture upload reported GL error: layer=%s texture=%u size=%dx%d row=%d/%d error=0x%x",
+              label,
+              upload.texture,
+              width,
+              height,
+              upload.uploaded_rows,
+              height,
+              error);
+    if (upload.texture) {
+      glDeleteTextures(1, &upload.texture);
+      upload.texture = 0;
+    }
+    upload = TextureUploadSlot();
+    dirty = false;
+    return false;
+  }
+
+  if (stats != nullptr) {
+    stats->attempted = true;
+    stats->uploaded = true;
+    stats->layer = label;
+    stats->duration_ms = duration_ms;
+    stats->width = width;
+    stats->height = rows;
+    stats->bytes = static_cast<std::size_t>(std::max(0, rows)) * row_bytes;
+    stats->error = error;
+    stats->deferred = !complete;
+  }
+
+  if (!complete)
+    return true;
+
+  if (active_texture)
+    glDeleteTextures(1, &active_texture);
+  active_texture = upload.texture;
+  upload.texture = 0;
+  active_range = upload.range;
+  loaded_key = upload.key;
+  upload = TextureUploadSlot();
+  pixels.clear();
+  dirty = false;
+  g_debug("Texture uploaded: layer=%s texture=%u size=%dx%d bytes=%zu",
+          label,
+          active_texture,
+          width,
+          height,
+          expected_size);
+  return true;
+}
+
 bool
 upload_textures_if_needed(GWorldSceneViewState *state, PerfTextureUploadStats *stats = nullptr)
 {
   bool uploaded_this_frame = false;
   bool has_more_uploads = false;
 
-  auto upload_layer = [&](GLuint &texture,
-                          const char *label,
-                          const std::vector<unsigned char> &pixels,
-                          int width,
-                          int height,
-                          bool &dirty) {
+  auto upload_atlas_layer = [&](TextureLayer layer) {
+    bool &dirty = texture_layer_dirty(state, layer);
     if (!dirty)
       return;
 
-    if (uploaded_this_frame && !pixels.empty() && width > 0 && height > 0) {
+    int &width = texture_layer_width(state, layer);
+    int &height = texture_layer_height(state, layer);
+    if (uploaded_this_frame && width > 0 && height > 0) {
       has_more_uploads = true;
       if (stats != nullptr)
         stats->deferred = true;
+      if (texture_trace_enabled()) {
+        g_message("GWorldScene texture-trace upload layer=%s action=defer-one-upload-per-frame size=%dx%d bytes=%.1fMiB",
+                  texture_layer_name(layer),
+                  width,
+                  height,
+                  bytes_to_mib(static_cast<std::size_t>(width) *
+                               static_cast<std::size_t>(height) * 4));
+      }
       return;
     }
 
-    if (upload_texture_buffer_if_needed(texture, label, pixels, width, height, dirty, stats))
+    if (upload_atlas_texture_chunk_if_needed(state, layer, stats)) {
       uploaded_this_frame = true;
+      if (dirty)
+        has_more_uploads = true;
+    }
   };
 
-  upload_layer(state->base_texture,
-               "base",
-               state->base_texture_pixels,
-               state->base_texture_width,
-               state->base_texture_height,
-               state->base_texture_dirty);
-  upload_layer(state->mid_texture,
-               "mid",
-               state->mid_texture_pixels,
-               state->mid_texture_width,
-               state->mid_texture_height,
-               state->mid_texture_dirty);
-  upload_layer(state->texture,
-               "detail",
-               state->texture_pixels,
-               state->texture_width,
-               state->texture_height,
-               state->texture_dirty);
-  upload_layer(state->ultra_texture,
-               "ultra",
-               state->ultra_texture_pixels,
-               state->ultra_texture_width,
-               state->ultra_texture_height,
-               state->ultra_texture_dirty);
-  upload_layer(state->globe_texture,
-               "globe",
-               state->globe_texture_pixels,
-               state->globe_texture_width,
-               state->globe_texture_height,
-               state->globe_texture_dirty);
-  upload_layer(state->model_texture,
-               "model",
-               state->model_texture_pixels,
-               state->model_texture_width,
-               state->model_texture_height,
-               state->model_texture_dirty);
+  upload_atlas_layer(TextureLayer::Base);
+  upload_atlas_layer(TextureLayer::Far);
+  upload_atlas_layer(TextureLayer::Mid);
+  upload_atlas_layer(TextureLayer::Detail);
+  upload_atlas_layer(TextureLayer::Ultra);
+  upload_atlas_layer(TextureLayer::Globe);
+
+  if (state->model_texture_dirty) {
+    if (uploaded_this_frame &&
+        !state->model_texture_pixels.empty() &&
+        state->model_texture_width > 0 &&
+        state->model_texture_height > 0) {
+      has_more_uploads = true;
+      if (stats != nullptr)
+        stats->deferred = true;
+    } else if (upload_texture_buffer_if_needed(state->model_texture,
+                                               "model",
+                                               state->model_texture_pixels,
+                                               state->model_texture_width,
+                                               state->model_texture_height,
+                                               state->model_texture_dirty,
+                                               stats)) {
+      uploaded_this_frame = true;
+    }
+  }
 
   return has_more_uploads;
 }
@@ -6845,23 +7219,28 @@ void cancel_texture_build_locked(GWorldSceneViewState *state,
                                  const std::string &pending_key);
 void cancel_all_texture_builds_locked(GWorldSceneViewState *state);
 void cancel_world_mesh_build_locked(GWorldSceneViewState *state);
+void cancel_view_async_work_locked(GWorldSceneViewState *state);
 
 GWorldSceneViewBackend::GWorldSceneViewBackend(GWorldSceneView *owner)
   : owner_(owner),
     state_(new GWorldSceneViewState)
 {
   state_->cache_directory = default_cache_directory();
+  state_->texture_memory_budget_mib =
+    env_uint_or_default("GWORLD_SCENE_TEXTURE_BUDGET_MIB",
+                        kDefaultTextureMemoryBudgetMib,
+                        kMaxTextureMemoryBudgetMib);
+  if (texture_trace_enabled()) {
+    g_message("GWorldScene texture-trace budget-init budget=%uMiB",
+              state_->texture_memory_budget_mib);
+  }
 }
 
 GWorldSceneViewBackend::~GWorldSceneViewBackend()
 {
-  if (state_ != nullptr && state_->scene_update_source != 0)
-    g_source_remove(state_->scene_update_source);
   if (state_ != nullptr) {
     std::lock_guard<std::mutex> lock(state_->mutex);
-    cancel_all_pending_downloads_locked(state_);
-    cancel_all_texture_builds_locked(state_);
-    cancel_world_mesh_build_locked(state_);
+    cancel_view_async_work_locked(state_);
   }
   delete state_;
   state_ = nullptr;
@@ -6948,6 +7327,7 @@ enum {
   PROP_MAP_TILE_URL_TEMPLATE,
   PROP_CACHE_DIRECTORY,
   PROP_CACHE_ENABLED,
+  PROP_TEXTURE_MEMORY_BUDGET_MIB,
   PROP_SUN_AZIMUTH_DEG,
   PROP_SUN_ELEVATION_DEG,
   PROP_SUN_TIME_OF_DAY,
@@ -7119,6 +7499,12 @@ world_mesh_build_done(GObject *source_object, GAsyncResult *result, gpointer use
   auto *state = get_state(self);
   auto *task = G_TASK(result);
   auto *job = static_cast<WorldMeshBuildJob *>(g_task_get_task_data(task));
+
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->pending_mesh_cancellable != g_task_get_cancellable(task))
+      return;
+  }
 
   g_autoptr(GError) error = nullptr;
   auto *mesh_result = static_cast<WorldMeshBuildResult *>(g_task_propagate_pointer(task, &error));
@@ -7316,11 +7702,13 @@ texture_atlas_build_thread(GTask *task, gpointer source_object, gpointer task_da
   const gint64 build_start_us = perf_now_us();
   auto *job = static_cast<TextureAtlasBuildJob *>(task_data);
   if (cancellable != nullptr && g_cancellable_is_cancelled(cancellable)) {
-    g_task_return_new_error(task,
-                            G_IO_ERROR,
-                            G_IO_ERROR_CANCELLED,
-                            "Texture atlas build cancelled: %s",
-                            job->pending_key.c_str());
+    if (!g_task_get_completed(task)) {
+      g_task_return_new_error(task,
+                              G_IO_ERROR,
+                              G_IO_ERROR_CANCELLED,
+                              "Texture atlas build cancelled: %s",
+                              job->pending_key.c_str());
+    }
     return;
   }
 
@@ -7329,6 +7717,7 @@ texture_atlas_build_thread(GTask *task, gpointer source_object, gpointer task_da
   result->layer = job->layer;
   result->pending_key = job->pending_key;
   result->source_revision = job->source_revision;
+  result->queue_wait_us = job->queued_at_us > 0 ? build_start_us - job->queued_at_us : 0;
 
   const int tiles_w = job->range.width_tiles();
   const int tiles_h = job->range.height_tiles();
@@ -7342,25 +7731,32 @@ texture_atlas_build_thread(GTask *task, gpointer source_object, gpointer task_da
     for (int tx = job->range.x_min; tx <= job->range.x_max; ++tx) {
       if (cancellable != nullptr && g_cancellable_is_cancelled(cancellable)) {
         texture_atlas_build_result_free(result);
-        g_task_return_new_error(task,
-                                G_IO_ERROR,
-                                G_IO_ERROR_CANCELLED,
-                                "Texture atlas build cancelled: %s",
-                                job->pending_key.c_str());
+        if (!g_task_get_completed(task)) {
+          g_task_return_new_error(task,
+                                  G_IO_ERROR,
+                                  G_IO_ERROR_CANCELLED,
+                                  "Texture atlas build cancelled: %s",
+                                  job->pending_key.c_str());
+        }
         return;
       }
 
-      TileCoord tile{job->range.z, tx, ty};
+      TileCoord tile{job->range.z, gworld_scene::wrap_tile_x(tx, job->range.z), ty};
       const std::string uri = texture_uri_from_template(job->texture_template, tile);
       const std::string path = texture_cache_path(job->cache_dir, uri, job->texture_template, tile);
+      const gint64 file_check_start_us = perf_now_us();
       if (!g_file_test(path.c_str(), G_FILE_TEST_EXISTS)) {
+        result->file_check_duration_us += perf_now_us() - file_check_start_us;
         ++result->missing_count;
         continue;
       }
+      result->file_check_duration_us += perf_now_us() - file_check_start_us;
 
       std::vector<unsigned char> tile_pixels;
       std::string load_error;
+      const gint64 decode_start_us = perf_now_us();
       if (!load_image_rgba_256(path, tile_pixels, &load_error)) {
+        result->decode_duration_us += perf_now_us() - decode_start_us;
         ++result->decode_failed_count;
         g_warning("Texture tile decode failed: layer=%s z=%d x=%d y=%d path=%s error=%s",
                   texture_layer_name(job->layer),
@@ -7371,18 +7767,22 @@ texture_atlas_build_thread(GTask *task, gpointer source_object, gpointer task_da
                   load_error.empty() ? "unknown error" : load_error.c_str());
         continue;
       }
+      result->decode_duration_us += perf_now_us() - decode_start_us;
 
       if (cancellable != nullptr && g_cancellable_is_cancelled(cancellable)) {
         texture_atlas_build_result_free(result);
-        g_task_return_new_error(task,
-                                G_IO_ERROR,
-                                G_IO_ERROR_CANCELLED,
-                                "Texture atlas build cancelled: %s",
-                                job->pending_key.c_str());
+        if (!g_task_get_completed(task)) {
+          g_task_return_new_error(task,
+                                  G_IO_ERROR,
+                                  G_IO_ERROR_CANCELLED,
+                                  "Texture atlas build cancelled: %s",
+                                  job->pending_key.c_str());
+        }
         return;
       }
 
       ++result->loaded_count;
+      const gint64 blit_start_us = perf_now_us();
       const int dst_x = (tx - job->range.x_min) * kAtlasTilePixels;
       const int dst_y = (ty - job->range.y_min) * kAtlasTilePixels;
       for (int y = 0; y < kAtlasTilePixels; ++y) {
@@ -7390,6 +7790,7 @@ texture_atlas_build_thread(GTask *task, gpointer source_object, gpointer task_da
         const std::size_t dst = static_cast<std::size_t>(((dst_y + y) * width + dst_x) * 4);
         std::memcpy(result->pixels.data() + dst, tile_pixels.data() + src, kAtlasTilePixels * 4);
       }
+      result->blit_duration_us += perf_now_us() - blit_start_us;
     }
   }
 
@@ -7405,9 +7806,26 @@ texture_atlas_build_thread(GTask *task, gpointer source_object, gpointer task_da
   }
 
   result->build_duration_us = perf_now_us() - build_start_us;
+  if (g_task_get_completed(task)) {
+    texture_atlas_build_result_free(result);
+    return;
+  }
   g_task_return_pointer(task,
                         result,
                         reinterpret_cast<GDestroyNotify>(texture_atlas_build_result_free));
+}
+
+static void
+run_texture_atlas_build_task(GTask *task)
+{
+  g_object_ref(task);
+  std::thread([task]() {
+    texture_atlas_build_thread(task,
+                               nullptr,
+                               g_task_get_task_data(task),
+                               g_task_get_cancellable(task));
+    g_object_unref(task);
+  }).detach();
 }
 
 static void
@@ -7419,6 +7837,15 @@ texture_atlas_build_done(GObject *source_object, GAsyncResult *result, gpointer 
   auto *state = get_state(self);
   auto *task = G_TASK(result);
   auto *job = static_cast<TextureAtlasBuildJob *>(g_task_get_task_data(task));
+
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    // A cancelled build may finish after a replacement with the same range key.
+    const auto pending = state->pending_texture_build_cancellables.find(job->pending_key);
+    if (pending == state->pending_texture_build_cancellables.end() ||
+        pending->second != g_task_get_cancellable(task))
+      return;
+  }
 
   g_autoptr(GError) error = nullptr;
   auto *atlas_result = static_cast<TextureAtlasBuildResult *>(g_task_propagate_pointer(task, &error));
@@ -7467,15 +7894,21 @@ texture_atlas_build_done(GObject *source_object, GAsyncResult *result, gpointer 
       auto &texture_width = texture_layer_width(state, atlas_result->layer);
       auto &texture_height = texture_layer_height(state, atlas_result->layer);
       auto &dirty = texture_layer_dirty(state, atlas_result->layer);
-      auto &loaded_key = texture_layer_loaded_key(state, atlas_result->layer);
-      auto &active_range = texture_layer_active_range(state, atlas_result->layer);
+      TextureUploadSlot &upload = texture_layer_upload_slot(state, atlas_result->layer);
 
       pixels = std::move(atlas_result->pixels);
       texture_width = atlas_result->width;
       texture_height = atlas_result->height;
       dirty = true;
-      loaded_key = range_key;
-      active_range = atlas_result->range;
+      upload.width = atlas_result->width;
+      upload.height = atlas_result->height;
+      upload.uploaded_rows = 0;
+      upload.key = range_key;
+      upload.range = atlas_result->range;
+      // Cache the empty result too, until a download invalidates it. Otherwise
+      // queue_scene_requests immediately starts the same build again.
+      if (pixels.empty())
+        texture_layer_loaded_key(state, atlas_result->layer) = range_key;
       applied = true;
     }
   }
@@ -7501,6 +7934,29 @@ texture_atlas_build_done(GObject *source_object, GAsyncResult *result, gpointer 
             atlas_result->source_revision,
             state_revision,
             cleared_pending ? "yes" : "no");
+  }
+
+  if (texture_trace_enabled()) {
+    g_message("GWorldScene texture-trace atlas layer=%s applied=%d range=%s queue_wait=%.2fms build=%.2fms file=%.2fms decode=%.2fms blit=%.2fms loaded=%d missing=%d decode_failed=%d size=%dx%d bytes=%.1fMiB wanted=%s revision=%" G_GUINT64_FORMAT "/%" G_GUINT64_FORMAT " pending_cleared=%d",
+              texture_layer_name(atlas_result->layer),
+              applied ? 1 : 0,
+              range_key.c_str(),
+              perf_elapsed_ms(0, atlas_result->queue_wait_us),
+              perf_elapsed_ms(0, atlas_result->build_duration_us),
+              perf_elapsed_ms(0, atlas_result->file_check_duration_us),
+              perf_elapsed_ms(0, atlas_result->decode_duration_us),
+              perf_elapsed_ms(0, atlas_result->blit_duration_us),
+              atlas_result->loaded_count,
+              atlas_result->missing_count,
+              atlas_result->decode_failed_count,
+              atlas_result->width,
+              atlas_result->height,
+              bytes_to_mib(static_cast<std::size_t>(std::max(0, atlas_result->width)) *
+                           static_cast<std::size_t>(std::max(0, atlas_result->height)) * 4),
+              wanted_key_snapshot.c_str(),
+              atlas_result->source_revision,
+              state_revision,
+              cleared_pending ? 1 : 0);
   }
 
   if (perf_enabled() && (perf_verbose() || applied ||
@@ -7561,6 +8017,7 @@ request_texture_atlas_build(GWorldSceneView *self, const AtlasRange &range, Text
   std::string texture_template;
   guint64 source_revision = 0;
   GCancellable *cancellable = nullptr;
+  const gint64 queued_at_us = perf_now_us();
 
   {
     std::lock_guard<std::mutex> lock(state->mutex);
@@ -7570,13 +8027,50 @@ request_texture_atlas_build(GWorldSceneView *self, const AtlasRange &range, Text
     auto &wanted_key = texture_layer_wanted_key(state, layer);
     auto &pending_layer_key = texture_layer_pending_key(state, layer);
     const std::string &loaded_key = texture_layer_loaded_key(state, layer);
+    TextureUploadSlot &upload = texture_layer_upload_slot(state, layer);
     wanted_key = range_key;
 
     if (loaded_key == range_key) {
       g_debug("Texture atlas already loaded: layer=%s range=%s",
               texture_layer_name(layer),
               range_key.c_str());
+      if (texture_trace_enabled()) {
+        g_message("GWorldScene texture-trace atlas-request layer=%s action=already-loaded range=%s",
+                  texture_layer_name(layer),
+                  range_key.c_str());
+      }
       return;
+    }
+    if (upload.key == range_key && upload.uploaded_rows < upload.height &&
+        texture_layer_dirty(state, layer) && !texture_layer_pixels(state, layer).empty()) {
+      g_debug("Texture atlas upload already pending: layer=%s range=%s row=%d/%d",
+              texture_layer_name(layer),
+              range_key.c_str(),
+              upload.uploaded_rows,
+              upload.height);
+      if (texture_trace_enabled()) {
+        g_message("GWorldScene texture-trace atlas-request layer=%s action=already-uploading range=%s row=%d/%d",
+                  texture_layer_name(layer),
+                  range_key.c_str(),
+                  upload.uploaded_rows,
+                  upload.height);
+      }
+      return;
+    }
+    if (!upload.key.empty() && upload.key != range_key) {
+      auto &pixels = texture_layer_pixels(state, layer);
+      int &width = texture_layer_width(state, layer);
+      int &height = texture_layer_height(state, layer);
+      bool &dirty = texture_layer_dirty(state, layer);
+      pixels.clear();
+      width = 0;
+      height = 0;
+      dirty = false;
+      upload.width = 0;
+      upload.height = 0;
+      upload.uploaded_rows = 0;
+      upload.key.clear();
+      upload.range = AtlasRange();
     }
     if (!pending_layer_key.empty()) {
       if (pending_layer_key == pending_key) {
@@ -7584,6 +8078,12 @@ request_texture_atlas_build(GWorldSceneView *self, const AtlasRange &range, Text
                 texture_layer_name(layer),
                 range_key.c_str(),
                 pending_layer_key.c_str());
+        if (texture_trace_enabled()) {
+          g_message("GWorldScene texture-trace atlas-request layer=%s action=already-pending range=%s pending=%s",
+                    texture_layer_name(layer),
+                    range_key.c_str(),
+                    pending_layer_key.c_str());
+        }
         return;
       }
 
@@ -7591,6 +8091,12 @@ request_texture_atlas_build(GWorldSceneView *self, const AtlasRange &range, Text
               texture_layer_name(layer),
               range_key.c_str(),
               pending_layer_key.c_str());
+      if (texture_trace_enabled()) {
+        g_message("GWorldScene texture-trace atlas-request layer=%s action=cancel-old wanted=%s old_pending=%s",
+                  texture_layer_name(layer),
+                  range_key.c_str(),
+                  pending_layer_key.c_str());
+      }
       cancel_texture_build_locked(state, pending_layer_key);
       pending_layer_key.clear();
     }
@@ -7605,6 +8111,16 @@ request_texture_atlas_build(GWorldSceneView *self, const AtlasRange &range, Text
           range_key.c_str(),
           pending_key.c_str(),
           source_revision);
+  if (texture_trace_enabled()) {
+    g_message("GWorldScene texture-trace atlas-request layer=%s action=queued range=%s tiles=%d size=%dx%d pending=%s revision=%" G_GUINT64_FORMAT,
+              texture_layer_name(layer),
+              range_key.c_str(),
+              range.width_tiles() * range.height_tiles(),
+              range.width_tiles() * kAtlasTilePixels,
+              range.height_tiles() * kAtlasTilePixels,
+              pending_key.c_str(),
+              source_revision);
+  }
 
   auto *job = new TextureAtlasBuildJob;
   job->range = range;
@@ -7613,16 +8129,20 @@ request_texture_atlas_build(GWorldSceneView *self, const AtlasRange &range, Text
   job->texture_template = texture_template;
   job->pending_key = pending_key;
   job->source_revision = source_revision;
+  job->queued_at_us = queued_at_us;
 
   GTask *task = g_task_new(self, cancellable, texture_atlas_build_done, nullptr);
+  g_task_set_return_on_cancel(task, TRUE);
   g_task_set_task_data(task, job, reinterpret_cast<GDestroyNotify>(texture_atlas_build_job_free));
-  g_task_run_in_thread(task, texture_atlas_build_thread);
+  run_texture_atlas_build_task(task);
   g_object_unref(task);
 }
 
 static void
 download_job_free(DownloadJob *job)
 {
+  g_clear_object(&job->message);
+  g_clear_pointer(&job->bytes, g_bytes_unref);
   delete job;
 }
 
@@ -7688,12 +8208,34 @@ count_pending_downloads_with_prefix_locked(GWorldSceneViewState *state, const st
   return count;
 }
 
+double
+oldest_pending_age_ms_with_prefix_locked(GWorldSceneViewState *state,
+                                         const std::string &prefix,
+                                         gint64 now_us)
+{
+  gint64 oldest_us = 0;
+  for (const std::string &pending_key : state->pending) {
+    if (pending_key.rfind(prefix, 0) != 0)
+      continue;
+
+    auto started_iter = state->pending_started_us.find(pending_key);
+    if (started_iter == state->pending_started_us.end())
+      continue;
+
+    if (oldest_us == 0 || started_iter->second < oldest_us)
+      oldest_us = started_iter->second;
+  }
+
+  return oldest_us > 0 ? perf_elapsed_ms(oldest_us, now_us) : 0.0;
+}
+
 void
 clear_loaded_texture_keys_locked(GWorldSceneViewState *state)
 {
   state->loaded_ultra_texture_key.clear();
   state->loaded_texture_key.clear();
   state->loaded_mid_texture_key.clear();
+  state->loaded_far_texture_key.clear();
   state->loaded_base_texture_key.clear();
   state->loaded_globe_texture_key.clear();
 }
@@ -7721,6 +8263,7 @@ bool
 remove_pending_download_locked(GWorldSceneViewState *state, const std::string &pending_key)
 {
   const bool was_pending = state->pending.erase(pending_key) > 0;
+  state->pending_started_us.erase(pending_key);
   auto cancellable_iter = state->pending_cancellables.find(pending_key);
   if (cancellable_iter != state->pending_cancellables.end()) {
     g_object_unref(cancellable_iter->second);
@@ -7738,6 +8281,7 @@ cancel_pending_download_locked(GWorldSceneViewState *state, const std::string &p
     g_object_unref(cancellable_iter->second);
     state->pending_cancellables.erase(cancellable_iter);
   }
+  state->pending_started_us.erase(pending_key);
   state->pending.erase(pending_key);
 }
 
@@ -7818,6 +8362,7 @@ cancel_all_texture_builds_locked(GWorldSceneViewState *state)
   cancel_texture_build_for_layer_locked(state, TextureLayer::Ultra);
   cancel_texture_build_for_layer_locked(state, TextureLayer::Detail);
   cancel_texture_build_for_layer_locked(state, TextureLayer::Mid);
+  cancel_texture_build_for_layer_locked(state, TextureLayer::Far);
   cancel_texture_build_for_layer_locked(state, TextureLayer::Base);
   cancel_texture_build_for_layer_locked(state, TextureLayer::Globe);
 
@@ -7838,6 +8383,20 @@ cancel_world_mesh_build_locked(GWorldSceneViewState *state)
   }
   state->pending_mesh_key.clear();
   state->mesh_build_refresh_needed = false;
+}
+
+void
+cancel_view_async_work_locked(GWorldSceneViewState *state)
+{
+  if (state->scene_update_source != 0) {
+    g_source_remove(state->scene_update_source);
+    state->scene_update_source = 0;
+  }
+  cancel_all_pending_downloads_locked(state);
+  cancel_all_texture_builds_locked(state);
+  cancel_world_mesh_build_locked(state);
+  state->texture_refresh_pending = false;
+  state->last_texture_refresh_us = 0;
 }
 
 static void
@@ -7898,6 +8457,14 @@ terrain_load_done(GObject *source_object, GAsyncResult *result, gpointer user_da
   auto *task = G_TASK(result);
   auto *job = static_cast<TerrainLoadJob *>(g_task_get_task_data(task));
   auto *state = get_state(self);
+
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    const auto pending = state->pending_cancellables.find(job->pending_key);
+    if (pending == state->pending_cancellables.end() ||
+        pending->second != g_task_get_cancellable(task))
+      return;
+  }
 
   g_autoptr(GError) error = nullptr;
   auto *terrain_result = static_cast<TerrainLoadResult *>(g_task_propagate_pointer(task, &error));
@@ -7967,6 +8534,7 @@ start_terrain_load(GWorldSceneView *self,
 {
   auto *state = get_state(self);
   auto *cancellable = g_cancellable_new();
+  const gint64 queued_at_us = perf_now_us();
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     if (state->terrain_tiles.find(terrain_key(terrain_lat, terrain_lon)) != state->terrain_tiles.end() ||
@@ -7977,6 +8545,7 @@ start_terrain_load(GWorldSceneView *self,
 
     state->pending.insert(pending_key);
     state->pending_cancellables[pending_key] = cancellable;
+    state->pending_started_us[pending_key] = queued_at_us;
   }
 
   auto *job = new TerrainLoadJob;
@@ -7994,7 +8563,7 @@ start_terrain_load(GWorldSceneView *self,
 }
 
 static void
-download_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable)
+download_write_thread(GTask *task, gpointer source_object, gpointer task_data, GCancellable *cancellable)
 {
   (void)source_object;
   auto *job = static_cast<DownloadJob *>(task_data);
@@ -8010,40 +8579,39 @@ download_thread(GTask *task, gpointer source_object, gpointer task_data, GCancel
 
   ensure_parent_directory(job->path);
 
-  g_autoptr(SoupSession) session = soup_session_new();
-  g_autoptr(SoupMessage) message = soup_message_new("GET", job->uri.c_str());
-  if (message == nullptr) {
-    g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "Invalid URI: %s", job->uri.c_str());
-    return;
-  }
-
-  soup_message_headers_append(soup_message_get_request_headers(message),
-                              "User-Agent",
-                              "GWorldScene/0.1 (GTK4 GLArea)");
-
   g_autoptr(GError) error = nullptr;
-  GBytes *bytes = soup_session_send_and_read(session, message, cancellable, &error);
-  g_autoptr(GBytes) owned_bytes = bytes;
-  const guint status = soup_message_get_status(message);
-  if (bytes == nullptr) {
-    g_task_return_error(task, g_steal_pointer(&error));
-    return;
-  }
-  if (status < 200 || status >= 300) {
-    const GIOErrorEnum code =
-      (status == 404 || status == 410) ? G_IO_ERROR_NOT_FOUND : G_IO_ERROR_FAILED;
-    g_task_return_new_error(task, G_IO_ERROR, code, "HTTP %u for %s", status, job->uri.c_str());
-    return;
-  }
-
   gsize size = 0;
-  const auto *data = static_cast<const char *>(g_bytes_get_data(bytes, &size));
+  const auto *data = static_cast<const char *>(g_bytes_get_data(job->bytes, &size));
   if (!g_file_set_contents(job->path.c_str(), data, size, &error)) {
     g_task_return_error(task, g_steal_pointer(&error));
     return;
   }
 
   g_task_return_boolean(task, TRUE);
+}
+
+static void
+download_response_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
+{
+  g_autoptr(GTask) task = G_TASK(user_data);
+  auto *job = static_cast<DownloadJob *>(g_task_get_task_data(task));
+  g_autoptr(GError) error = nullptr;
+  job->bytes = soup_session_send_and_read_finish(SOUP_SESSION(source_object), result, &error);
+  if (job->bytes == nullptr) {
+    g_task_return_error(task, g_steal_pointer(&error));
+    return;
+  }
+  const guint status = soup_message_get_status(job->message);
+  if (status < 200 || status >= 300) {
+    const GIOErrorEnum code =
+      (status == 404 || status == 410) ? G_IO_ERROR_NOT_FOUND : G_IO_ERROR_FAILED;
+    g_task_return_new_error(task, G_IO_ERROR, code, "HTTP %u", status);
+    return;
+  }
+
+  // Only disk writes use a worker. Slow network responses must not occupy the
+  // GTask pool needed to build meshes and decode already available tiles.
+  g_task_run_in_thread(task, download_write_thread);
 }
 
 static void
@@ -8055,6 +8623,14 @@ download_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
   auto *task = G_TASK(result);
   auto *job = static_cast<DownloadJob *>(g_task_get_task_data(task));
   auto *state = get_state(self);
+
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    const auto pending = state->pending_cancellables.find(job->pending_key);
+    if (pending == state->pending_cancellables.end() ||
+        pending->second != g_task_get_cancellable(task))
+      return;
+  }
 
   g_autoptr(GError) error = nullptr;
   const gboolean ok = g_task_propagate_boolean(task, &error);
@@ -8070,9 +8646,8 @@ download_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
 
   if (!was_pending) {
     if (!cancelled) {
-      g_debug("Stale download ignored: key=%s uri=%s cache=%s ok=%s",
+      g_debug("Stale download ignored: key=%s cache=%s ok=%s",
               job->pending_key.c_str(),
-              job->uri.c_str(),
               job->path.c_str(),
               ok ? "yes" : "no");
     }
@@ -8081,19 +8656,23 @@ download_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
 
   if (!ok) {
     if (cancelled) {
-      g_debug("Download cancelled: key=%s uri=%s cache=%s",
+      g_debug("Download cancelled: key=%s cache=%s",
               job->pending_key.c_str(),
-              job->uri.c_str(),
               job->path.c_str());
       return;
     }
 
     if (job->kind == "texture") {
-      g_warning("Texture download failed: key=%s uri=%s cache=%s error=%s",
+      g_warning("Texture download failed: key=%s cache=%s error=%s",
                 job->pending_key.c_str(),
-                job->uri.c_str(),
                 job->path.c_str(),
                 error ? error->message : "unknown error");
+      if (texture_trace_enabled()) {
+        g_message("GWorldScene texture-trace download kind=texture ok=0 key=%s elapsed=%.2fms error=%s",
+                  job->pending_key.c_str(),
+                  job->queued_at_us > 0 ? perf_elapsed_ms(job->queued_at_us) : 0.0,
+                  error ? error->message : "unknown error");
+      }
     } else {
       const std::string key = terrain_key(job->terrain_lat, job->terrain_lon);
       const bool unavailable = error != nullptr &&
@@ -8108,15 +8687,13 @@ download_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
                                                               g_get_monotonic_time());
       }
       if (unavailable) {
-        g_debug("Terrain tile unavailable: key=%s uri=%s cache=%s error=%s",
+        g_debug("Terrain tile unavailable: key=%s cache=%s error=%s",
                 job->pending_key.c_str(),
-                job->uri.c_str(),
                 job->path.c_str(),
                 error ? error->message : "unknown error");
       } else {
-        g_debug("Terrain download failed: key=%s uri=%s cache=%s retry_in_ms=%" G_GINT64_FORMAT " error=%s",
+        g_debug("Terrain download failed: key=%s cache=%s retry_in_ms=%" G_GINT64_FORMAT " error=%s",
                 job->pending_key.c_str(),
-                job->uri.c_str(),
                 job->path.c_str(),
                 retry_delay_us / 1000,
                 error ? error->message : "unknown error");
@@ -8138,10 +8715,18 @@ download_done(GObject *source_object, GAsyncResult *result, gpointer user_data)
                        job->terrain_lon);
     return;
   } else if (job->kind == "texture") {
-    g_debug("Texture download finished: key=%s uri=%s cache=%s",
+    g_debug("Texture download finished: key=%s cache=%s",
             job->pending_key.c_str(),
-            job->uri.c_str(),
             job->path.c_str());
+    if (texture_trace_enabled()) {
+      GStatBuf stat_buf = {};
+      const bool has_size = g_stat(job->path.c_str(), &stat_buf) == 0;
+      g_message("GWorldScene texture-trace download kind=texture ok=1 key=%s elapsed=%.2fms bytes=%" G_GINT64_FORMAT " cache=%s",
+                job->pending_key.c_str(),
+                job->queued_at_us > 0 ? perf_elapsed_ms(job->queued_at_us) : 0.0,
+                has_size ? static_cast<gint64>(stat_buf.st_size) : static_cast<gint64>(-1),
+                job->path.c_str());
+    }
     bool refreshed = false;
     {
       std::lock_guard<std::mutex> lock(state->mutex);
@@ -8168,26 +8753,26 @@ start_download(GWorldSceneView *self,
 {
   auto *state = get_state(self);
   auto *cancellable = g_cancellable_new();
+  const gint64 queued_at_us = perf_now_us();
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     if (state->pending.find(pending_key) != state->pending.end()) {
       g_object_unref(cancellable);
       if (kind == "texture") {
-        g_debug("Texture download already pending: key=%s uri=%s cache=%s",
+        g_debug("Texture download already pending: key=%s cache=%s",
                 pending_key.c_str(),
-                uri.c_str(),
                 path.c_str());
       }
       return false;
     }
     state->pending.insert(pending_key);
     state->pending_cancellables[pending_key] = cancellable;
+    state->pending_started_us[pending_key] = queued_at_us;
   }
 
   if (kind == "texture") {
-    g_debug("Texture download queued: key=%s uri=%s cache=%s",
+    g_debug("Texture download queued: key=%s cache=%s",
             pending_key.c_str(),
-            uri.c_str(),
             path.c_str());
   }
 
@@ -8198,11 +8783,24 @@ start_download(GWorldSceneView *self,
   job->path = path;
   job->terrain_lat = terrain_lat;
   job->terrain_lon = terrain_lon;
+  job->queued_at_us = queued_at_us;
 
   GTask *task = g_task_new(self, cancellable, download_done, nullptr);
   g_task_set_task_data(task, job, reinterpret_cast<GDestroyNotify>(download_job_free));
-  g_task_run_in_thread(task, download_thread);
-  g_object_unref(task);
+  job->message = soup_message_new("GET", job->uri.c_str());
+  if (job->message == nullptr) {
+    // Tile URLs can carry credentials in the path, user info, or query string.
+    // Identify downloads by their tile/cache keys in diagnostics instead.
+    g_task_return_new_error(task, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "Invalid tile URI");
+    g_object_unref(task);
+    return true;
+  }
+  soup_message_headers_append(soup_message_get_request_headers(job->message),
+                              "User-Agent", "GWorldScene/0.1");
+  g_autoptr(SoupSession) session = soup_session_new();
+  // The response callback owns the task until it completes or queues the write.
+  soup_session_send_and_read_async(session, job->message, G_PRIORITY_DEFAULT,
+                                   cancellable, download_response_done, task);
   return true;
 }
 
@@ -8210,32 +8808,19 @@ static bool
 load_cached_terrain_tile(GWorldSceneView *self,
                          int tile_lat,
                          int tile_lon,
-                         const std::string &tile_name,
                          const std::string &path)
 {
   auto *state = get_state(self);
   const std::string key = terrain_key(tile_lat, tile_lon);
   const std::string pending_key = "terrain:" + key;
-  std::string cache_dir;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     if (state->terrain_tiles.find(key) != state->terrain_tiles.end() ||
         state->pending.find(pending_key) != state->pending.end())
       return true;
-    cache_dir = state->cache_directory;
   }
 
-  std::string load_path = path;
-  const std::string raw_path = join_path(join_path(cache_dir, "terrain"), tile_name + ".hgt");
-  const std::string zip_path = join_path(join_path(cache_dir, "terrain"), tile_name + ".hgt.zip");
-  if (g_file_test(raw_path.c_str(), G_FILE_TEST_EXISTS))
-    load_path = raw_path;
-  else if (g_file_test(zip_path.c_str(), G_FILE_TEST_EXISTS))
-    load_path = zip_path;
-  else if (!g_file_test(path.c_str(), G_FILE_TEST_EXISTS))
-    return false;
-
-  return start_terrain_load(self, "cache", pending_key, load_path, tile_lat, tile_lon);
+  return start_terrain_load(self, "cache", pending_key, path, tile_lat, tile_lon);
 }
 
 static void
@@ -8252,6 +8837,8 @@ queue_scene_requests(GWorldSceneView *self)
   std::string texture_template;
   std::vector<LatLonBounds> overlay_terrain_bounds;
   bool cache_enabled = true;
+  guint texture_budget_mib = kDefaultTextureMemoryBudgetMib;
+  TextureCapacityConfig texture_capacity;
   bool has_ground_height = false;
   double ground_height_amsl = 0.0;
   double initial_state_ms = 0.0;
@@ -8267,11 +8854,12 @@ queue_scene_requests(GWorldSceneView *self)
   int texture_candidates_count = 0;
   int texture_downloads_count = 0;
   int pending_texture_downloads_count = 0;
+  double oldest_texture_pending_ms = 0.0;
+  int texture_limit_skips_count = 0;
   bool texture_refresh_waiting = false;
   bool texture_refresh_flushed = false;
   bool mesh_rebuilt = false;
   bool mesh_build_queued = false;
-  bool mesh_build_deferred = false;
   bool globe_mesh_rebuilt = false;
   std::size_t mesh_vertices_count = 0;
   std::size_t mesh_indices_count = 0;
@@ -8286,6 +8874,8 @@ queue_scene_requests(GWorldSceneView *self)
     terrain_template = state->terrain_server;
     texture_template = state->map_tile_template;
     cache_enabled = state->cache_enabled;
+    texture_budget_mib = state->texture_memory_budget_mib;
+    texture_capacity = texture_capacity_config_for_state(state);
     collect_ground_overlay_terrain_bounds_locked(state, overlay_terrain_bounds);
     has_ground_height = terrain_height_at_lat_lon_locked(state,
                                                         latitude,
@@ -8310,31 +8900,20 @@ queue_scene_requests(GWorldSceneView *self)
   const bool render_globe = altitude >= kGlobeRenderAltitudeM;
   const bool include_terrain = altitude < kTerrainDisableAltitudeM;
   const double altitude_agl = has_ground_height ? std::max(0.0, altitude - ground_height_amsl) : altitude;
-  const double texture_lod_altitude = has_ground_height ? altitude_agl : altitude;
-  const double ultra_bubble_lateral_radius_m = include_terrain
-                                                 ? ultra_texture_lateral_radius_for_agl(altitude_agl)
-                                                 : 0.0;
-  const int ultra_texture_zoom = ultra_texture_zoom_for_altitude(texture_lod_altitude);
-  double ultra_lateral_radius_m =
-    ultra_texture_atlas_radius(latitude, ultra_texture_zoom, ultra_bubble_lateral_radius_m);
+  const auto imagery = gworld_scene::terrain_imagery_plan(latitude, longitude, altitude_agl,
+                                                          radius_m, texture_capacity.max_atlas_tiles,
+                                                          texture_capacity.atlas_pixels,
+                                                          texture_capacity.max_ultra_atlas_tiles,
+                                                          texture_capacity.ultra_bubble_radius_m);
+  const double ultra_lateral_radius_m = include_terrain ? imagery.ultra.radius_m : 0.0;
+  const AtlasRange ultra_atlas_range = include_terrain ? imagery.ultra.range : AtlasRange();
+  const AtlasRange atlas_range = imagery.detail.range;
+  const AtlasRange mid_atlas_range = imagery.mid.range;
+  const AtlasRange far_atlas_range = imagery.far.range;
+  const AtlasRange base_atlas_range = imagery.base.range;
   const LatLonBounds terrain_bounds = bounds_around_camera(latitude, longitude, radius_m);
-  const LatLonBounds texture_bounds =
-    bounds_around_camera(latitude, longitude, texture_radius_for_altitude(texture_lod_altitude));
-  const LatLonBounds mid_texture_bounds =
-    bounds_around_camera(latitude, longitude, mid_texture_radius_for_altitude(texture_lod_altitude, radius_m));
-  const AtlasRange atlas_range =
-    select_atlas_range(texture_bounds, detail_texture_zoom_for_altitude(texture_lod_altitude));
-  const AtlasRange ultra_atlas_range = ultra_lateral_radius_m > 0.0
-                                         ? select_ultra_atlas_range(latitude,
-                                                                    longitude,
-                                                                    ultra_texture_zoom,
-                                                                    ultra_lateral_radius_m)
-                                         : AtlasRange();
-  const AtlasRange mid_atlas_range =
-    select_atlas_range(mid_texture_bounds, mid_texture_zoom_for_altitude(texture_lod_altitude));
-  const AtlasRange base_atlas_range =
-    select_atlas_range(terrain_bounds, base_texture_zoom_for_altitude(texture_lod_altitude));
-  const AtlasRange globe_range = globe_atlas_range(latitude, longitude, altitude);
+  const AtlasRange globe_range = globe_atlas_range(latitude, longitude, altitude,
+                                                   texture_capacity.atlas_pixels);
 
   if (cache_enabled) {
     const gint64 terrain_start_us = perf_now_us();
@@ -8351,9 +8930,10 @@ queue_scene_requests(GWorldSceneView *self)
         const int lon_max = static_cast<int>(std::floor(bounds.max_lon));
 
         for (int lat = lat_min; lat <= lat_max; ++lat) {
-          for (int lon = lon_min; lon <= lon_max; ++lon) {
-            if (lat < -90 || lat > 89 || lon < -180 || lon > 179)
+          for (int unwrapped_lon = lon_min; unwrapped_lon <= std::min(lon_max, lon_min + 359); ++unwrapped_lon) {
+            if (lat < -90 || lat > 89)
               continue;
+            const int lon = static_cast<int>(gworld_scene::wrap_longitude(unwrapped_lon));
 
             const std::string key = terrain_key(lat, lon);
             keep_keys.insert(key);
@@ -8409,18 +8989,17 @@ queue_scene_requests(GWorldSceneView *self)
 
         const std::string name = hgt_tile_name(lat, lon);
         const std::string uri = terrain_uri_from_template(terrain_template, name);
-        const std::string path = terrain_cache_path_for_uri(cache_dir, uri, name);
+        const std::string path = terrain_cache_path_for_uri(cache_dir, uri, terrain_template, name);
+        const std::string cached_path = existing_terrain_cache_path(path);
 
-        if (g_file_test(path.c_str(), G_FILE_TEST_EXISTS) ||
-            g_file_test(join_path(join_path(cache_dir, "terrain"), name + ".hgt").c_str(), G_FILE_TEST_EXISTS) ||
-            g_file_test(join_path(join_path(cache_dir, "terrain"), name + ".hgt.zip").c_str(), G_FILE_TEST_EXISTS)) {
+        if (!cached_path.empty()) {
           if (terrain_loads >= kMaxTerrainTileLoadsPerUpdate ||
               pending_terrain_downloads + terrain_loads >= kMaxPendingTerrainDownloads) {
             has_more_terrain_work = true;
             terrain_reschedule_ms = 350;
             continue;
           }
-          if (load_cached_terrain_tile(self, lat, lon, name, path))
+          if (load_cached_terrain_tile(self, lat, lon, cached_path))
             ++terrain_loads;
           continue;
         }
@@ -8458,12 +9037,11 @@ queue_scene_requests(GWorldSceneView *self)
 
       {
         std::lock_guard<std::mutex> lock(state->mutex);
-        for (const std::string &pending_key : state->pending) {
-          if (pending_key.rfind("terrain:", 0) == 0) {
-            has_more_terrain_work = true;
-            terrain_reschedule_ms = 350;
-            break;
-          }
+        pending_terrain_downloads_count =
+          count_pending_downloads_with_prefix_locked(state, "terrain:");
+        if (pending_terrain_downloads_count > 0) {
+          has_more_terrain_work = true;
+          terrain_reschedule_ms = 350;
         }
       }
 
@@ -8504,38 +9082,53 @@ queue_scene_requests(GWorldSceneView *self)
     std::unordered_set<std::string> wanted_texture_pending_keys;
     std::unordered_set<std::string> candidate_texture_keys;
     std::vector<TextureCandidate> texture_candidates;
-    auto add_texture_range_candidates = [&](const AtlasRange &range, double layer_priority) {
+    std::vector<TextureRangeTraceStats> texture_range_trace_stats;
+    auto add_texture_range_candidates = [&](const AtlasRange &range,
+                                            double layer_priority,
+                                            const char *label) {
       if (!range.valid())
         return;
 
+      TextureRangeTraceStats trace_stats;
+      trace_stats.label = label;
+      trace_stats.range = range;
       const double center_x = lon_to_tile_x(longitude, range.z);
       const double center_y = lat_to_tile_y(latitude, range.z);
       for (int ty = range.y_min; ty <= range.y_max; ++ty) {
         for (int tx = range.x_min; tx <= range.x_max; ++tx) {
-          TileCoord tile{range.z, tx, ty};
+          ++trace_stats.total;
+          TileCoord tile{range.z, gworld_scene::wrap_tile_x(tx, range.z), ty};
           const std::string key = texture_download_key(tile);
           wanted_texture_pending_keys.insert(key);
           const std::string uri = texture_uri_from_template(texture_template, tile);
           const std::string path = texture_cache_path(cache_dir, uri, texture_template, tile);
-          if (g_file_test(path.c_str(), G_FILE_TEST_EXISTS))
+          if (g_file_test(path.c_str(), G_FILE_TEST_EXISTS)) {
+            ++trace_stats.cached;
             continue;
-          if (!candidate_texture_keys.insert(key).second)
+          }
+          ++trace_stats.missing;
+          if (!candidate_texture_keys.insert(key).second) {
+            ++trace_stats.duplicates;
             continue;
+          }
           const double distance = std::hypot((static_cast<double>(tx) + 0.5) - center_x,
                                              (static_cast<double>(ty) + 0.5) - center_y);
           texture_candidates.push_back({tile, layer_priority + distance});
+          ++trace_stats.candidates;
         }
       }
+      texture_range_trace_stats.push_back(trace_stats);
     };
 
     if (include_terrain) {
-      add_texture_range_candidates(base_atlas_range, 0.0);
-      add_texture_range_candidates(ultra_atlas_range, 0.04);
-      add_texture_range_candidates(mid_atlas_range, 0.12);
-      add_texture_range_candidates(atlas_range, 0.24);
+      add_texture_range_candidates(base_atlas_range, 0.0, "base");
+      add_texture_range_candidates(ultra_atlas_range, 0.04, "ultra");
+      add_texture_range_candidates(far_atlas_range, 0.08, "far");
+      add_texture_range_candidates(mid_atlas_range, 0.12, "mid");
+      add_texture_range_candidates(atlas_range, 0.24, "detail");
     }
     if (render_globe)
-      add_texture_range_candidates(globe_range, 0.0);
+      add_texture_range_candidates(globe_range, 0.0, "globe");
 
     int texture_downloads = 0;
     int pending_texture_downloads = 0;
@@ -8545,6 +9138,8 @@ queue_scene_requests(GWorldSceneView *self)
       std::lock_guard<std::mutex> lock(state->mutex);
       cancel_pending_downloads_not_in_locked(state, "texture:", wanted_texture_pending_keys);
       pending_texture_downloads = count_pending_downloads_with_prefix_locked(state, "texture:");
+      oldest_texture_pending_ms =
+        oldest_pending_age_ms_with_prefix_locked(state, "texture:", g_get_monotonic_time());
     }
     pending_texture_downloads_count = pending_texture_downloads;
 
@@ -8563,9 +9158,10 @@ queue_scene_requests(GWorldSceneView *self)
           continue;
       }
 
-      if (texture_downloads >= kMaxTextureDownloadsPerUpdate ||
-          pending_texture_downloads + texture_downloads >= kMaxPendingTextureDownloads) {
+      if (texture_downloads >= texture_capacity.max_texture_downloads_per_update ||
+          pending_texture_downloads + texture_downloads >= texture_capacity.max_pending_texture_downloads) {
         has_more_texture_work = true;
+        ++texture_limit_skips_count;
         continue;
       }
 
@@ -8589,20 +9185,54 @@ queue_scene_requests(GWorldSceneView *self)
     if (has_more_texture_work)
       schedule_scene_requests(self, 350);
     texture_queue_ms = perf_elapsed_ms(texture_start_us);
+    if (texture_trace_enabled()) {
+      const double max_atlas_layer_mib =
+        bytes_to_mib(static_cast<std::size_t>(texture_capacity.atlas_pixels) *
+                     static_cast<std::size_t>(texture_capacity.atlas_pixels) * 4);
+      g_message("GWorldScene texture-trace queue budget=%uMiB atlas_pixels=%d max_layer=%.1fMiB max_tiles=%d max_ultra_tiles=%d ultra_bubble=%.0fm downloads(new=%d pending=%d oldest=%.2fms limit_skips=%d candidates=%d) refresh(wait=%d flushed=%d) ranges ultra=%s detail=%s mid=%s far=%s base=%s globe=%s",
+                texture_budget_mib,
+                texture_capacity.atlas_pixels,
+                max_atlas_layer_mib,
+                texture_capacity.max_atlas_tiles,
+                texture_capacity.max_ultra_atlas_tiles,
+                texture_capacity.ultra_bubble_radius_m,
+                texture_downloads_count,
+                pending_texture_downloads_count,
+                oldest_texture_pending_ms,
+                texture_limit_skips_count,
+                texture_candidates_count,
+                texture_refresh_waiting ? 1 : 0,
+                texture_refresh_flushed ? 1 : 0,
+                ultra_atlas_range.key().c_str(),
+                atlas_range.key().c_str(),
+                mid_atlas_range.key().c_str(),
+                far_atlas_range.key().c_str(),
+                base_atlas_range.key().c_str(),
+                globe_range.key().c_str());
+      for (const TextureRangeTraceStats &stats : texture_range_trace_stats) {
+        g_message("GWorldScene texture-trace range layer=%s range=%s tiles=%d cached=%d missing=%d candidates=%d duplicates=%d",
+                  stats.label,
+                  stats.range.key().c_str(),
+                  stats.total,
+                  stats.cached,
+                  stats.missing,
+                  stats.candidates,
+                  stats.duplicates);
+      }
+    }
   }
 
   {
     const gint64 mesh_start_us = perf_now_us();
-    mesh_build_deferred = include_terrain && terrain_loads_count > 0;
-    if (!mesh_build_deferred) {
-      mesh_build_queued = request_world_mesh_build(self,
-                                                   ultra_atlas_range,
-                                                   atlas_range,
-                                                   mid_atlas_range,
-                                                   base_atlas_range,
-                                                   ultra_lateral_radius_m,
-                                                   include_terrain);
-    }
+    // Render the available terrain and scene immediately; each completed tile
+    // invalidates the mesh and schedules another build.
+    mesh_build_queued = request_world_mesh_build(self,
+                                                 ultra_atlas_range,
+                                                 atlas_range,
+                                                 mid_atlas_range,
+                                                 base_atlas_range,
+                                                 ultra_lateral_radius_m,
+                                                 include_terrain);
     {
       std::lock_guard<std::mutex> lock(state->mutex);
       const AtlasRange mesh_globe_atlas_range =
@@ -8619,6 +9249,7 @@ queue_scene_requests(GWorldSceneView *self)
   if (include_terrain) {
     request_texture_atlas_build(self, ultra_atlas_range, TextureLayer::Ultra);
     request_texture_atlas_build(self, base_atlas_range, TextureLayer::Base);
+    request_texture_atlas_build(self, far_atlas_range, TextureLayer::Far);
     request_texture_atlas_build(self, mid_atlas_range, TextureLayer::Mid);
     request_texture_atlas_build(self, atlas_range, TextureLayer::Detail);
   } else {
@@ -8629,8 +9260,8 @@ queue_scene_requests(GWorldSceneView *self)
   atlas_request_ms = perf_elapsed_ms(atlas_start_us);
   const double total_ms = perf_elapsed_ms(request_start_us);
   if (perf_enabled() &&
-      (perf_verbose() || total_ms >= perf_scene_threshold_ms() || mesh_rebuilt || mesh_build_queued || mesh_build_deferred || globe_mesh_rebuilt)) {
-    g_message("GWorldScene perf scene total=%.2fms state=%.2f refresh=%.2f terrain=%.2f(candidates=%d cached_loads=%d downloads=%d pending=%d) texture=%.2f(candidates=%d downloads=%d pending=%d refresh_wait=%d refresh_flush=%d) mesh=%.2f(rebuilt=%d queued=%d deferred=%d globe=%d vertices=%zu indices=%zu) atlas_req=%.2f ranges ultra=%s detail=%s mid=%s base=%s",
+      (perf_verbose() || total_ms >= perf_scene_threshold_ms() || mesh_rebuilt || mesh_build_queued || globe_mesh_rebuilt)) {
+    g_message("GWorldScene perf scene total=%.2fms state=%.2f refresh=%.2f terrain=%.2f(candidates=%d cached_loads=%d downloads=%d pending=%d) texture=%.2f(candidates=%d downloads=%d pending=%d refresh_wait=%d refresh_flush=%d) mesh=%.2f(rebuilt=%d queued=%d globe=%d vertices=%zu indices=%zu) atlas_req=%.2f ranges ultra=%s detail=%s mid=%s far=%s base=%s",
               total_ms,
               initial_state_ms,
               refresh_ms,
@@ -8648,7 +9279,6 @@ queue_scene_requests(GWorldSceneView *self)
               mesh_rebuild_ms,
               mesh_rebuilt ? 1 : 0,
               mesh_build_queued ? 1 : 0,
-              mesh_build_deferred ? 1 : 0,
               globe_mesh_rebuilt ? 1 : 0,
               mesh_vertices_count,
               mesh_indices_count,
@@ -8656,9 +9286,88 @@ queue_scene_requests(GWorldSceneView *self)
               ultra_atlas_range.key().c_str(),
               atlas_range.key().c_str(),
               mid_atlas_range.key().c_str(),
+              far_atlas_range.key().c_str(),
               base_atlas_range.key().c_str());
   }
   gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+static GdkGLContext *
+gworld_scene_view_create_context(GtkGLArea *area)
+{
+  bool allow_gl = true;
+  bool allow_gles = true;
+#if GWORLD_SCENE_GTK_MAJOR == 4 && GTK_CHECK_VERSION(4, 12, 0)
+  const GdkGLAPI apis = gtk_gl_area_get_allowed_apis(area);
+  allow_gl = (apis & GDK_GL_API_GL) != 0;
+  allow_gles = (apis & GDK_GL_API_GLES) != 0;
+#else
+  // Older GtkGLArea has no "both APIs" setting. Its default selects automatic
+  // negotiation here, while an explicit use-es=TRUE still forces GLES.
+  allow_gl = !gtk_gl_area_get_use_es(area);
+#endif
+
+  int requested_major = 0;
+  int requested_minor = 0;
+  gtk_gl_area_get_required_version(area, &requested_major, &requested_minor);
+  g_autoptr(GdkGLContext) previous = gdk_gl_context_get_current();
+  if (previous != nullptr)
+    g_object_ref(previous);
+  const auto restore_current = [&]() {
+    if (previous != nullptr)
+      gdk_gl_context_make_current(previous);
+    else
+      gdk_gl_context_clear_current();
+  };
+  g_autoptr(GError) error = nullptr;
+  for (bool use_es : {false, true}) {
+    if ((use_es && !allow_gles) || (!use_es && !allow_gl))
+      continue;
+
+    g_clear_error(&error);
+#if GWORLD_SCENE_GTK_MAJOR == 4
+    GdkGLContext *context = gdk_surface_create_gl_context(
+      gtk_native_get_surface(gtk_widget_get_native(GTK_WIDGET(area))), &error);
+#else
+    GdkGLContext *context =
+      gdk_window_create_gl_context(gtk_widget_get_window(GTK_WIDGET(area)), &error);
+#endif
+    if (context == nullptr)
+      continue;
+
+#if GWORLD_SCENE_GTK_MAJOR == 4
+    gdk_gl_context_set_allowed_apis(context, use_es ? GDK_GL_API_GLES : GDK_GL_API_GL);
+#else
+    gdk_gl_context_set_use_es(context, use_es);
+#endif
+    const int version = std::max(requested_major * 10 + requested_minor, use_es ? 30 : 33);
+    gdk_gl_context_set_required_version(context, version / 10, version % 10);
+    if (gdk_gl_context_realize(context, &error)) {
+      // GTK 3 only discovers the actual version when the context is made current.
+      gdk_gl_context_make_current(context);
+      int major = 0;
+      int minor = 0;
+      gdk_gl_context_get_version(context, &major, &minor);
+      const bool actual_es = gdk_gl_context_get_use_es(context);
+      const int minimum = std::max(requested_major * 10 + requested_minor, actual_es ? 30 : 33);
+      if (major * 10 + minor >= minimum && (actual_es ? allow_gles : allow_gl)) {
+        g_debug("GWorldScene using %s %d.%d", actual_es ? "OpenGL ES" : "OpenGL", major, minor);
+        restore_current();
+        return context;
+      }
+      g_set_error(&error, GDK_GL_ERROR, GDK_GL_ERROR_NOT_AVAILABLE,
+                  "Unsupported %s context %d.%d", actual_es ? "OpenGL ES" : "OpenGL", major, minor);
+    }
+    restore_current();
+    g_object_unref(context);
+  }
+
+  g_autoptr(GError) unavailable = g_error_new(
+    GDK_GL_ERROR, GDK_GL_ERROR_NOT_AVAILABLE,
+    "GWorldScene requires OpenGL 3.3 or OpenGL ES 3.0: %s",
+    error != nullptr ? error->message : "no supported GL API is allowed");
+  gtk_gl_area_set_error(area, unavailable);
+  return nullptr;
 }
 
 static void
@@ -8670,8 +9379,15 @@ on_realize(GtkGLArea *area, gpointer user_data)
   auto *state = get_state(self);
 
   gtk_gl_area_make_current(area);
-  if (gtk_gl_area_get_error(area) != nullptr)
+  if (const GError *error = gtk_gl_area_get_error(area)) {
+    g_warning("Failed to realize GWorldScene OpenGL context: %s", error->message);
     return;
+  }
+
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    update_gl_texture_limit_locked(state);
+  }
 
   state->program = gworld_scene_view_create_program();
   schedule_scene_requests(self);
@@ -8683,11 +9399,18 @@ on_unrealize(GtkGLArea *area, gpointer user_data)
 {
   (void)user_data;
 
-  gtk_gl_area_make_current(area);
-  if (gtk_gl_area_get_error(area) != nullptr)
-    return;
-
   auto *state = get_state(GWORLD_SCENE_VIEW(area));
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    cancel_view_async_work_locked(state);
+  }
+
+  gtk_gl_area_make_current(area);
+  if (const GError *error = gtk_gl_area_get_error(area)) {
+    g_debug("Skipping OpenGL cleanup after context error: %s", error->message);
+    return;
+  }
+
   delete_gl_resources(state);
 }
 
@@ -8700,6 +9423,9 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
   auto *self = GWORLD_SCENE_VIEW(area);
   auto *state = get_state(self);
   const gint64 frame_start_us = perf_now_us();
+  // GtkGLArea sets the viewport in framebuffer pixels, including display scaling.
+  GLint viewport[4] = {};
+  glGetIntegerv(GL_VIEWPORT, viewport);
 
   if (state->program == 0)
     state->program = gworld_scene_view_create_program();
@@ -8736,6 +9462,7 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
   AtlasRange ultra_texture_atlas_range;
   AtlasRange texture_atlas_range;
   AtlasRange mid_texture_atlas_range;
+  AtlasRange far_texture_atlas_range;
   AtlasRange base_texture_atlas_range;
   AtlasRange globe_texture_atlas_range;
   bool more_texture_uploads_pending = false;
@@ -8745,12 +9472,14 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
   bool texture_dirty_before = false;
   bool ultra_texture_dirty_before = false;
   bool mid_texture_dirty_before = false;
+  bool far_texture_dirty_before = false;
   bool base_texture_dirty_before = false;
   bool globe_texture_dirty_before = false;
   bool model_texture_dirty_before = false;
   int pending_terrain_downloads = 0;
   int pending_texture_downloads = 0;
   int pending_texture_builds = 0;
+  std::size_t active_texture_storage_bytes = 0;
   guint64 frame_number = 0;
   double frame_gap_ms = 0.0;
   double state_lock_wait_ms = 0.0;
@@ -8796,6 +9525,7 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
     ultra_texture_atlas_range = state->ultra_texture_atlas_range;
     texture_atlas_range = state->texture_atlas_range;
     mid_texture_atlas_range = state->mid_texture_atlas_range;
+    far_texture_atlas_range = state->far_texture_atlas_range;
     base_texture_atlas_range = state->base_texture_atlas_range;
     globe_texture_atlas_range = state->globe_texture_atlas_range;
     moving = state->move_forward || state->move_backward || state->move_left || state->move_right;
@@ -8804,6 +9534,7 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
     texture_dirty_before = state->texture_dirty;
     ultra_texture_dirty_before = state->ultra_texture_dirty;
     mid_texture_dirty_before = state->mid_texture_dirty;
+    far_texture_dirty_before = state->far_texture_dirty;
     base_texture_dirty_before = state->base_texture_dirty;
     globe_texture_dirty_before = state->globe_texture_dirty;
     model_texture_dirty_before = state->model_texture_dirty;
@@ -8819,6 +9550,13 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
     if (render_globe)
       upload_globe_mesh_if_needed(state, &globe_upload_stats);
     more_texture_uploads_pending = upload_textures_if_needed(state, &texture_upload_stats);
+    ultra_texture_atlas_range = state->ultra_texture_atlas_range;
+    texture_atlas_range = state->texture_atlas_range;
+    mid_texture_atlas_range = state->mid_texture_atlas_range;
+    far_texture_atlas_range = state->far_texture_atlas_range;
+    base_texture_atlas_range = state->base_texture_atlas_range;
+    globe_texture_atlas_range = state->globe_texture_atlas_range;
+    active_texture_storage_bytes = estimated_active_texture_storage_bytes_locked(state);
     state_copy_upload_ms = perf_elapsed_ms(state_start_us);
   }
 
@@ -8826,7 +9564,6 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
   int width = 1;
   int height = 1;
   widget_size(GTK_WIDGET(area), &width, &height);
-  glViewport(0, 0, width, height);
 
   double far_plane_m = std::max(100000.0, radius_m * 3.0 + altitude * 4.0);
   if (render_globe)
@@ -8925,7 +9662,7 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
   const double shadow_ms = perf_elapsed_ms(shadow_start_us);
 
   const gint64 draw_start_us = perf_now_us();
-  glViewport(0, 0, width, height);
+  glViewport(viewport[0], viewport[1], viewport[2], viewport[3]);
   glClearColor(effective_fog_color.r, effective_fog_color.g, effective_fog_color.b, 1.0f);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
   render_sky_background(state,
@@ -8960,9 +9697,11 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
   glUniform1i(glGetUniformLocation(state->program, "shadow_texture"), 3);
   glUniform1i(glGetUniformLocation(state->program, "model_texture"), 4);
   glUniform1i(glGetUniformLocation(state->program, "ultra_texture"), 5);
+  glUniform1i(glGetUniformLocation(state->program, "far_texture"), 6);
   set_atlas_uniforms(state->program, "ultra", ultra_texture_atlas_range);
   set_atlas_uniforms(state->program, "detail", texture_atlas_range);
   set_atlas_uniforms(state->program, "mid", mid_texture_atlas_range);
+  set_atlas_uniforms(state->program, "far", far_texture_atlas_range);
   set_atlas_uniforms(state->program, "base", base_texture_atlas_range);
   set_atlas_uniforms(state->program, "globe", globe_texture_atlas_range);
   glUniform3fv(glGetUniformLocation(state->program, "sun_direction"),
@@ -9002,6 +9741,7 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
     glUniform1i(glGetUniformLocation(state->program, "has_ultra_texture"), FALSE);
     glUniform1i(glGetUniformLocation(state->program, "has_detail_texture"), FALSE);
     glUniform1i(glGetUniformLocation(state->program, "has_mid_texture"), FALSE);
+    glUniform1i(glGetUniformLocation(state->program, "has_far_texture"), FALSE);
     glUniform1i(glGetUniformLocation(state->program, "has_base_texture"), state->globe_texture != 0);
     glUniform1i(glGetUniformLocation(state->program, "has_shadow_texture"), FALSE);
     glUniform1i(glGetUniformLocation(state->program, "has_model_texture"), FALSE);
@@ -9025,6 +9765,7 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
     glUniform1i(glGetUniformLocation(state->program, "has_ultra_texture"), state->ultra_texture != 0);
     glUniform1i(glGetUniformLocation(state->program, "has_detail_texture"), state->texture != 0);
     glUniform1i(glGetUniformLocation(state->program, "has_mid_texture"), state->mid_texture != 0);
+    glUniform1i(glGetUniformLocation(state->program, "has_far_texture"), state->far_texture != 0);
     glUniform1i(glGetUniformLocation(state->program, "has_base_texture"), state->base_texture != 0);
     glUniform1i(glGetUniformLocation(state->program, "has_shadow_texture"), shadow_available);
     glUniform1i(glGetUniformLocation(state->program, "has_model_texture"), state->model_texture != 0);
@@ -9036,6 +9777,10 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
     if (state->mid_texture != 0) {
       glActiveTexture(GL_TEXTURE1);
       glBindTexture(GL_TEXTURE_2D, state->mid_texture);
+    }
+    if (state->far_texture != 0) {
+      glActiveTexture(GL_TEXTURE6);
+      glBindTexture(GL_TEXTURE_2D, state->far_texture);
     }
     if (state->base_texture != 0) {
       glActiveTexture(GL_TEXTURE2);
@@ -9078,7 +9823,7 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
       mesh_upload_stats.duration_ms >= perf_upload_threshold_ms() ||
       globe_upload_stats.duration_ms >= perf_upload_threshold_ms();
     if (perf_verbose() || slow_frame) {
-      g_message("GWorldScene perf frame=%" G_GUINT64_FORMAT " total=%.2fms gap=%.2fms moving=%d lock_wait=%.2f state_upload=%.2f camera=%.2f shadow=%.2f draw=%.2f mesh_upload=%d %.2fms %.1fMiB idx=%zu globe_upload=%d %.2fms %.1fMiB tex_upload=%s %.2fms %.1fMiB %dx%d deferred=%d pending(terrain=%d texture=%d builds=%d) dirty(mesh=%d globe=%d tex=%d ultra=%d mid=%d base=%d globe_tex=%d model=%d)",
+      g_message("GWorldScene perf frame=%" G_GUINT64_FORMAT " total=%.2fms gap=%.2fms moving=%d lock_wait=%.2f state_upload=%.2f camera=%.2f shadow=%.2f draw=%.2f mesh_upload=%d %.2fms %.1fMiB idx=%zu globe_upload=%d %.2fms %.1fMiB tex_upload=%s %.2fms %.1fMiB %dx%d active_tex=%.1fMiB deferred=%d pending(terrain=%d texture=%d builds=%d) dirty(mesh=%d globe=%d tex=%d ultra=%d mid=%d far=%d base=%d globe_tex=%d model=%d)",
                 frame_number,
                 total_ms,
                 frame_gap_ms,
@@ -9100,6 +9845,7 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
                 bytes_to_mib(texture_upload_stats.bytes),
                 texture_upload_stats.width,
                 texture_upload_stats.height,
+                bytes_to_mib(active_texture_storage_bytes),
                 texture_upload_stats.deferred ? 1 : 0,
                 pending_terrain_downloads,
                 pending_texture_downloads,
@@ -9109,6 +9855,7 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
                 texture_dirty_before ? 1 : 0,
                 ultra_texture_dirty_before ? 1 : 0,
                 mid_texture_dirty_before ? 1 : 0,
+                far_texture_dirty_before ? 1 : 0,
                 base_texture_dirty_before ? 1 : 0,
                 globe_texture_dirty_before ? 1 : 0,
                 model_texture_dirty_before ? 1 : 0);
@@ -9619,6 +10366,9 @@ gworld_scene_view_set_property(GObject *object,
   case PROP_CACHE_ENABLED:
     gworld_scene_view_set_cache_enabled(self, g_value_get_boolean(value));
     break;
+  case PROP_TEXTURE_MEMORY_BUDGET_MIB:
+    gworld_scene_view_set_texture_memory_budget_mib(self, g_value_get_uint(value));
+    break;
   case PROP_SUN_AZIMUTH_DEG: {
     double azimuth = 0.0;
     double elevation = 0.0;
@@ -9683,6 +10433,9 @@ gworld_scene_view_get_property(GObject *object,
   case PROP_CACHE_ENABLED:
     g_value_set_boolean(value, state->cache_enabled);
     break;
+  case PROP_TEXTURE_MEMORY_BUDGET_MIB:
+    g_value_set_uint(value, state->texture_memory_budget_mib);
+    break;
   case PROP_SUN_AZIMUTH_DEG: {
     const gworld_scene::SunPosition sun_position =
       gworld_scene::sun_position_from_direction(sun_enu_for_state(state, state->latitude));
@@ -9716,6 +10469,14 @@ gworld_scene_view_get_property(GObject *object,
 static void
 gworld_scene_view_dispose(GObject *object)
 {
+  auto *priv = static_cast<GWorldSceneViewPrivate *>(
+    gworld_scene_view_get_instance_private(GWORLD_SCENE_VIEW(object)));
+  if (priv->backend != nullptr) {
+    GWorldSceneViewState &state = priv->backend->state();
+    std::lock_guard<std::mutex> lock(state.mutex);
+    cancel_view_async_work_locked(&state);
+  }
+
   G_OBJECT_CLASS(gworld_scene_view_parent_class)->dispose(object);
 }
 
@@ -9744,6 +10505,7 @@ gworld_scene_view_finalize(GObject *object)
 static void
 gworld_scene_view_class_init(GWorldSceneViewClass *klass)
 {
+  GTK_GL_AREA_CLASS(klass)->create_context = gworld_scene_view_create_context;
   GObjectClass *object_class = G_OBJECT_CLASS(klass);
   object_class->set_property = gworld_scene_view_set_property;
   object_class->get_property = gworld_scene_view_get_property;
@@ -9857,6 +10619,14 @@ gworld_scene_view_class_init(GWorldSceneViewClass *klass)
                          "Whether terrain and map tiles are cached on disk",
                          TRUE,
                          static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY));
+  properties[PROP_TEXTURE_MEMORY_BUDGET_MIB] =
+    g_param_spec_uint("texture-memory-budget-mib",
+                      "Texture Memory Budget MiB",
+                      "Approximate texture atlas memory budget in MiB; 0 uses the default profile",
+                      0,
+                      kMaxTextureMemoryBudgetMib,
+                      kDefaultTextureMemoryBudgetMib,
+                      static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY));
   properties[PROP_SUN_AZIMUTH_DEG] =
     g_param_spec_double("sun-azimuth-deg",
                         "Sun Azimuth",
@@ -9911,7 +10681,8 @@ gworld_scene_view_init(GWorldSceneView *self)
   auto *priv = static_cast<GWorldSceneViewPrivate *>(gworld_scene_view_get_instance_private(self));
   priv->backend = new GWorldSceneViewBackend(self);
 
-  gtk_gl_area_set_required_version(GTK_GL_AREA(self), 3, 3);
+  // The context factory requests GL 3.3 or GLES 3.0 as appropriate.
+  gtk_gl_area_set_required_version(GTK_GL_AREA(self), 3, 0);
   gtk_gl_area_set_has_depth_buffer(GTK_GL_AREA(self), TRUE);
   gtk_gl_area_set_auto_render(GTK_GL_AREA(self), TRUE);
   gtk_widget_set_hexpand(GTK_WIDGET(self), TRUE);
@@ -10274,6 +11045,11 @@ gworld_scene_view_set_map_tile_url_template(GWorldSceneView *self, const char *u
     state->mid_texture_height = 0;
     state->mid_texture_dirty = true;
     state->loaded_mid_texture_key.clear();
+    state->far_texture_pixels.clear();
+    state->far_texture_width = 0;
+    state->far_texture_height = 0;
+    state->far_texture_dirty = true;
+    state->loaded_far_texture_key.clear();
     state->loaded_base_texture_key.clear();
     state->base_texture_pixels.clear();
     state->base_texture_width = 0;
@@ -10287,11 +11063,13 @@ gworld_scene_view_set_map_tile_url_template(GWorldSceneView *self, const char *u
     state->wanted_ultra_texture_key.clear();
     state->wanted_texture_key.clear();
     state->wanted_mid_texture_key.clear();
+    state->wanted_far_texture_key.clear();
     state->wanted_base_texture_key.clear();
     state->wanted_globe_texture_key.clear();
     state->pending_ultra_texture_build_key.clear();
     state->pending_texture_build_key.clear();
     state->pending_mid_texture_build_key.clear();
+    state->pending_far_texture_build_key.clear();
     state->pending_base_texture_build_key.clear();
     state->pending_globe_texture_build_key.clear();
     state->texture_refresh_pending = false;
@@ -10299,6 +11077,7 @@ gworld_scene_view_set_map_tile_url_template(GWorldSceneView *self, const char *u
     state->ultra_texture_atlas_range = AtlasRange();
     state->texture_atlas_range = AtlasRange();
     state->mid_texture_atlas_range = AtlasRange();
+    state->far_texture_atlas_range = AtlasRange();
     state->base_texture_atlas_range = AtlasRange();
     state->globe_texture_atlas_range = AtlasRange();
     ++state->texture_source_revision;
@@ -10346,6 +11125,11 @@ gworld_scene_view_set_cache_directory(GWorldSceneView *self, const char *cache_d
     state->mid_texture_height = 0;
     state->mid_texture_dirty = true;
     state->loaded_mid_texture_key.clear();
+    state->far_texture_pixels.clear();
+    state->far_texture_width = 0;
+    state->far_texture_height = 0;
+    state->far_texture_dirty = true;
+    state->loaded_far_texture_key.clear();
     state->loaded_base_texture_key.clear();
     state->base_texture_pixels.clear();
     state->base_texture_width = 0;
@@ -10359,11 +11143,13 @@ gworld_scene_view_set_cache_directory(GWorldSceneView *self, const char *cache_d
     state->wanted_ultra_texture_key.clear();
     state->wanted_texture_key.clear();
     state->wanted_mid_texture_key.clear();
+    state->wanted_far_texture_key.clear();
     state->wanted_base_texture_key.clear();
     state->wanted_globe_texture_key.clear();
     state->pending_ultra_texture_build_key.clear();
     state->pending_texture_build_key.clear();
     state->pending_mid_texture_build_key.clear();
+    state->pending_far_texture_build_key.clear();
     state->pending_base_texture_build_key.clear();
     state->pending_globe_texture_build_key.clear();
     state->texture_refresh_pending = false;
@@ -10371,6 +11157,7 @@ gworld_scene_view_set_cache_directory(GWorldSceneView *self, const char *cache_d
     state->ultra_texture_atlas_range = AtlasRange();
     state->texture_atlas_range = AtlasRange();
     state->mid_texture_atlas_range = AtlasRange();
+    state->far_texture_atlas_range = AtlasRange();
     state->base_texture_atlas_range = AtlasRange();
     state->globe_texture_atlas_range = AtlasRange();
     ++state->texture_source_revision;
@@ -10417,6 +11204,45 @@ gworld_scene_view_get_cache_enabled(GWorldSceneView *self)
   auto *state = get_state(self);
   std::lock_guard<std::mutex> lock(state->mutex);
   return state->cache_enabled;
+}
+
+void
+gworld_scene_view_set_texture_memory_budget_mib(GWorldSceneView *self, guint budget_mib)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+
+  budget_mib = std::min(budget_mib, kMaxTextureMemoryBudgetMib);
+
+  bool changed = false;
+  {
+    auto *state = get_state(self);
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->texture_memory_budget_mib != budget_mib) {
+      state->texture_memory_budget_mib = budget_mib;
+      clear_loaded_texture_keys_locked(state);
+      changed = true;
+    }
+  }
+
+  if (!changed)
+    return;
+
+  if (texture_trace_enabled()) {
+    g_message("GWorldScene texture-trace budget-set budget=%uMiB",
+              budget_mib);
+  }
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_TEXTURE_MEMORY_BUDGET_MIB]);
+  schedule_scene_requests(self, 20);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+guint
+gworld_scene_view_get_texture_memory_budget_mib(GWorldSceneView *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), kDefaultTextureMemoryBudgetMib);
+  auto *state = get_state(self);
+  std::lock_guard<std::mutex> lock(state->mutex);
+  return state->texture_memory_budget_mib;
 }
 
 void

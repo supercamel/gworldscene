@@ -401,12 +401,57 @@ test_text_label_node_stores_text_and_display_policy()
   g_object_unref(node);
 }
 
+void
+test_node_moves_across_dateline()
+{
+  auto *node = GWORLD_SCENE_NODE(_gworld_scene_cube_node_new(1, 0.0, 179.999, 100.0, 1.0, 1.0, 1.0));
+  gworld_scene_node_translate_ned(node, 0.0, 500.0, 0.0);
+  double longitude = 0.0;
+  gworld_scene_node_get_position(node, nullptr, &longitude, nullptr);
+  g_assert_cmpfloat(longitude, <, -179.0);
+  gworld_scene_node_translate_ned(node, 0.0, -500.0, 0.0);
+  gworld_scene_node_get_position(node, nullptr, &longitude, nullptr);
+  assert_near(longitude, 179.999, 1e-10);
+  g_object_unref(node);
+}
+
+template <typename Node>
+void
+assert_string_aliasing(Node *node, void (*set)(Node *, const char *), const char *(*get)(Node *))
+{
+  set(node, "prefix-value");
+  set(node, get(node));
+  g_assert_cmpstr(get(node), ==, "prefix-value");
+  set(node, get(node) + 7);
+  g_assert_cmpstr(get(node), ==, "value");
+}
+
+void
+test_string_setters_accept_getter_results()
+{
+  auto *model = GWORLD_SCENE_MODEL_NODE(g_object_new(GWORLD_TYPE_SCENE_MODEL_NODE, nullptr));
+  assert_string_aliasing(model, gworld_scene_model_node_set_model_path, gworld_scene_model_node_get_model_path);
+  g_object_unref(model);
+  auto *billboard = GWORLD_SCENE_BILLBOARD_NODE(g_object_new(GWORLD_TYPE_SCENE_BILLBOARD_NODE, nullptr));
+  assert_string_aliasing(billboard, gworld_scene_billboard_node_set_image_path, gworld_scene_billboard_node_get_image_path);
+  g_object_unref(billboard);
+  auto *overlay = GWORLD_SCENE_GROUND_OVERLAY_NODE(g_object_new(GWORLD_TYPE_SCENE_GROUND_OVERLAY_NODE, nullptr));
+  assert_string_aliasing(overlay, gworld_scene_ground_overlay_node_set_image_path, gworld_scene_ground_overlay_node_get_image_path);
+  g_object_unref(overlay);
+  auto *label = GWORLD_SCENE_TEXT_LABEL_NODE(g_object_new(GWORLD_TYPE_SCENE_TEXT_LABEL_NODE, nullptr));
+  assert_string_aliasing(label, gworld_scene_text_label_node_set_text, gworld_scene_text_label_node_get_text);
+  assert_string_aliasing(label, gworld_scene_text_label_node_set_font, gworld_scene_text_label_node_get_font);
+  g_object_unref(label);
+}
+
 } // namespace
 
 int
 main(int argc, char **argv)
 {
   g_test_init(&argc, &argv, nullptr);
+  g_test_add_func("/scene-node/moves-across-dateline", test_node_moves_across_dateline);
+  g_test_add_func("/scene-node/string-setters-accept-getter-results", test_string_setters_accept_getter_results);
   g_test_add_func("/scene-node/new-node-has-nonzero-defaults", test_new_node_has_nonzero_defaults);
   g_test_add_func("/scene-node/translate-ned-updates-geodetic-position", test_translate_ned_updates_geodetic_position);
   g_test_add_func("/scene-node/mutations-emit-changed", test_mutations_emit_changed);

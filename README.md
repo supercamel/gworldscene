@@ -18,6 +18,7 @@ GObject Introspection metadata, generated Vala bindings, and SQGI examples.
 ## Features
 
 - GTK 3 and GTK 4 widget libraries built on `GtkGLArea`.
+- Automatic desktop OpenGL 3.3 / OpenGL ES 3.0 context and shader selection.
 - Shared core library for scene nodes, camera math, picking, and geodesy.
 - Local terrain rendering from HGT-style elevation tiles.
 - Slippy-map texture imagery with disk caching.
@@ -75,6 +76,34 @@ meson setup builddir -Dgtk3=disabled -Dgtk4=enabled
 
 When both backends are enabled, applications should still link only one of
 `gworldscene-gtk3-0.1` or `gworldscene-gtk4-0.1` in a single process.
+
+The widget tries desktop OpenGL 3.3 first, then OpenGL ES 3.0. Shaders are
+selected from the actual current context; no GLES-specific build is needed.
+GTK 4.12 and later applications can restrict selection with
+`gtk_gl_area_set_allowed_apis()` before realization. On older GTK, setting
+`use-es` to true requests GLES; the default permits automatic selection.
+GTK 3's X11 backend may require `GDK_GL=gles` at process startup to select
+GLES for its shared contexts.
+
+The rendering tests exercise both APIs, shadows, scaled viewports, and context
+recreation. They skip when no display is available. To run them with Mesa
+software rendering on a headless Linux machine:
+
+```sh
+xvfb-run -a env LIBGL_ALWAYS_SOFTWARE=1 GSK_RENDERER=cairo GTK_A11Y=none \
+  meson test -C builddir --suite render --print-errorlogs
+```
+
+The binding tests check scalar output direction, ownership, optionality, and
+parameter order in both generated GIRs. When `sqgi` is available at configure
+time, they also run all 25 multi-output getters against the build's typelibs and
+libraries, using a separate process for each GTK version. These runtime tests
+skip without a display:
+
+```sh
+xvfb-run -a env GSK_RENDERER=cairo GTK_A11Y=none \
+  meson test -C builddir --suite bindings --print-errorlogs
+```
 
 Install system-wide when you want the headers, pkg-config file, GIR, typelib,
 and VAPI available to external programs:
@@ -169,6 +198,34 @@ gworld_scene_view_set_cache_directory(view, "/tmp/gworldscene-cache");
 gworld_scene_view_set_cache_enabled(view, TRUE);
 ```
 
+Terrain files are cached under `terrain/<SHA-256 of terrain-server>/<tile>.hgt`
+or `<tile>.hgt.zip`. Each source has its own directory, including distinct URL
+templates and query parameters. Switching sources cannot reuse another source's
+elevations. Older files directly under `terrain/` are left on disk and ignored;
+the library downloads fresh copies into the source-specific directories.
+
+The local scene renders while elevation tiles are loading. Missing tiles use a
+sea-level surface for imagery, then update as terrain arrives. Slow or unavailable
+terrain requests do not prevent scene objects or imagery from appearing.
+
+Terrain imagery uses five overlapping distance bands. Near the ground around
+Cairns, the default tile budget gives approximately:
+
+| Band | Coverage radius | Imagery zoom |
+| --- | ---: | ---: |
+| Ultra | Up to 1 km | 18 |
+| Detail | 2 km | 16 |
+| Mid | 8 km | 14 |
+| Far | 33 km | 12 |
+| Base | Full terrain extent | 10 or lower |
+
+Each two-level zoom step increases ground pixel size by 4×. Adjacent bands blend
+at their edges and keep coarser imagery visible while finer tiles load. Altitude
+above ground adjusts the zoom levels; latitude, texture-memory presets, and GPU
+texture limits determine each band's coverage. Larger presets extend coverage
+at the same resolution. The extra far band uses up to 16 MiB of resident texture
+memory with the default 64-tile limit, plus temporary upload storage.
+
 ## Coordinates
 
 Positions use geodetic coordinates:
@@ -176,6 +233,10 @@ Positions use geodetic coordinates:
 - `latitude`: degrees north.
 - `longitude`: degrees east.
 - `altitude_amsl`: metres above mean sea level.
+
+East/west movement wraps longitude across the dateline. Terrain and imagery
+ranges span both sides, so crossing ±180 degrees does not stop movement or drop
+the adjacent tiles.
 
 Scene node orientation uses the local NED frame:
 

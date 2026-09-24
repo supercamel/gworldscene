@@ -10,6 +10,9 @@ constexpr double kWgs84A = 6378137.0;
 
 double deg_to_rad(double degrees);
 
+// Normalize longitude to [-180, 180), including multi-turn translations.
+double wrap_longitude(double longitude);
+
 glm::dvec3 geodetic_to_ecef(double lat_deg, double lon_deg, double h);
 
 glm::dvec3 geodetic_to_scene(double lat_deg,
