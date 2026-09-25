@@ -1,7 +1,7 @@
 project = "GWorldScene"
 copyright = "2026, GWorldScene contributors"
 author = "GWorldScene contributors"
-release = "0.1.0"
+release = "0.2.0"
 
 extensions = []
 templates_path = ["_templates"]
