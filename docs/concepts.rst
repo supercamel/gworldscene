@@ -206,6 +206,11 @@ Renderable node types
   outline width, and altitude mode.
 
 ``SceneTextLabelNode``
+  Text cards extend upward from their geographic anchor with a three-screen-pixel
+  gap below the card. Terrain still occludes labels behind hills. Newlines create
+  multiple lines; picking follows the rendered font, padding and card bounds.
+  Image billboards retain their centered anchors.
+
   Camera-facing text label with font, text/background colors, padding, pixel
   size limits, reference size, maximum visible distance, and altitude mode.
 

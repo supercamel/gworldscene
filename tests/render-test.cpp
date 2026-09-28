@@ -653,6 +653,41 @@ check_camera_crosses_dateline(GWorldSceneView *view)
   }
 }
 
+// Exercise actual terrain depth testing and rasterized multiline text, not
+// only node properties. The local terrain tile is flat at 800 m here.
+void
+check_ground_labels(GWorldSceneView *view)
+{
+  gworld_scene_view_clear_nodes(view);
+  gworld_scene_view_set_camera(view, 0.49, 0.5, 1400.0);
+  gworld_scene_view_set_camera_orientation(view, 0.0, -28.0);
+  auto *label = gworld_scene_view_add_text_label(view, "Ground", 0.5, 0.5, 802.0);
+  gworld_scene_text_label_node_set_font(label, "Sans 12");
+  gworld_scene_text_label_node_set_size_limits(label, 80, 80);
+  gworld_scene_text_label_node_set_padding(label, 4);
+  gworld_scene_text_label_node_set_background_color(label, 1, 0, 0, 1);
+  gworld_scene_text_label_node_set_text_color(label, 1, 1, 1, 1);
+  auto height = [&]() {
+    const auto pixels = render_frame(GTK_GL_AREA(view));
+    int low = 256, high = -1;
+    for (int y = 0; y < 256; ++y)
+      for (int x = 0; x < 256; ++x) {
+        const auto *p = pixels.data() + (y * 256 + x) * 4;
+        if (p[0] > 100 && p[0] > p[1] * 2 && p[0] > p[2] * 2) {
+          low = std::min(low, y); high = std::max(high, y);
+        }
+      }
+    return high >= low ? high - low + 1 : 0;
+  };
+  int single = 0;
+  g_assert_true(wait_until([&]() { single = height(); return single >= 30; }));
+  gworld_scene_text_label_node_set_text(label, "Ground\nOrigin");
+  int multi = 0;
+  g_assert_true(wait_until([&]() { multi = height(); return multi > single * 1.4; }));
+  g_test_message("Complete ground text cards: single=%d multiline=%d", single, multi);
+  gworld_scene_view_clear_nodes(view);
+}
+
 void
 test_render(gconstpointer data)
 {
@@ -826,6 +861,7 @@ test_render(gconstpointer data)
   check_dateline_imagery(area);
   check_imagery_blending(area);
   check_imported_material(view, cache_dir);
+  check_ground_labels(view);
   gworld_scene_view_set_cache_enabled(view, FALSE);
   check_camera_crosses_dateline(view);
 

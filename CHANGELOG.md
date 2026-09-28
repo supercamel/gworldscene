@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.1 — 2026-09-28
+
+- Anchor text cards above their geographic point with a three-pixel gap, fixing
+  their lower half intersecting flat terrain at oblique camera angles. Terrain
+  occlusion remains enabled; image billboards remain centered.
+- Support multiline text labels and match picking bounds to the rendered font,
+  padding, dimensions and anchor.
+- Add native GL regression coverage for ground-level multiline labels.
+
+The API namespace and pkg-config suffix remain `0.1`.
+
 ## 0.2.0 — 2026-09-25
 
 First tagged release of GWorldScene.

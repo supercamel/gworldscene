@@ -2685,6 +2685,33 @@ pick_billboard_node_locked(GWorldSceneViewState *state,
   return try_update_pick(best, scene_node, distance, latitude, longitude, altitude_amsl, false);
 }
 
+void
+text_label_dimensions(const std::string &text, const std::string &font,
+                      int padding, int &width, int &height)
+{
+  const int max_texture_size = kMaxSceneImageTexturePixels;
+  cairo_surface_t *measure_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
+  cairo_t *measure_cr = cairo_create(measure_surface);
+  PangoLayout *layout = pango_cairo_create_layout(measure_cr);
+  PangoFontDescription *font_desc = pango_font_description_from_string(font.c_str());
+  pango_layout_set_font_description(layout, font_desc);
+  pango_layout_set_text(layout, text.c_str(), -1);
+  pango_layout_set_single_paragraph_mode(layout, FALSE);
+  pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END);
+  pango_layout_set_width(layout, std::max(1, max_texture_size - padding * 2) * PANGO_SCALE);
+
+  int text_width = 0;
+  int text_height = 0;
+  pango_layout_get_pixel_size(layout, &text_width, &text_height);
+  width = std::clamp(text_width + padding * 2, 1, max_texture_size);
+  height = std::clamp(text_height + padding * 2, 1, max_texture_size);
+
+  g_object_unref(layout);
+  pango_font_description_free(font_desc);
+  cairo_destroy(measure_cr);
+  cairo_surface_destroy(measure_surface);
+}
+
 bool
 pick_text_label_node_locked(GWorldSceneViewState *state,
                             GWorldSceneNode *scene_node,
@@ -2737,8 +2764,15 @@ pick_text_label_node_locked(GWorldSceneViewState *state,
     std::clamp(reference_size_px * (reference_distance_m / std::max(distance, 1.0)),
                min_px,
                max_px);
-  const double aspect = std::clamp(static_cast<double>(std::strlen(text)) * 0.55 + 1.0, 1.0, 8.0);
+  int label_width = 0, label_height = 0;
+  const char *font = gworld_scene_text_label_node_get_font(label);
+  text_label_dimensions(text[0] ? text : " ", font && font[0] ? font : "Sans Bold 18",
+    std::clamp(static_cast<int>(std::lround(gworld_scene_text_label_node_get_padding(label))), 0, 256),
+    label_width, label_height);
+  const double aspect = static_cast<double>(label_width) / std::max(1, label_height);
   const double target_height_px = target_width_px / aspect;
+  // Text is anchored above its geographic point, matching render_billboards.
+  center_y -= target_height_px * 0.5 + 3.0;
   if (std::abs(widget_x - center_x) > target_width_px * 0.5 ||
       std::abs(widget_y - center_y) > target_height_px * 0.5)
     return false;
@@ -3408,28 +3442,7 @@ render_text_label_rgba(const BillboardRenderItem &label,
   const std::string text = label.text.empty() ? " " : label.text;
   const std::string font = label.font.empty() ? "Sans Bold 18" : label.font;
   const int padding = std::clamp(static_cast<int>(std::lround(label.padding_px)), 0, 256);
-  const int max_texture_size = kMaxSceneImageTexturePixels;
-
-  cairo_surface_t *measure_surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, 1, 1);
-  cairo_t *measure_cr = cairo_create(measure_surface);
-  PangoLayout *layout = pango_cairo_create_layout(measure_cr);
-  PangoFontDescription *font_desc = pango_font_description_from_string(font.c_str());
-  pango_layout_set_font_description(layout, font_desc);
-  pango_layout_set_text(layout, text.c_str(), -1);
-  pango_layout_set_single_paragraph_mode(layout, TRUE);
-  pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END);
-  pango_layout_set_width(layout, std::max(1, max_texture_size - padding * 2) * PANGO_SCALE);
-
-  int text_width = 0;
-  int text_height = 0;
-  pango_layout_get_pixel_size(layout, &text_width, &text_height);
-  width = std::clamp(text_width + padding * 2, 1, max_texture_size);
-  height = std::clamp(text_height + padding * 2, 1, max_texture_size);
-
-  g_object_unref(layout);
-  pango_font_description_free(font_desc);
-  cairo_destroy(measure_cr);
-  cairo_surface_destroy(measure_surface);
+  text_label_dimensions(text, font, padding, width, height);
 
   cairo_surface_t *surface = cairo_image_surface_create(CAIRO_FORMAT_ARGB32, width, height);
   cairo_t *cr = cairo_create(surface);
@@ -3440,11 +3453,11 @@ render_text_label_rgba(const BillboardRenderItem &label,
                         label.background_color.a);
   cairo_paint(cr);
 
-  layout = pango_cairo_create_layout(cr);
-  font_desc = pango_font_description_from_string(font.c_str());
+  PangoLayout *layout = pango_cairo_create_layout(cr);
+  PangoFontDescription *font_desc = pango_font_description_from_string(font.c_str());
   pango_layout_set_font_description(layout, font_desc);
   pango_layout_set_text(layout, text.c_str(), -1);
-  pango_layout_set_single_paragraph_mode(layout, TRUE);
+  pango_layout_set_single_paragraph_mode(layout, FALSE);
   pango_layout_set_ellipsize(layout, PANGO_ELLIPSIZE_END);
   pango_layout_set_width(layout, std::max(1, width - padding * 2) * PANGO_SCALE);
   cairo_set_source_rgba(cr,
@@ -6366,10 +6379,16 @@ render_billboards(GWorldSceneViewState *state,
 
     const glm::dvec3 left = camera_right * half_width_m;
     const glm::dvec3 up = billboard_up * half_height_m;
-    const glm::dvec3 top_left = center - left + up;
-    const glm::dvec3 bottom_left = center - left - up;
-    const glm::dvec3 bottom_right = center + left - up;
-    const glm::dvec3 top_right = center + left + up;
+    // Labels denote a ground anchor. Centering their screen-sized quad there
+    // buried its lower half in terrain, especially at low camera pitch. Keep
+    // ordinary image billboards centered, but lift text above the anchor with
+    // a small screen-space gap. Picking applies the same vertical shift.
+    const glm::dvec3 label_center = billboard.generated_text
+      ? center + billboard_up * (half_height_m + 3.0 * world_per_pixel) : center;
+    const glm::dvec3 top_left = label_center - left + up;
+    const glm::dvec3 bottom_left = label_center - left - up;
+    const glm::dvec3 bottom_right = label_center + left - up;
+    const glm::dvec3 top_right = label_center + left + up;
 
     float vertices[30];
     int offset = 0;
