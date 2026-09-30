@@ -50,6 +50,13 @@ TerrainImageryPlan terrain_imagery_plan(double latitude, double longitude,
                                         int max_tiles = 64, int max_pixels = 4096,
                                         int max_ultra_tiles = 256, double ultra_radius_m = 1000.0);
 
+// Finest imagery around the calibrated view's ground footprint. Focal length
+// is in sensor pixels; keep resolution while shrinking coverage to fit budgets.
+ImageryBand camera_imagery_band(double latitude, double longitude,
+                                double distance_m, double focal_pixels,
+                                double footprint_radius_m, int max_tiles,
+                                int max_pixels);
+
 int globe_texture_zoom_for_altitude(double altitude_amsl);
 
 TileRange globe_texture_range_for_camera(double latitude,

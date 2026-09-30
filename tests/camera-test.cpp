@@ -259,12 +259,37 @@ test_camera_orientation_for_scene_target()
   assert_near(up.pitch_deg, 89.0, 0.001);
 }
 
+void test_calibrated_camera_math()
+{
+  gworld_scene::CameraProjection p{true,640,480,400,300,250,210,.01,100000};
+  const auto projection=gworld_scene::camera_projection(p);
+  const auto project=[&](glm::dvec3 v) {
+    const auto clip=projection*glm::dvec4(v,1);
+    return glm::dvec2((clip.x/clip.w+1)*320,(1-clip.y/clip.w)*240);
+  };
+  const auto center=project({0,0,-10});
+  assert_near(center.x,250,1e-9); assert_near(center.y,210,1e-9);
+  const auto corner=project({1,2,-10});
+  assert_near(corner.x,290,1e-9); assert_near(corner.y,150,1e-9);
+  const auto viewport=gworld_scene::camera_viewport(p,640,640);
+  g_assert_cmpint(viewport.y,==,80);g_assert_cmpint(viewport.height,==,480);
+  const auto local=gworld_scene::local_frame_at(0,0,0,0);
+  const auto identity=gworld_scene::quaternion_camera_pose(0,0,-5,{1,0,0,0},0,0);
+  assert_near(glm::dot(identity.eye-local.origin,local.up),-5,1e-9);
+  assert_near(glm::dot(identity.center-identity.eye,local.north),1,1e-9);
+  const auto rolled=gworld_scene::quaternion_camera_pose(0,0,600,glm::angleAxis(G_PI/2,glm::dvec3(1,0,0)),0,0);
+  assert_near(glm::dot(rolled.up,local.east),1,1e-9);
+  const auto down=gworld_scene::quaternion_camera_pose(0,0,600,glm::angleAxis(-G_PI/2,glm::dvec3(0,1,0)),0,0);
+  assert_near(glm::dot(down.center-down.eye,local.up),-1,1e-9);
+}
+
 } // namespace
 
 int
 main(int argc, char **argv)
 {
   g_test_init(&argc, &argv, nullptr);
+  g_test_add_func("/camera/calibrated-math", test_calibrated_camera_math);
   g_test_add_func("/camera/local-frame-axes", test_local_frame_axes);
   g_test_add_func("/camera/orbit-blend-steps", test_orbit_blend_steps);
   g_test_add_func("/camera/heading-and-pitch-normalization", test_heading_and_pitch_normalization);

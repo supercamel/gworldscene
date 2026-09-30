@@ -2,6 +2,7 @@
 #define GWORLD_SCENE_CAMERA_PRIVATE_H
 
 #include <glm/glm.hpp>
+#include <glm/gtc/quaternion.hpp>
 
 namespace gworld_scene {
 
@@ -17,6 +18,19 @@ struct CameraPose {
   glm::dvec3 center;
   glm::dvec3 up;
 };
+
+struct CameraProjection {
+  bool enabled = false;
+  int width = 1, height = 1;
+  double fx = 1, fy = 1, cx = 0.5, cy = 0.5;
+  double near_m = 0.01, far_m = 100000;
+};
+struct CameraViewport { int x, y, width, height; };
+CameraViewport camera_viewport(const CameraProjection &p, int width, int height);
+glm::dmat4 camera_projection(const CameraProjection &p);
+CameraPose quaternion_camera_pose(double latitude, double longitude, double altitude_amsl,
+                                 const glm::dquat &orientation,
+                                 double origin_latitude, double origin_longitude);
 
 struct CameraOrientation {
   double heading_deg = 0.0;

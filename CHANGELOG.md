@@ -1,5 +1,17 @@
 # Changelog
 
+## Unreleased
+
+- Calibrated zoom now requests finer imagery around the viewed terrain, with bounded tile coverage and coarser fallback.
+
+- Add exact quaternion camera pose, calibrated off-centre projection and aspect-preserving resizing.
+- Support millimetre near-plane settings with logarithmic world depth for calibrated views.
+- Add retained offscreen capture and owned timestamped frames for GTK 3/4 and introspection consumers.
+- Add a shared application-fed terrain source with bounded sample memory and deduplicated demand.
+- Apply current node transforms before rendering without rebuilding unchanged terrain; reuse model imports and update node buffer ranges.
+- Report entirely void terrain as unknown rather than valid zero elevation.
+- Add native OpenGL/GLES pixel, shared-terrain, GIR and SQGI regression coverage.
+
 ## 0.2.1 — 2026-09-28
 
 - Anchor text cards above their geographic point with a three-pixel gap, fixing

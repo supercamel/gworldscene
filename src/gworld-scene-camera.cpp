@@ -3,9 +3,40 @@
 #include "gworld-scene-geo-private.h"
 
 #include <algorithm>
+#include <glm/gtc/matrix_transform.hpp>
 #include <cmath>
 
 namespace gworld_scene {
+
+// Quaternion rotates optical forward/right/down into local north/east/down.
+CameraPose quaternion_camera_pose(double latitude, double longitude, double altitude_amsl,
+                                 const glm::dquat &q, double origin_latitude, double origin_longitude)
+{
+  const auto frame = local_frame_at(latitude, longitude, origin_latitude, origin_longitude);
+  const auto forward = q * glm::dvec3(1, 0, 0);
+  const auto up = q * glm::dvec3(0, 0, -1);
+  const auto ned = [&](const glm::dvec3 &v) { return frame.north*v.x + frame.east*v.y - frame.up*v.z; };
+  const auto eye = frame.origin + frame.up * altitude_amsl;
+  return {eye, eye + ned(forward), ned(up)};
+}
+
+CameraViewport camera_viewport(const CameraProjection &p, int width, int height)
+{
+  if (!p.enabled) return {0, 0, width, height};
+  const double scale = std::min(double(width)/p.width, double(height)/p.height);
+  const int w = std::max(1, int(std::lround(p.width*scale)));
+  const int h = std::max(1, int(std::lround(p.height*scale)));
+  return {(width-w)/2, (height-h)/2, w, h};
+}
+
+glm::dmat4 camera_projection(const CameraProjection &p)
+{
+  // Intrinsics in pixels measured from the top-left image edge; pixel centers
+  // are (i+0.5,j+0.5). OpenGL camera coordinates: right/up/backward.
+  return glm::frustum(-p.cx*p.near_m/p.fx, (p.width-p.cx)*p.near_m/p.fx,
+                      -(p.height-p.cy)*p.near_m/p.fy, p.cy*p.near_m/p.fy,
+                      p.near_m, p.far_m);
+}
 
 namespace {
 

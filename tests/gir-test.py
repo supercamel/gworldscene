@@ -6,6 +6,7 @@ NS = {"gi": "http://www.gtk.org/introspection/core/1.0",
       "glib": "http://www.gtk.org/introspection/glib/1.0"}
 C = "{http://www.gtk.org/introspection/c/1.0}"
 OUTPUTS = {
+    "gworld_scene_view_get_camera_quaternion": ["qw", "qx", "qy", "qz"],
     "gworld_scene_node_get_position": ["latitude", "longitude", "altitude_amsl"],
     "gworld_scene_node_get_orientation_ned": ["yaw_deg", "pitch_deg", "roll_deg"],
     "gworld_scene_node_get_scale": ["scale_x", "scale_y", "scale_z"],
@@ -65,6 +66,18 @@ def check(path):
     assert params[2].get("caller-allocates") == "0"
     assert params[2].get("transfer-ownership") == "none"
     assert params[2].get("optional", "0") == "0"
+
+    # Captures expose a retained GObject and borrowed read-only image to GI callers.
+    frame = methods["gworld_scene_view_capture_frame"]
+    assert frame.get("throws") == "1"
+    assert frame.find("gi:return-value", NS).get("transfer-ownership") == "full"
+    assert frame.find("gi:return-value", NS).get("nullable") == "1"
+    image = methods["gworld_scene_frame_get_image"].find("gi:return-value", NS)
+    assert image.get("transfer-ownership") == "none"
+    assert image.find("gi:type", NS).get("name") == "GdkPixbuf.Pixbuf"
+    for name in ["set_camera_pose", "set_camera_projection"]:
+        assert methods["gworld_scene_view_"+name].get("throws") == "1"
+    assert methods["gworld_scene_terrain_source_put_tile"].get("throws") == "1"
 
     provider = root.find("gi:namespace/gi:class[@name='SceneTileProvider']", NS)
     assert provider is not None

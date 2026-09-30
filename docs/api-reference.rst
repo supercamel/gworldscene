@@ -416,3 +416,19 @@ The complete C declarations are included here as the final source of truth.
 
 .. literalinclude:: ../src/gworld-scene-tile-provider.h
    :language: c
+
+Calibrated camera and shared terrain APIs
+-----------------------------------------
+
+See :doc:`calibrated-cameras` for coordinate conventions, ownership, error
+semantics and complete examples. New view methods are ``set_camera_pose()``,
+``get_camera_quaternion()``, ``get_camera_pose_enabled()``,
+``set_camera_projection()``, ``reset_camera_projection()``,
+``set_offscreen_enabled()``, ``get_offscreen_enabled()``, ``capture_frame()``,
+``set_terrain_source()`` and ``get_terrain_source()``.
+
+``GWorldSceneFrame`` owns a captured image, caller timestamp, completion time
+and sequence. ``GWorldSceneTerrainSource`` provides shared immutable decoded
+tiles, ``tile-needed`` / ``changed`` signals, memory accounting and height
+sampling. Both are available through the generated GTK 3 and GTK 4 namespaces;
+the terrain source lives in the shared core library.

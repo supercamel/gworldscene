@@ -181,3 +181,47 @@ if gworldscene_gtk4_built
       suite: ['bindings', 'imagery'], timeout: 30)
   endif
 endif
+
+foreach variant : [3, 4]
+  if (variant == 3 and gworldscene_gtk3_built) or (variant == 4 and gworldscene_gtk4_built)
+    camera_capture = executable('gworldscene-camera-capture-gtk' + variant.to_string(),
+      'calibrated-camera-test.cpp', include_directories: gworldscene_inc,
+      dependencies: variant == 3 ? gworldscene_gtk3_dep : gworldscene_gtk4_dep,
+      cpp_args: ['-DGWORLD_SCENE_GTK_MAJOR=' + variant.to_string()])
+    test('camera-capture-gtk' + variant.to_string(), camera_capture,
+      args: ['-p', '/camera-capture/automatic'], suite: 'render', timeout: 120)
+    test('camera-capture-gtk' + variant.to_string() + '-gles', camera_capture,
+      args: ['-p', '/camera-capture/gles'], env: variant == 3 ? ['GDK_GL=gles'] : [],
+      suite: 'render', timeout: 120)
+  endif
+endforeach
+terrain_source_test = executable('gworldscene-terrain-source-test', 'terrain-source-test.cpp',
+  include_directories: gworldscene_inc, dependencies: gworldscene_core_dep)
+test('terrain-source', terrain_source_test)
+if sqgi.found()
+  foreach variant : [3,4]
+    if (variant == 3 and gworldscene_gtk3_built) or (variant == 4 and gworldscene_gtk4_built)
+      test('camera-bindings-sqgi-gtk' + variant.to_string(), sqgi,
+        args: [files('camera-bindings-test.nut'),variant.to_string(),bindings_dir],
+        env: bindings_env, protocol: 'tap', suite: 'bindings')
+    endif
+  endforeach
+endif
+
+if sqgi.found() and gworldscene_gtk4_built
+  test('camera-example-sqgi-gtk4', sqgi,
+    args: [files('../examples/sqgi/calibrated-camera.nut'), '--smoke-test'],
+    depends: gworldscene_gtk4_gir, env: bindings_env,
+    suite: ['bindings', 'examples'], timeout: 30)
+endif
+
+if sqgi.found()
+  foreach variant : [3,4]
+    if (variant == 3 and gworldscene_gtk3_built) or (variant == 4 and gworldscene_gtk4_built)
+      test('camera-imagery-sqgi-gtk' + variant.to_string(), sqgi,
+        args: [files('camera-imagery-test.nut'), variant.to_string()],
+        depends: variant == 3 ? gworldscene_gtk3_gir : gworldscene_gtk4_gir,
+        env: bindings_env, protocol: 'tap', suite: ['bindings', 'imagery'])
+    endif
+  endforeach
+endif

@@ -4,8 +4,10 @@
 #include <epoxy/gl.h>
 
 GLuint gworld_scene_view_create_program(void);
+GLuint gworld_scene_view_create_program_depth(bool logarithmic);
 GLuint gworld_scene_view_create_shadow_program(void);
 GLuint gworld_scene_view_create_billboard_program(void);
+GLuint gworld_scene_view_create_billboard_program_depth(bool logarithmic);
 GLuint gworld_scene_view_create_sun_program(void);
 GLuint gworld_scene_view_create_sky_program(void);
 

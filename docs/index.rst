@@ -16,5 +16,6 @@ widget for GTK 3 or GTK 4 applications.
 
    installation
    concepts
+   calibrated-cameras
    examples
    api-reference

@@ -4,6 +4,7 @@
 #include <gtk/gtk.h>
 
 #include "gworld-scene-node.h"
+#include "gworld-scene-terrain-source.h"
 #include "gworld-scene-tile-provider.h"
 
 G_BEGIN_DECLS
@@ -11,6 +12,155 @@ G_BEGIN_DECLS
 #define GWORLD_TYPE_SCENE_VIEW (gworld_scene_view_get_type())
 
 G_DECLARE_FINAL_TYPE(GWorldSceneView, gworld_scene_view, GWORLD, SCENE_VIEW, GtkGLArea)
+
+/**
+ * GWorldSceneFrame:
+ *
+ * Owned CPU image and timing for one explicit scene render. Frame metadata is
+ * immutable; treat the borrowed image as read-only. No widgets or GL resources
+ * are retained. Available in both GTK variants.
+ */
+#define GWORLD_TYPE_SCENE_FRAME (gworld_scene_frame_get_type())
+G_DECLARE_FINAL_TYPE(GWorldSceneFrame, gworld_scene_frame, GWORLD, SCENE_FRAME, GObject)
+
+/**
+ * gworld_scene_frame_get_image:
+ * @self: a captured frame
+ * Returns: (transfer none): top-down, opaque sRGB RGBA image; treat as read-only
+ */
+GdkPixbuf *gworld_scene_frame_get_image(GWorldSceneFrame *self);
+/**
+ * gworld_scene_frame_get_timestamp:
+ * @self: a captured frame
+ * Returns: the caller's timestamp in microseconds (caller chooses clock domain)
+ */
+gint64 gworld_scene_frame_get_timestamp(GWorldSceneFrame *self);
+/**
+ * gworld_scene_frame_get_completed_time:
+ * @self: a captured frame
+ * Returns: GLib monotonic completion time in microseconds
+ */
+gint64 gworld_scene_frame_get_completed_time(GWorldSceneFrame *self);
+/**
+ * gworld_scene_frame_get_sequence:
+ * @self: a captured frame
+ * Returns: monotonically increasing successful capture sequence for this view
+ */
+guint64 gworld_scene_frame_get_sequence(GWorldSceneFrame *self);
+
+/**
+ * gworld_scene_view_set_camera_pose:
+ * @self: a scene view
+ * @latitude: eye latitude in degrees, -90 to 90
+ * @longitude: eye longitude in degrees, -180 to 180
+ * @altitude_amsl: exact eye altitude in metres AMSL, -12000 to 10000000
+ * @qw: quaternion scalar component
+ * @qx: quaternion X component
+ * @qy: quaternion Y component
+ * @qz: quaternion Z component
+ * @error: return location for a validation error
+ *
+ * Atomically sets the free eye and complete orientation. The nonzero quaternion
+ * is normalized and rotates optical forward/right/down axes into geographic
+ * north/east/down. Identity looks north with image up toward zenith. No orbit,
+ * pitch or 25 metre altitude clamp is applied. Legacy orientation setters and
+ * changing camera mode leave this exact-pose path. Call on the GTK thread.
+ * Returns: %TRUE on success; invalid inputs leave the previous pose unchanged
+ */
+gboolean gworld_scene_view_set_camera_pose(GWorldSceneView *self,
+  double latitude, double longitude, double altitude_amsl,
+  double qw, double qx, double qy, double qz, GError **error);
+
+/**
+ * gworld_scene_view_get_camera_quaternion:
+ * @self: a scene view
+ * @qw: (out) (optional) (transfer none): normalized scalar component
+ * @qx: (out) (optional) (transfer none): normalized X component
+ * @qy: (out) (optional) (transfer none): normalized Y component
+ * @qz: (out) (optional) (transfer none): normalized Z component
+ *
+ * Reads the exact camera quaternion, or identity when exact pose is inactive.
+ * Use get_camera_pose_enabled() to distinguish those states.
+ */
+void gworld_scene_view_get_camera_quaternion(GWorldSceneView *self,
+  double *qw, double *qx, double *qy, double *qz);
+
+/**
+ * gworld_scene_view_get_camera_pose_enabled:
+ * @self: a scene view
+ * Returns: whether the exact quaternion camera pose is active
+ */
+gboolean gworld_scene_view_get_camera_pose_enabled(GWorldSceneView *self);
+
+/**
+ * gworld_scene_view_set_camera_projection:
+ * @self: a scene view
+ * @width: calibrated sensor width in pixels, 1 to 8192
+ * @height: calibrated sensor height in pixels, 1 to 8192
+ * @fx: positive horizontal focal length in pixels
+ * @fy: positive vertical focal length in pixels
+ * @cx: principal point measured from the left image edge in pixels
+ * @cy: principal point measured from the top image edge in pixels
+ * @near_m: near clipping distance in metres, at least 0.001
+ * @far_m: far clipping distance in metres, greater than near_m, at most 100000000
+ * @error: return location for a validation error
+ *
+ * Sets a calibrated pinhole projection. Pixel centers are at half-integers.
+ * Viewport/capture resizing letterboxes without changing optics. World geometry
+ * uses logarithmic depth to retain precision with close clipping. Lens
+ * distortion and image resampling belong to the caller. Call on the GTK thread.
+ * Returns: %TRUE on success; invalid inputs leave the previous projection unchanged
+ */
+gboolean gworld_scene_view_set_camera_projection(GWorldSceneView *self,
+  int width, int height, double fx, double fy, double cx, double cy,
+  double near_m, double far_m, GError **error);
+
+/**
+ * gworld_scene_view_reset_camera_projection:
+ * @self: a scene view
+ *
+ * Restores the legacy 45 degree vertical field of view and automatic clipping.
+ * Does not change the current pose.
+ */
+void gworld_scene_view_reset_camera_projection(GWorldSceneView *self);
+
+/**
+ * gworld_scene_view_set_offscreen_enabled:
+ * @self: a scene view
+ * @enabled: whether an offscreen consumer needs terrain and imagery updates
+ *
+ * Retains external imagery demand while unmapped. Enable before hiding a view
+ * used for capture; disable when its consumer stops. Does not create a timer,
+ * realize the widget or render frames automatically. Call on the GTK thread.
+ */
+void gworld_scene_view_set_offscreen_enabled(GWorldSceneView *self, gboolean enabled);
+/**
+ * gworld_scene_view_get_offscreen_enabled:
+ * @self: a scene view
+ * Returns: whether offscreen demand is enabled
+ */
+gboolean gworld_scene_view_get_offscreen_enabled(GWorldSceneView *self);
+
+/**
+ * gworld_scene_view_capture_frame:
+ * @self: a realized scene view
+ * @width: output width in pixels, 1 to 8192
+ * @height: output height in pixels, 1 to 8192
+ * @timestamp_us: caller-provided frame timestamp in microseconds
+ * @error: return location for a render/context/validation error
+ *
+ * Renders current scene state into a retained offscreen framebuffer and reads
+ * back one owned image. The view must be realized, but need not be mapped or
+ * visible; no GTK overlays enter the image. Works before first mapping when
+ * the view and its native ancestor have been explicitly realized. No network
+ * work is waited on: currently available terrain/assets are rendered. Maximum
+ * output is 16777216 pixels. Call on the GTK thread outside a render callback;
+ * rendering and readback are synchronous, and callers must bound their cadence.
+ * Sharing this frame among displays and encoders avoids duplicate scene renders.
+ * Returns: (transfer full) (nullable): a captured frame, or %NULL on error
+ */
+GWorldSceneFrame *gworld_scene_view_capture_frame(GWorldSceneView *self,
+  int width, int height, gint64 timestamp_us, GError **error);
 
 typedef enum {
   GWORLD_SCENE_CAMERA_MODE_DEFAULT,
@@ -152,6 +302,24 @@ void gworld_scene_view_look_at_location(GWorldSceneView *self,
  */
 void gworld_scene_view_look_at_node(GWorldSceneView *self,
                                     GWorldSceneNode *node);
+
+/**
+ * gworld_scene_view_set_terrain_source:
+ * @self: a scene view
+ * @source: (nullable): shared application-fed terrain, or %NULL for built-in terrain loading
+ *
+ * Attaches a retained source. Views share immutable decoded data; missing tiles
+ * emit tile-needed on the source. Built-in terrain network/cache reads are
+ * disabled while attached, including with caching disabled. Source replacement
+ * cancels/fences old terrain work and invalidates geometry. Main-thread only.
+ */
+void gworld_scene_view_set_terrain_source(GWorldSceneView *self,GWorldSceneTerrainSource *source);
+/**
+ * gworld_scene_view_get_terrain_source:
+ * @self: a scene view
+ * Returns: (transfer none) (nullable): the attached application source
+ */
+GWorldSceneTerrainSource *gworld_scene_view_get_terrain_source(GWorldSceneView *self);
 
 void gworld_scene_view_set_terrain_server(GWorldSceneView *self,
                                           const char *terrain_server);

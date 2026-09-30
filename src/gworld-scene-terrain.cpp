@@ -18,8 +18,8 @@ get_height_clamped(const TerrainTile &tile, int x, int y)
   return tile.heights[static_cast<std::size_t>(y * tile.dimension + x)];
 }
 
-int16_t
-get_safe_height(const TerrainTile &tile, int x, int y)
+static int16_t
+height_or_void(const TerrainTile &tile, int x, int y)
 {
   const int16_t h = get_height_clamped(tile, x, y);
   if (h != -32768)
@@ -35,9 +35,14 @@ get_safe_height(const TerrainTile &tile, int x, int y)
     }
   }
 
-  return 0;
+  return -32768;
 }
 
+int16_t get_safe_height(const TerrainTile &tile, int x, int y)
+{
+  const auto value = height_or_void(tile,x,y);
+  return value == -32768 ? 0 : value;
+}
 
 namespace {
 bool contains(const TerrainTile &tile, double lat, double lon)
@@ -76,8 +81,15 @@ double sample(const TerrainTile &tile, double lat, double lon)
   const double y = std::clamp(tile.lat + 1.0 - lat, 0.0, 1.0) * (tile.dimension - 1);
   const int x0 = static_cast<int>(std::floor(x)), y0 = static_cast<int>(std::floor(y));
   const double a = x - x0, b = y - y0;
-  return (1.0 - b) * ((1.0 - a) * get_safe_height(tile, x0, y0) + a * get_safe_height(tile, x0 + 1, y0)) +
-         b * ((1.0 - a) * get_safe_height(tile, x0, y0 + 1) + a * get_safe_height(tile, x0 + 1, y0 + 1));
+  const double weights[4]={(1-a)*(1-b),a*(1-b),(1-a)*b,a*b};
+  const int values[4]={height_or_void(tile,x0,y0),height_or_void(tile,x0+1,y0),
+    height_or_void(tile,x0,y0+1),height_or_void(tile,x0+1,y0+1)};
+  double result=0;
+  for(int i=0;i<4;++i) {
+    if(weights[i] > 0 && values[i] == -32768) return NAN;
+    if(weights[i] > 0) result+=weights[i]*values[i];
+  }
+  return result;
 }
 } // namespace
 
@@ -85,7 +97,9 @@ bool terrain_height_at(const TerrainTileMap &tiles, double lat, double lon, doub
 {
   const auto *tile = tile_at(tiles, lat, lon);
   if (!tile) return false;
-  height = sample(*tile, lat, lon);
+  const double value = sample(*tile, lat, lon);
+  if (!std::isfinite(value)) return false;
+  height = value;
   return true;
 }
 

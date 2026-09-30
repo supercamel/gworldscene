@@ -16,6 +16,26 @@ range_contains(const gworld_scene::TileRange &range, double latitude, double lon
 }
 
 void
+test_calibrated_imagery_resolution()
+{
+  using gworld_scene::camera_imagery_band;
+  const auto wide = camera_imagery_band(-16.9,145.7,3000,800,3500,64,4096);
+  const auto zoom = camera_imagery_band(-16.9,145.7,3000,6400,440,64,4096);
+  g_assert_cmpint(zoom.range.z, ==, wide.range.z+3);
+  g_assert_true(range_contains(zoom.range,-16.9,145.7));
+  g_assert_cmpfloat(zoom.radius_m, <, wide.radius_m);
+  for (double lat : {-80.0,0.0,80.0}) {
+    const auto band = camera_imagery_band(lat,179.999,1000,1e9,100000,64,2048);
+    g_assert_cmpint(band.range.z, ==, 19);
+    g_assert_true(range_contains(band.range,lat,179.999));
+    g_assert_cmpint(band.range.width_tiles(), <=, 8);
+    g_assert_cmpint(band.range.height_tiles(), <=, 8);
+    g_assert_cmpint(band.range.width_tiles()*band.range.height_tiles(), <=, 64);
+  }
+  g_assert_false(camera_imagery_band(0,0,0,800,1000,64,4096).range.valid());
+}
+
+void
 test_terrain_imagery_distance_steps()
 {
   const double latitude = -16.8878, longitude = 145.7048;
@@ -199,6 +219,7 @@ int
 main(int argc, char **argv)
 {
   g_test_init(&argc, &argv, nullptr);
+  g_test_add_func("/lod/calibrated-imagery-resolution", test_calibrated_imagery_resolution);
   g_test_add_func("/lod/terrain-imagery-distance-steps", test_terrain_imagery_distance_steps);
   g_test_add_func("/lod/terrain-imagery-capacity-and-altitude", test_terrain_imagery_capacity_and_altitude);
   g_test_add_func("/lod/ranges-cross-dateline", test_ranges_cross_dateline);

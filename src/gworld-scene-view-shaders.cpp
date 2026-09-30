@@ -6,6 +6,7 @@
 #include "gworld-scene-atmosphere-glsl-private.h"
 
 #include <glib.h>
+#include <string>
 
 namespace {
 
@@ -81,7 +82,7 @@ create_linked_program(const char *label, const char *vertex_source, const char *
 } // namespace
 
 GLuint
-gworld_scene_view_create_program(void)
+gworld_scene_view_create_program_depth(bool logarithmic)
 {
   static const char *vertex_source = R"GLSL(
 layout(location = 0) in vec3 position;
@@ -135,6 +136,7 @@ out float v_material;
 out vec2 v_surface;
 out float v_height;
 out vec3 v_world_position;
+out float v_camera_depth;
 
 const float MERCATOR_MAX_LATITUDE = 85.05112878;
 const float PI = 3.14159265358979323846;
@@ -155,6 +157,7 @@ vec2 atlas_uv_for_lat_lon(vec2 lat_lon, vec4 range, vec2 size) {
 void main() {
   vec4 world_position = vec4(position, 1.0);
   gl_Position = mvp * world_position;
+  v_camera_depth = gl_Position.w;
   bool is_terrain = material < 0.5;
   bool is_globe = material > 1.5 && material < 2.5;
   if (is_terrain) {
@@ -225,6 +228,8 @@ in float v_material;
 in vec2 v_surface;
 in float v_height;
 in vec3 v_world_position;
+in float v_camera_depth;
+uniform float log_depth_far;
 uniform bool ultra_atlas_valid;
 uniform vec4 ultra_atlas_range;
 uniform vec2 ultra_atlas_size;
@@ -267,6 +272,7 @@ uniform vec3 direct_light_color;
 uniform float ambient_strength;
 uniform float sun_strength;
 uniform vec3 camera_position;
+uniform bool calibrated_imagery;
 uniform vec3 ultra_texture_center;
 uniform float ultra_texture_radius;
 uniform bool fog_enabled;
@@ -457,6 +463,9 @@ float fog_amount() {
 }
 
 void main() {
+#ifdef LOGARITHMIC_DEPTH
+  gl_FragDepth = log_depth_far > 0.0 ? log2(1.0 + max(0.0, v_camera_depth))/log2(1.0 + log_depth_far) : gl_FragCoord.z;
+#endif
   vec3 normal = lighting_normal();
   float diffuse = clamp(dot(normal, normalize(sun_direction)), 0.0, 1.0);
   float visibility = shadow_visibility(normal);
@@ -503,6 +512,8 @@ void main() {
                  ? (texture_stack.a <= 0.01 && ultra_texel.a > 0.01 ? ultra_texel :
                     mix(texture_stack, ultra_texel, ultra_blend * ultra_texel.a))
                  : texture_stack;
+  if (calibrated_imagery)
+    texel = blend_imagery(texture_stack, ultra_texel, ultra_uv, ultra_atlas_size);
   vec3 terrain_base = mix(terrain_tint, texel.rgb, texel.a * 0.88);
   vec3 globe_base = texel.a > 0.01 ? texel.rgb : v_color.rgb;
   bool is_globe = v_material > 1.5 && v_material < 2.5;
@@ -531,7 +542,8 @@ void main() {
 }
 )GLSL";
 
-  const GLuint program = create_linked_program("Scene", vertex_source, fragment_source, kAtmosphereGlsl);
+  const std::string helpers = std::string(logarithmic ? "#define LOGARITHMIC_DEPTH\n" : "") + kAtmosphereGlsl;
+  const GLuint program = create_linked_program("Scene", vertex_source, fragment_source, helpers.c_str());
   if (program) {
     // Different sampler types must use distinct units even while shadows are off.
     GLint previous = 0;
@@ -579,25 +591,32 @@ void main() {
 }
 
 GLuint
-gworld_scene_view_create_billboard_program(void)
+gworld_scene_view_create_billboard_program_depth(bool logarithmic)
 {
   static const char *vertex_source = R"GLSL(
 layout(location = 0) in vec3 position;
 layout(location = 1) in vec2 texcoord;
 uniform mat4 mvp;
 out vec2 v_texcoord;
+out float v_camera_depth;
 void main() {
   gl_Position = mvp * vec4(position, 1.0);
+  v_camera_depth = gl_Position.w;
   v_texcoord = texcoord;
 }
 )GLSL";
 
   static const char *fragment_source = R"GLSL(
 in vec2 v_texcoord;
+in float v_camera_depth;
+uniform float log_depth_far;
 uniform sampler2D billboard_texture;
 uniform float opacity;
 out vec4 color;
 void main() {
+#ifdef LOGARITHMIC_DEPTH
+  gl_FragDepth = log_depth_far > 0.0 ? log2(1.0 + max(0.0, v_camera_depth))/log2(1.0 + log_depth_far) : gl_FragCoord.z;
+#endif
   vec4 texel = texture(billboard_texture, v_texcoord);
   texel.a *= opacity;
   if (texel.a < 0.01)
@@ -606,7 +625,7 @@ void main() {
 }
 )GLSL";
 
-  return create_linked_program("Billboard", vertex_source, fragment_source);
+  return create_linked_program("Billboard", vertex_source, fragment_source, logarithmic ? "#define LOGARITHMIC_DEPTH\n" : "");
 }
 
 GLuint
@@ -740,3 +759,6 @@ void main() {
 )GLSL";
   return create_linked_program("Presentation", vertex_source, fragment_source);
 }
+
+GLuint gworld_scene_view_create_program(void) { return gworld_scene_view_create_program_depth(false); }
+GLuint gworld_scene_view_create_billboard_program(void) { return gworld_scene_view_create_billboard_program_depth(false); }

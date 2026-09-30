@@ -14,6 +14,7 @@
 #include "gworld-scene-picking-private.h"
 #include "gworld-scene-view-private.h"
 #include "gworld-scene-terrain-private.h"
+#include "gworld-scene-terrain-source-private.h"
 #include "gworld-scene-render-private.h"
 #include "gworld-scene-water-private.h"
 #include "gworld-scene-view-shaders-private.h"
@@ -354,6 +355,16 @@ struct GWorldSceneViewState {
   double mesh_radius_m = 0.0;
   int mesh_sample_step = 0;
   GWorldSceneCameraMode camera_mode = GWORLD_SCENE_CAMERA_MODE_DEFAULT;
+  bool exact_camera = false;
+  glm::dquat camera_quaternion{1, 0, 0, 0};
+  gworld_scene::CameraProjection camera_projection;
+  bool offscreen_enabled = false;
+  bool capturing = false;
+  GLuint capture_fbo = 0, capture_texture = 0;
+  int capture_width = 0, capture_height = 0;
+  guint64 capture_sequence = 0;
+  float log_depth_far = 0;
+
   double sun_azimuth_deg = 228.0;
   double sun_elevation_deg = 50.0;
   double sun_time_of_day = 14.0;
@@ -387,6 +398,8 @@ struct GWorldSceneViewState {
   int gl_max_texture_size = kMaxAtlasPixels;
 
   gworld_scene::TerrainTileMap terrain_tiles;
+  GWorldSceneTerrainSource *terrain_source = nullptr;
+  gulong terrain_source_changed = 0;
   std::unordered_set<std::string> wanted_terrain_keys;
   std::unordered_set<std::string> pending;
   std::unordered_map<std::string, GCancellable *> pending_cancellables;
@@ -398,6 +411,9 @@ struct GWorldSceneViewState {
   std::vector<float> vertices;
   std::vector<unsigned int> indices;
   bool mesh_dirty = true;
+  bool scene_nodes_dirty = true, mesh_nodes_only_dirty = false;
+  std::size_t terrain_vertex_elements = 0, terrain_index_elements = 0;
+  std::size_t uploaded_vertex_elements = 0, uploaded_index_elements = 0;
   std::string mesh_key;
   std::string pending_mesh_key;
   GCancellable *pending_mesh_cancellable = nullptr;
@@ -488,6 +504,7 @@ struct GWorldSceneViewState {
 
   gworld_scene::LinearRenderTarget linear_target;
   GLuint program = 0;
+  bool program_logarithmic = false, billboard_logarithmic = false;
   GLuint shadow_program = 0;
   GLuint shadow_fbo = 0;
   GLuint shadow_depth_texture = 0;
@@ -1460,6 +1477,8 @@ world_mesh_key(double mesh_origin_latitude,
                guint64 scene_revision,
                bool include_terrain)
 {
+  // Node geometry is refreshed at render time; it must not invalidate terrain work.
+  (void)scene_revision;
   const int altitude_bucket =
     quantized_key_value(altitude_amsl, std::clamp(altitude_amsl * 0.08, 50.0, 2500.0));
   const int radius_bucket = quantized_key_value(radius_m, 500.0);
@@ -1471,7 +1490,6 @@ world_mesh_key(double mesh_origin_latitude,
          ":" + std::to_string(sample_step) +
          ":" + std::to_string(terrain_tile_count) +
          ":" + std::to_string(terrain_revision) +
-         ":" + std::to_string(scene_revision) +
          ":" + (include_terrain ? "terrain" : "scene-only");
 }
 
@@ -1536,12 +1554,13 @@ set_camera_position_locked(GWorldSceneViewState *state,
 {
   state->latitude = std::clamp(latitude, -90.0, 90.0);
   state->longitude = std::clamp(longitude, -180.0, 180.0);
-  state->altitude_amsl = std::clamp(altitude_amsl, 25.0, 10000000.0);
+  state->altitude_amsl = std::clamp(altitude_amsl, state->exact_camera ? -12000.0 : 25.0, 10000000.0);
 }
 
 void
 set_camera_orientation_locked(GWorldSceneViewState *state, double heading_deg, double pitch_deg)
 {
+  state->exact_camera = false;
   state->heading_deg = gworld_scene::normalize_heading_degrees(heading_deg);
   state->pitch_deg = gworld_scene::clamp_camera_pitch(pitch_deg);
 }
@@ -2457,7 +2476,7 @@ make_pick_ray_locked(GWorldSceneViewState *state,
   int width = 1;
   int height = 1;
   widget_size(widget, &width, &height);
-  const double altitude = std::max(25.0, state->altitude_amsl);
+  const double altitude = state->exact_camera ? state->altitude_amsl : std::max(25.0, state->altitude_amsl);
   const double radius_m = terrain_build_radius_for_altitude(state->altitude_amsl);
   const bool render_globe = altitude >= kGlobeRenderAltitudeM;
 
@@ -2466,12 +2485,15 @@ make_pick_ray_locked(GWorldSceneViewState *state,
     far_plane_m = std::max(far_plane_m, altitude + gworld_scene::kWgs84A * 2.4);
   const double near_plane = render_globe ? std::clamp(altitude * 0.002, 25.0, 25000.0) : 2.0;
 
-  const glm::dmat4 projection =
+  const auto content = gworld_scene::camera_viewport(state->camera_projection, width, height);
+  if (widget_x < content.x || widget_y < content.y || widget_x >= content.x+content.width || widget_y >= content.y+content.height) return false;
+  const glm::dmat4 projection = state->camera_projection.enabled ? gworld_scene::camera_projection(state->camera_projection) :
     glm::perspective(deg_to_rad(45.0),
                      static_cast<double>(width) / static_cast<double>(height),
                      near_plane,
                      far_plane_m);
-  const gworld_scene::CameraPose camera_pose =
+  const gworld_scene::CameraPose camera_pose = state->exact_camera ?
+    gworld_scene::quaternion_camera_pose(state->latitude, state->longitude, altitude, state->camera_quaternion, state->mesh_origin_latitude, state->mesh_origin_longitude) :
     gworld_scene::camera_pose_for_mode(view_camera_mode(state->camera_mode),
                                        state->latitude,
                                        state->longitude,
@@ -2480,10 +2502,10 @@ make_pick_ray_locked(GWorldSceneViewState *state,
                                        state->pitch_deg,
                                        state->mesh_origin_latitude,
                                        state->mesh_origin_longitude);
-  return gworld_scene::pick_ray_from_widget_point(width,
-                                                  height,
-                                                  widget_x,
-                                                  widget_y,
+  return gworld_scene::pick_ray_from_widget_point(content.width,
+                                                  content.height,
+                                                  widget_x-content.x,
+                                                  widget_y-content.y,
                                                   projection,
                                                   camera_pose,
                                                   ray);
@@ -5879,8 +5901,11 @@ rebuild_world_mesh(GWorldSceneViewState *state,
 bool
 ensure_billboard_resources(GWorldSceneViewState *state)
 {
-  if (state->billboard_program == 0)
-    state->billboard_program = gworld_scene_view_create_billboard_program();
+  if (state->billboard_program == 0 || state->billboard_logarithmic != state->camera_projection.enabled) {
+    if (state->billboard_program) glDeleteProgram(state->billboard_program);
+    state->billboard_logarithmic = state->camera_projection.enabled;
+    state->billboard_program = gworld_scene_view_create_billboard_program_depth(state->billboard_logarithmic);
+  }
   if (state->billboard_program == 0)
     return false;
 
@@ -5980,8 +6005,11 @@ ensure_sun_resources(GWorldSceneViewState *state)
 bool
 ensure_ground_overlay_resources(GWorldSceneViewState *state)
 {
-  if (state->billboard_program == 0)
-    state->billboard_program = gworld_scene_view_create_billboard_program();
+  if (state->billboard_program == 0 || state->billboard_logarithmic != state->camera_projection.enabled) {
+    if (state->billboard_program) glDeleteProgram(state->billboard_program);
+    state->billboard_logarithmic = state->camera_projection.enabled;
+    state->billboard_program = gworld_scene_view_create_billboard_program_depth(state->billboard_logarithmic);
+  }
   if (state->billboard_program == 0)
     return false;
 
@@ -6253,11 +6281,12 @@ render_sun_disc(GWorldSceneViewState *state,
   if (ndc.z < -1.0f || ndc.z > 1.0f)
     return;
 
-  constexpr double vertical_fov_rad = 45.0 * kPi / 180.0;
+  const double vertical_fov_rad = state->camera_projection.enabled ?
+    2*std::atan(state->camera_projection.height/(2*state->camera_projection.fy)) : 45.0*kPi/180.0;
   const double physical_radius_px =
     0.5 * static_cast<double>(viewport_height) * std::tan(deg_to_rad(kSunAngularRadiusDeg)) /
     std::tan(vertical_fov_rad * 0.5);
-  const double core_radius_px = std::clamp(std::max(physical_radius_px, 5.5), 5.5, 14.0);
+  const double core_radius_px = state->camera_projection.enabled ? physical_radius_px : std::clamp(std::max(physical_radius_px, 5.5), 5.5, 14.0);
   const double glow_radius_px = std::clamp(core_radius_px * 7.5, 34.0, 120.0);
   const float radius_x = static_cast<float>((glow_radius_px * 2.0) / viewport_width);
   const float radius_y = static_cast<float>((glow_radius_px * 2.0) / viewport_height);
@@ -6330,6 +6359,7 @@ render_billboards(GWorldSceneViewState *state,
     safe_normalize(glm::cross(camera_right, camera_forward), camera_up);
 
   glUseProgram(state->billboard_program);
+  glUniform1f(glGetUniformLocation(state->billboard_program, "log_depth_far"), state->log_depth_far);
   glUniformMatrix4fv(glGetUniformLocation(state->billboard_program, "mvp"),
                      1,
                      GL_FALSE,
@@ -6344,7 +6374,8 @@ render_billboards(GWorldSceneViewState *state,
   glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
   glDisable(GL_CULL_FACE);
 
-  constexpr double vertical_fov_rad = 45.0 * kPi / 180.0;
+  const double vertical_fov_rad = state->camera_projection.enabled ?
+    2*std::atan(state->camera_projection.height/(2*state->camera_projection.fy)) : 45.0*kPi/180.0;
   for (const BillboardRenderItem &billboard : billboards) {
     SceneImageTexture *texture = billboard.generated_text
                                     ? ensure_scene_text_texture(state, billboard)
@@ -6423,6 +6454,8 @@ render_water_attribution(GWorldSceneViewState *state, int width, int height)
     return;
   const glm::mat4 projection = glm::ortho(0.0f, float(width), float(height), 0.0f);
   glUseProgram(state->billboard_program);
+  glUniform1f(glGetUniformLocation(state->billboard_program, "log_depth_far"), state->log_depth_far);
+  glUniform1f(glGetUniformLocation(state->billboard_program, "log_depth_far"), 0);
   glUniformMatrix4fv(glGetUniformLocation(state->billboard_program, "mvp"), 1, GL_FALSE, glm::value_ptr(projection));
   glUniform1i(glGetUniformLocation(state->billboard_program, "billboard_texture"), 6);
   glUniform1f(glGetUniformLocation(state->billboard_program, "opacity"), 1.0f);
@@ -6488,6 +6521,7 @@ render_ground_overlays(GWorldSceneViewState *state,
     return;
 
   glUseProgram(state->billboard_program);
+  glUniform1f(glGetUniformLocation(state->billboard_program, "log_depth_far"), state->log_depth_far);
   glUniformMatrix4fv(glGetUniformLocation(state->billboard_program, "mvp"),
                      1,
                      GL_FALSE,
@@ -6624,6 +6658,10 @@ void
 delete_gl_resources(GWorldSceneViewState *state)
 {
   state->linear_target.destroy();
+  glDeleteFramebuffers(1, &state->capture_fbo);
+  glDeleteTextures(1, &state->capture_texture);
+  state->capture_fbo = state->capture_texture = 0;
+  state->capture_width = state->capture_height = 0;
   state->water_tiles.destroy_gl();
   state->texture_uploads_pending = false;
   if (state->ultra_texture)
@@ -6858,14 +6896,33 @@ upload_mesh_if_needed(GWorldSceneViewState *state, PerfBufferUploadStats *stats 
     return false;
 
   const gint64 start_us = perf_now_us();
-  const std::size_t vertex_bytes = state->vertices.size() * sizeof(float);
-  const std::size_t index_bytes = state->indices.size() * sizeof(unsigned int);
+  std::size_t vertex_bytes = state->vertices.size() * sizeof(float);
+  std::size_t index_bytes = state->indices.size() * sizeof(unsigned int);
+  if (state->mesh_nodes_only_dirty && state->vao &&
+      state->uploaded_vertex_elements == state->vertices.size() &&
+      state->uploaded_index_elements == state->indices.size()) {
+    const std::size_t vertex_offset=state->terrain_vertex_elements*sizeof(float);
+    const std::size_t index_offset=state->terrain_index_elements*sizeof(unsigned int);
+    vertex_bytes-=vertex_offset; index_bytes-=index_offset;
+    glBindVertexArray(state->vao);
+    glBindBuffer(GL_ARRAY_BUFFER,state->vbo);
+    if(vertex_bytes) glBufferSubData(GL_ARRAY_BUFFER,vertex_offset,vertex_bytes,
+                                   state->vertices.data()+state->terrain_vertex_elements);
+    glBindBuffer(GL_ELEMENT_ARRAY_BUFFER,state->ebo);
+    if(index_bytes) glBufferSubData(GL_ELEMENT_ARRAY_BUFFER,index_offset,index_bytes,
+                                  state->indices.data()+state->terrain_index_elements);
+    glBindVertexArray(0);
+  } else {
   upload_vertex_index_buffers(state->vao,
                               state->vbo,
                               state->ebo,
                               state->vertices,
                               state->indices,
                               state->index_count);
+  }
+  state->uploaded_vertex_elements=state->vertices.size();
+  state->uploaded_index_elements=state->indices.size();
+  state->mesh_nodes_only_dirty=false;
   state->mesh_dirty = false;
   if (stats != nullptr) {
     stats->uploaded = true;
@@ -7645,7 +7702,11 @@ world_mesh_build_done(GObject *source_object, GAsyncResult *result, gpointer use
       state->mesh_lod_altitude_amsl = mesh_result->mesh_lod_altitude_amsl;
       state->mesh_radius_m = mesh_result->mesh_radius_m;
       state->mesh_sample_step = mesh_result->mesh_sample_step;
+      state->terrain_vertex_elements = state->vertices.size();
+      state->terrain_index_elements = state->indices.size();
       append_scene_nodes(state);
+      state->scene_nodes_dirty = false;
+      state->mesh_nodes_only_dirty = false;
       state->mesh_dirty = true;
       if (origin_changed)
         state->globe_mesh_key.clear();
@@ -8932,15 +8993,59 @@ load_cached_terrain_tile(GWorldSceneView *self,
   return start_terrain_load(self, "cache", pending_key, path, tile_lat, tile_lon);
 }
 
+// Find the first sampled ground crossing without scanning the scene mesh.
+// Missing elevations use the eye's current ground estimate until tiles arrive.
+// Downloads reschedule selection, refining the footprint with real heights.
+static gworld_scene::ImageryBand
+calibrated_imagery_band_locked(GWorldSceneViewState *state, GtkWidget *widget,
+                               double radius_m, double fallback_ground,
+                               const TextureCapacityConfig &capacity)
+{
+  int width = 1, height = 1;
+  widget_size(widget, &width, &height);
+  gworld_scene::PickRay ray;
+  if (!make_pick_ray_locked(state, widget, width*0.5, height*0.5, ray)) return {};
+  const double limit = std::min(radius_m*0.9, state->camera_projection.far_m);
+  auto clearance = [&](double distance, double &lat, double &lon) {
+    const auto point = ray.origin + ray.direction*distance;
+    scene_position_to_lat_lon_approx(point, state->mesh_origin_latitude,
+                                     state->mesh_origin_longitude, lat, lon);
+    double ground = fallback_ground;
+    terrain_height_at_lat_lon_locked(state, lat, lon, ground);
+    return point.y - ground;
+  };
+  double lat = 0, lon = 0, previous = 0;
+  if (clearance(0, lat, lon) <= 0) return {};
+  for (int i = 1; i <= 128; ++i) {
+    const double distance = limit*i/128.0;
+    if (clearance(distance, lat, lon) <= 0) {
+      double low = previous, high = distance;
+      for (int j = 0; j < 16; ++j) {
+        const double middle = (low+high)*0.5;
+        if (clearance(middle, lat, lon) > 0) low = middle; else high = middle;
+      }
+      clearance(high, lat, lon);
+      const auto &p = state->camera_projection;
+      const double radius = high * std::hypot(p.width/(2*p.fx), p.height/(2*p.fy)) /
+                             std::max(0.15, std::abs(ray.direction.y));
+      return gworld_scene::camera_imagery_band(lat, lon, high, std::max(p.fx,p.fy),
+        std::min(radius_m, radius*1.2), capacity.max_ultra_atlas_tiles, capacity.atlas_pixels);
+    }
+    previous = distance;
+  }
+  return {}; // Sky or ground beyond available terrain: retain coarser coverage.
+}
+
 static void
 queue_scene_requests(GWorldSceneView *self)
 {
   const gint64 request_start_us = perf_now_us();
   auto *state = get_state(self);
 
-  if (state->disposing || (state->external_imagery && !gtk_widget_get_mapped(GTK_WIDGET(self))))
+  if (state->disposing || ((state->external_imagery || state->terrain_source) && (!gtk_widget_get_mapped(GTK_WIDGET(self)) && !state->offscreen_enabled)))
     return;
   const bool external_imagery = state->external_imagery;
+  g_autoptr(GWorldSceneTerrainSource) terrain_source = state->terrain_source ? GWORLD_SCENE_TERRAIN_SOURCE(g_object_ref(state->terrain_source)) : nullptr;
 
   double latitude = 0.0;
   double longitude = 0.0;
@@ -9013,11 +9118,17 @@ queue_scene_requests(GWorldSceneView *self)
   const bool render_globe = altitude >= kGlobeRenderAltitudeM;
   const bool include_terrain = altitude < kTerrainDisableAltitudeM;
   const double altitude_agl = has_ground_height ? std::max(0.0, altitude - ground_height_amsl) : altitude;
-  const auto imagery = gworld_scene::terrain_imagery_plan(latitude, longitude, altitude_agl,
+  auto imagery = gworld_scene::terrain_imagery_plan(latitude, longitude, altitude_agl,
                                                           radius_m, texture_capacity.max_atlas_tiles,
                                                           texture_capacity.atlas_pixels,
                                                           texture_capacity.max_ultra_atlas_tiles,
                                                           texture_capacity.ultra_bubble_radius_m);
+  if (include_terrain) {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    if (state->camera_projection.enabled)
+      imagery.ultra = calibrated_imagery_band_locked(state, GTK_WIDGET(self), radius_m,
+        has_ground_height ? ground_height_amsl : 0.0, texture_capacity);
+  }
   const double ultra_lateral_radius_m = include_terrain ? imagery.ultra.radius_m : 0.0;
   const AtlasRange ultra_atlas_range = include_terrain ? imagery.ultra.range : AtlasRange();
   const AtlasRange atlas_range = imagery.detail.range;
@@ -9028,7 +9139,7 @@ queue_scene_requests(GWorldSceneView *self)
   const AtlasRange globe_range = globe_atlas_range(latitude, longitude, altitude,
                                                    texture_capacity.atlas_pixels);
 
-  if (cache_enabled) {
+  if (cache_enabled || terrain_source) {
     const gint64 terrain_start_us = perf_now_us();
     if (include_terrain) {
       std::unordered_set<std::string> keep_keys;
@@ -9100,6 +9211,19 @@ queue_scene_requests(GWorldSceneView *self)
             continue;
         }
 
+        if (terrain_source) {
+          auto tile = gworld_scene::terrain_source_tile(terrain_source,lat,lon);
+          if (tile) {
+            std::lock_guard<std::mutex> lock(state->mutex);
+            if (state->terrain_source != terrain_source) return;
+            state->terrain_tiles[key]=tile;
+            ++state->terrain_revision; state->mesh_key.clear();
+          } else {
+            gworld_scene::terrain_source_request(terrain_source,lat,lon);
+            if (state->disposing || state->terrain_source != terrain_source) return;
+          }
+          continue;
+        }
         const std::string name = hgt_tile_name(lat, lon);
         const std::string uri = terrain_uri_from_template(terrain_template, name);
         const std::string path = terrain_cache_path_for_uri(cache_dir, uri, terrain_template, name);
@@ -9208,8 +9332,8 @@ queue_scene_requests(GWorldSceneView *self)
       TextureRangeTraceStats trace_stats;
       trace_stats.label = label;
       trace_stats.range = range;
-      const double center_x = lon_to_tile_x(longitude, range.z);
-      const double center_y = lat_to_tile_y(latitude, range.z);
+      const double center_x = (range.x_min + range.x_max + 1)*0.5;
+      const double center_y = (range.y_min + range.y_max + 1)*0.5;
       for (int ty = range.y_min; ty <= range.y_max; ++ty) {
         for (int tx = range.x_min; tx <= range.x_max; ++tx) {
           ++trace_stats.total;
@@ -9356,7 +9480,7 @@ queue_scene_requests(GWorldSceneView *self)
     if (render_globe) add(globe_range);
     gworld_scene::imagery_update(provider, wanted);
     if (state->disposing || state->tile_provider != provider ||
-        !gtk_widget_get_mapped(GTK_WIDGET(self))) return;
+        (!gtk_widget_get_mapped(GTK_WIDGET(self)) && !state->offscreen_enabled)) return;
   }
 
   {
@@ -9527,7 +9651,8 @@ on_realize(GtkGLArea *area, gpointer user_data)
     update_gl_texture_limit_locked(state);
   }
 
-  state->program = gworld_scene_view_create_program();
+  state->program_logarithmic = state->camera_projection.enabled;
+  state->program = gworld_scene_view_create_program_depth(state->program_logarithmic);
   schedule_scene_requests(self);
   gtk_widget_queue_draw(GTK_WIDGET(self));
 }
@@ -9560,17 +9685,29 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
 
   auto *self = GWORLD_SCENE_VIEW(area);
   auto *state = get_state(self);
+  struct ViewportRestore {
+    GLint v[4];
+    ViewportRestore() { glGetIntegerv(GL_VIEWPORT,v); }
+    ~ViewportRestore() { glViewport(v[0],v[1],v[2],v[3]); }
+  } viewport_restore;
   const gint64 frame_start_us = perf_now_us();
   // GtkGLArea sets the viewport in framebuffer pixels, including display scaling.
   GLint viewport[4] = {};
   glGetIntegerv(GL_VIEWPORT, viewport);
 
+  if (state->program == 0 || state->program_logarithmic != state->camera_projection.enabled) {
+    if (state->program) glDeleteProgram(state->program);
+    state->program_logarithmic = state->camera_projection.enabled;
+    state->program = gworld_scene_view_create_program_depth(state->program_logarithmic);
+  }
   if (state->program == 0)
-    state->program = gworld_scene_view_create_program();
-  if (state->program == 0)
-    return TRUE;
+    return FALSE;
 
   glEnable(GL_DEPTH_TEST);
+  glDepthFunc(GL_LESS);
+  glDepthMask(GL_TRUE);
+  if (epoxy_is_desktop_gl()) glClearDepth(1.0);
+  else glClearDepthf(1.0f);
   glDisable(GL_CULL_FACE);
 
   double altitude = 0.0;
@@ -9582,6 +9719,9 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
   double mesh_origin_latitude = 0.0;
   double mesh_origin_longitude = 0.0;
   GWorldSceneCameraMode camera_mode = GWORLD_SCENE_CAMERA_MODE_DEFAULT;
+  bool exact_camera = false;
+  glm::dquat camera_quaternion{1,0,0,0};
+  gworld_scene::CameraProjection calibrated_projection;
   bool render_globe = false;
   bool render_terrain = true;
   bool mesh_includes_terrain = true;
@@ -9647,7 +9787,10 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
         state->active_annotations[static_cast<unsigned>(layer)].clear();
     latitude = state->latitude;
     longitude = state->longitude;
-    altitude = std::max(25.0, state->altitude_amsl);
+    exact_camera = state->exact_camera;
+    camera_quaternion = state->camera_quaternion;
+    calibrated_projection = state->camera_projection;
+    altitude = exact_camera ? state->altitude_amsl : std::max(25.0, state->altitude_amsl);
     heading = state->heading_deg;
     pitch = gworld_scene::clamp_camera_pitch(state->pitch_deg);
     radius_m = terrain_build_radius_for_altitude(state->altitude_amsl);
@@ -9697,6 +9840,14 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
                                    ground_overlays,
                                    state->mesh_origin_latitude,
                                    state->mesh_origin_longitude);
+    if (state->scene_nodes_dirty) {
+      state->vertices.resize(state->terrain_vertex_elements);
+      state->indices.resize(state->terrain_index_elements);
+      append_scene_nodes(state);
+      state->scene_nodes_dirty = false;
+      state->mesh_nodes_only_dirty = !state->mesh_dirty;
+      state->mesh_dirty = true;
+    }
     upload_mesh_if_needed(state, &mesh_upload_stats);
     if (render_globe)
       upload_globe_mesh_if_needed(state, &globe_upload_stats);
@@ -9718,21 +9869,26 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
   }
 
   const gint64 camera_start_us = perf_now_us();
-  int width = 1;
-  int height = 1;
-  widget_size(GTK_WIDGET(area), &width, &height);
-
+  const auto content = gworld_scene::camera_viewport(calibrated_projection, viewport[2], viewport[3]);
+  const int width = content.width, height = content.height;
+  if (calibrated_projection.enabled) {
+    // Clear the full destination before drawing the aspect-contained sensor.
+    glDisable(GL_SCISSOR_TEST);
+    glClearColor(0,0,0,1);
+    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+    viewport[0] += content.x; viewport[1] += content.y;
+    viewport[2] = width; viewport[3] = height;
+  }
   double far_plane_m = std::max(100000.0, radius_m * 3.0 + altitude * 4.0);
   if (render_globe)
     far_plane_m = std::max(far_plane_m, altitude + gworld_scene::kWgs84A * 2.4);
-  const float far_plane = static_cast<float>(far_plane_m);
-  const float near_plane = render_globe
-                             ? static_cast<float>(std::clamp(altitude * 0.002, 25.0, 25000.0))
-                             : 2.0f;
-  const glm::mat4 projection = glm::perspective(glm::radians(45.0f),
-                                                static_cast<float>(width) / static_cast<float>(height),
-                                                near_plane,
-                                                far_plane);
+  if (calibrated_projection.enabled) far_plane_m = calibrated_projection.far_m;
+  const float near_plane = calibrated_projection.enabled ? calibrated_projection.near_m :
+    (render_globe ? std::clamp(altitude * 0.002, 25.0, 25000.0) : 2.0);
+  const glm::mat4 projection = calibrated_projection.enabled ?
+    glm::mat4(gworld_scene::camera_projection(calibrated_projection)) :
+    glm::perspective(glm::radians(45.0f), float(width)/height, near_plane, float(far_plane_m));
+  state->log_depth_far = calibrated_projection.enabled ? float(far_plane_m) : 0;
 
   const glm::dvec3 sun_enu =
     sun_uses_time_of_day
@@ -9784,7 +9940,8 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
   const float fog_density =
     fog_enabled ? static_cast<float>(1.0 / std::max(fog_end * 2.8, 1.0)) : 0.0f;
 
-  const gworld_scene::CameraPose camera_pose =
+  const gworld_scene::CameraPose camera_pose = exact_camera ?
+    gworld_scene::quaternion_camera_pose(latitude, longitude, altitude, camera_quaternion, mesh_origin_latitude, mesh_origin_longitude) :
     gworld_scene::camera_pose_for_mode(view_camera_mode(camera_mode),
                                        latitude,
                                        longitude,
@@ -9796,9 +9953,7 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
   const gworld_scene::LocalFrame camera_frame =
     gworld_scene::local_frame_at(latitude, longitude, mesh_origin_latitude, mesh_origin_longitude);
   const glm::vec3 ultra_texture_center = glm::vec3(camera_frame.origin);
-  const glm::mat4 view = glm::lookAt(glm::vec3(camera_pose.eye),
-                                     glm::vec3(camera_pose.center),
-                                     glm::vec3(camera_pose.up));
+  const glm::mat4 view = glm::mat4(glm::lookAt(camera_pose.eye, camera_pose.center, camera_pose.up));
   const glm::mat4 mvp = projection * view;
   const bool render_world_mesh = state->index_count > 0 && (render_terrain || !mesh_includes_terrain);
   const double camera_setup_ms = perf_elapsed_ms(camera_start_us);
@@ -9807,8 +9962,10 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
   gworld_scene::ShadowCascades cascades{};
   bool shadow_available = false;
   if (shadows_enabled && render_world_mesh && altitude < kShadowMaxAltitudeM && sun_enu.z > 0.02) {
-    cascades = gworld_scene::shadow_cascades(camera_pose, static_cast<double>(width) / height,
-      glm::radians(45.0), near_plane, std::clamp(radius_m * 0.7 + altitude * 2.0, 5000.0, 60000.0),
+    const double tx = calibrated_projection.enabled ? std::max(std::abs(calibrated_projection.cx), std::abs(calibrated_projection.width-calibrated_projection.cx))/calibrated_projection.fx : 0;
+    const double ty = calibrated_projection.enabled ? std::max(std::abs(calibrated_projection.cy), std::abs(calibrated_projection.height-calibrated_projection.cy))/calibrated_projection.fy : 0;
+    cascades = gworld_scene::shadow_cascades(camera_pose, calibrated_projection.enabled ? tx/ty : static_cast<double>(width) / height,
+      calibrated_projection.enabled ? 2*std::atan(ty) : glm::radians(45.0), near_plane, std::clamp(radius_m * 0.7 + altitude * 2.0, 5000.0, 60000.0),
       glm::dvec3(sun_direction), kShadowMapSize);
     shadow_available = render_shadow_map(state, cascades);
   }
@@ -9847,6 +10004,7 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
                   height);
 
   glUseProgram(state->program);
+  glUniform1f(glGetUniformLocation(state->program, "log_depth_far"), state->log_depth_far);
   set_atmosphere_uniforms(state->program, atmosphere_settings, atmosphere_frame);
   glUniform1i(glGetUniformLocation(state->program, "water_enabled"), water_enabled);
   glUniform1f(glGetUniformLocation(state->program, "water_wave_strength"), water_wave_strength);
@@ -9894,6 +10052,7 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
   glUniform3fv(glGetUniformLocation(state->program, "camera_position"),
                1,
                glm::value_ptr(glm::vec3(camera_pose.eye)));
+  glUniform1i(glGetUniformLocation(state->program, "calibrated_imagery"), calibrated_projection.enabled);
   glUniform3fv(glGetUniformLocation(state->program, "ultra_texture_center"),
                1,
                glm::value_ptr(ultra_texture_center));
@@ -10045,7 +10204,7 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
     // GTK may still present the previous framebuffer after this callback.
     // Publish its successor only at the frame clock's after-paint boundary.
     state->next_presented_annotations.clear();
-    state->presentation_pending = true;
+    state->presentation_pending = !state->capturing;
     for (auto layer : {TextureLayer::Ultra, TextureLayer::Detail, TextureLayer::Mid,
                        TextureLayer::Far, TextureLayer::Base, TextureLayer::Globe}) {
       if (!texture_layer_active_range(state, layer).valid()) continue;
@@ -10746,6 +10905,7 @@ on_view_unmap(GtkWidget *widget, gpointer)
     g_signal_handler_disconnect(state->presentation_clock, state->presentation_handler);
     g_clear_object(&state->presentation_clock);state->presentation_handler = 0;
   }
+  if (state->offscreen_enabled) return;
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     if (state->external_imagery)
@@ -10778,6 +10938,11 @@ gworld_scene_view_dispose(GObject *object)
     if (state.presentation_clock) {
       g_signal_handler_disconnect(state.presentation_clock, state.presentation_handler);
       g_clear_object(&state.presentation_clock);state.presentation_handler = 0;
+    }
+    if (state.terrain_source) {
+      g_signal_handler_disconnect(state.terrain_source,state.terrain_source_changed);
+      state.terrain_source_changed=0;
+      g_clear_object(&state.terrain_source);
     }
     auto *provider = state.tile_provider;
     if (provider != nullptr) {
@@ -10919,7 +11084,7 @@ gworld_scene_view_class_init(GWorldSceneViewClass *klass)
     g_param_spec_double("altitude-amsl",
                         "Altitude AMSL",
                         "Camera altitude above mean sea level in metres",
-                        -500.0,
+                        -12000.0,
                         10000000.0,
                         4200.0,
                         static_cast<GParamFlags>(G_PARAM_READWRITE | G_PARAM_EXPLICIT_NOTIFY));
@@ -11186,6 +11351,7 @@ gworld_scene_view_set_camera_mode(GWorldSceneView *self, GWorldSceneCameraMode c
   {
     std::lock_guard<std::mutex> lock(state->mutex);
     state->camera_mode = camera_mode;
+    state->exact_camera = false;
   }
 
   gtk_widget_queue_draw(GTK_WIDGET(self));
@@ -11407,7 +11573,7 @@ on_provider_changed(GWorldSceneTileProvider *provider, gpointer data)
     else
       state->texture_refresh_pending = true;
   }
-  if (gtk_widget_get_mapped(GTK_WIDGET(self)))
+  if (gtk_widget_get_mapped(GTK_WIDGET(self)) || state->offscreen_enabled)
     ensure_scene_requests_scheduled(self, 20);
   gtk_widget_queue_draw(GTK_WIDGET(self));
 }
@@ -11422,7 +11588,7 @@ on_provider_coverage(GWorldSceneTileProvider *provider, gpointer data)
   if (!state->disposing && state->tile_provider == provider &&
       gworld_scene_tile_provider_get_overflow_count(provider) > 0 &&
       gworld_scene_tile_provider_get_held_count(provider) < 1024 &&
-      gtk_widget_get_mapped(GTK_WIDGET(self)))
+      (gtk_widget_get_mapped(GTK_WIDGET(self)) || state->offscreen_enabled))
     ensure_scene_requests_scheduled(self, 20);
 }
 
@@ -11465,7 +11631,7 @@ gworld_scene_view_get_imagery_ready(GWorldSceneView *self)
   auto *state = get_state(self);
   auto *provider = state->tile_provider;
   if (!state->external_imagery || provider == nullptr || state->disposing ||
-      !gtk_widget_get_mapped(GTK_WIDGET(self)) || gworld_scene_tile_provider_get_closed(provider)) return FALSE;
+      (!gtk_widget_get_mapped(GTK_WIDGET(self)) && !state->offscreen_enabled) || gworld_scene_tile_provider_get_closed(provider)) return FALSE;
   const guint total = gworld_scene_tile_provider_get_tile_count(provider);
   if (total == 0 || gworld_scene_tile_provider_get_ready_count(provider) != total ||
       gworld_scene_tile_provider_get_overflow_count(provider) != 0 ||
@@ -11999,7 +12165,7 @@ mark_scene_nodes_changed(GWorldSceneView *self, GWorldSceneViewState *state)
 {
   (void)self;
   ++state->scene_revision;
-  state->mesh_key.clear();
+  state->scene_nodes_dirty = true;
 }
 
 static bool
@@ -12341,4 +12507,288 @@ gworld_scene_view_clear_nodes(GWorldSceneView *self)
     schedule_scene_nodes_changed(self);
   else
     gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+
+// Explicit camera frames deliberately own CPU pixels rather than a GL texture:
+// consumers may outlive the originating view/context and use either GTK variant.
+struct _GWorldSceneFrame {
+  GObject parent_instance;
+  GdkPixbuf *image;
+  gint64 timestamp_us, completed_us;
+  guint64 sequence;
+};
+G_DEFINE_TYPE(GWorldSceneFrame, gworld_scene_frame, G_TYPE_OBJECT)
+static void gworld_scene_frame_finalize(GObject *object)
+{
+  auto *frame = GWORLD_SCENE_FRAME(object);
+  g_clear_object(&frame->image);
+  G_OBJECT_CLASS(gworld_scene_frame_parent_class)->finalize(object);
+}
+static void gworld_scene_frame_class_init(GWorldSceneFrameClass *klass)
+{
+  G_OBJECT_CLASS(klass)->finalize = gworld_scene_frame_finalize;
+}
+static void gworld_scene_frame_init(GWorldSceneFrame *) {}
+GdkPixbuf *gworld_scene_frame_get_image(GWorldSceneFrame *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_FRAME(self), nullptr);
+  return self->image;
+}
+gint64 gworld_scene_frame_get_timestamp(GWorldSceneFrame *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_FRAME(self), 0);
+  return self->timestamp_us;
+}
+gint64 gworld_scene_frame_get_completed_time(GWorldSceneFrame *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_FRAME(self), 0);
+  return self->completed_us;
+}
+guint64 gworld_scene_frame_get_sequence(GWorldSceneFrame *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_FRAME(self), 0);
+  return self->sequence;
+}
+
+gboolean gworld_scene_view_set_camera_pose(GWorldSceneView *self,
+  double latitude, double longitude, double altitude_amsl,
+  double qw, double qx, double qy, double qz, GError **error)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), FALSE);
+  for (double v : {latitude, longitude, altitude_amsl, qw, qx, qy, qz}) {
+    if (!std::isfinite(v)) {
+      g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "Camera pose must be finite");
+      return FALSE;
+    }
+  }
+  // Scale before normalization to avoid overflow/underflow for finite inputs.
+  const double scale = std::max({std::abs(qw), std::abs(qx), std::abs(qy), std::abs(qz)});
+  if (std::abs(latitude)>90 || std::abs(longitude)>180 || altitude_amsl < -12000 ||
+      altitude_amsl > 10000000 || scale == 0) {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "Camera pose is outside supported bounds or quaternion is zero");
+    return FALSE;
+  }
+  auto *state = get_state(self);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->latitude=latitude; state->longitude=longitude; state->altitude_amsl=altitude_amsl;
+    state->camera_quaternion = glm::normalize(glm::dquat(qw/scale, qx/scale, qy/scale, qz/scale));
+    state->exact_camera = true;
+    state->camera_mode = GWORLD_SCENE_CAMERA_MODE_FREE;
+    const auto forward = state->camera_quaternion * glm::dvec3(1,0,0);
+    state->heading_deg = gworld_scene::normalize_heading_degrees(std::atan2(forward.y,forward.x)*180/G_PI);
+    state->pitch_deg = std::asin(std::clamp(-forward.z,-1.0,1.0))*180/G_PI;
+  }
+  g_object_freeze_notify(G_OBJECT(self));
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_LATITUDE]);
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_LONGITUDE]);
+  g_object_notify_by_pspec(G_OBJECT(self), properties[PROP_ALTITUDE_AMSL]);
+  g_object_thaw_notify(G_OBJECT(self));
+  schedule_scene_requests(self);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+  return TRUE;
+}
+
+void gworld_scene_view_get_camera_quaternion(GWorldSceneView *self,
+  double *qw, double *qx, double *qy, double *qz)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+  auto *state = get_state(self);
+  std::lock_guard<std::mutex> lock(state->mutex);
+  const auto q = state->exact_camera ? state->camera_quaternion : glm::dquat(1,0,0,0);
+  if (qw) *qw=q.w;
+  if (qx) *qx=q.x;
+  if (qy) *qy=q.y;
+  if (qz) *qz=q.z;
+
+}
+
+gboolean gworld_scene_view_get_camera_pose_enabled(GWorldSceneView *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), FALSE);
+  return get_state(self)->exact_camera;
+}
+
+gboolean gworld_scene_view_set_camera_projection(GWorldSceneView *self,
+  int width, int height, double fx, double fy, double cx, double cy,
+  double near_m, double far_m, GError **error)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), FALSE);
+  bool finite = true;
+  for (double v : {fx,fy,cx,cy,near_m,far_m}) finite = finite && std::isfinite(v);
+  if (!finite || width<1 || height<1 || width>8192 || height>8192 ||
+      fx<0.000001 || fy<0.000001 || fx>1e9 || fy>1e9 || std::abs(cx)>1e9 || std::abs(cy)>1e9 ||
+      near_m<0.001 || far_m<=near_m || far_m>100000000) {
+    g_set_error_literal(error, G_IO_ERROR, G_IO_ERROR_INVALID_ARGUMENT, "Invalid calibrated camera projection");
+    return FALSE;
+  }
+  auto *state = get_state(self);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->camera_projection={true,width,height,fx,fy,cx,cy,near_m,far_m};
+  }
+  schedule_scene_requests(self);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+  return TRUE;
+}
+void gworld_scene_view_reset_camera_projection(GWorldSceneView *self)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+  auto *state = get_state(self);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->camera_projection.enabled = false;
+  }
+  schedule_scene_requests(self);
+  gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+void gworld_scene_view_set_offscreen_enabled(GWorldSceneView *self, gboolean enabled)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+  auto *state = get_state(self);
+  if (state->offscreen_enabled == bool(enabled)) return;
+  state->offscreen_enabled = enabled;
+  if (enabled) schedule_scene_requests(self);
+  else if (!gtk_widget_get_mapped(GTK_WIDGET(self))) on_view_unmap(GTK_WIDGET(self), nullptr);
+}
+gboolean gworld_scene_view_get_offscreen_enabled(GWorldSceneView *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), FALSE);
+  return get_state(self)->offscreen_enabled;
+}
+
+GWorldSceneFrame *gworld_scene_view_capture_frame(GWorldSceneView *self,
+  int width, int height, gint64 timestamp_us, GError **error)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), nullptr);
+  auto *state = get_state(self);
+  if (width<1 || height<1 || width>8192 || height>8192 || gint64(width)*height>16777216) {
+    g_set_error_literal(error,G_IO_ERROR,G_IO_ERROR_INVALID_ARGUMENT,"Invalid capture dimensions");
+    return nullptr;
+  }
+  if (state->disposing || state->capturing || !gtk_widget_get_realized(GTK_WIDGET(self))) {
+    g_set_error_literal(error,G_IO_ERROR,G_IO_ERROR_FAILED,"Capture requires a realized, idle scene view");
+    return nullptr;
+  }
+  struct ContextRestore {
+    GdkGLContext *previous = gdk_gl_context_get_current();
+    ContextRestore() { if (previous) g_object_ref(previous); }
+    ~ContextRestore() {
+      if(previous) { gdk_gl_context_make_current(previous); g_object_unref(previous); }
+      else gdk_gl_context_clear_current();
+    }
+  } context_restore;
+  auto *area=GTK_GL_AREA(self);
+  gtk_gl_area_make_current(area);
+  if (const auto *problem=gtk_gl_area_get_error(area)) {
+    g_propagate_error(error,g_error_copy(problem)); return nullptr;
+  }
+  GLint maximum=0;
+  glGetIntegerv(GL_MAX_TEXTURE_SIZE,&maximum);
+  if (width>maximum || height>maximum) {
+    g_set_error_literal(error,G_IO_ERROR,G_IO_ERROR_NOT_SUPPORTED,"Capture exceeds the GL texture limit"); return nullptr;
+  }
+  // Preserve GTK's framebuffer and pixel-pack state even on allocation failure.
+  struct Restore {
+    GWorldSceneViewState *s;
+    GLint draw,read,viewport[4],pack,align,row,skiprows,skippixels,active,texture;
+    gworld_scene::ImageryAnnotations pending_annotations;
+    bool pending_presentation;
+    Restore(GWorldSceneViewState *v):s(v), pending_annotations(v->next_presented_annotations), pending_presentation(v->presentation_pending) {
+      glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING,&draw); glGetIntegerv(GL_READ_FRAMEBUFFER_BINDING,&read);
+      glGetIntegerv(GL_VIEWPORT,viewport); glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING,&pack);
+      glGetIntegerv(GL_PACK_ALIGNMENT,&align); glGetIntegerv(GL_PACK_ROW_LENGTH,&row);
+      glGetIntegerv(GL_PACK_SKIP_ROWS,&skiprows); glGetIntegerv(GL_PACK_SKIP_PIXELS,&skippixels);
+      glGetIntegerv(GL_ACTIVE_TEXTURE,&active); glActiveTexture(GL_TEXTURE0); glGetIntegerv(GL_TEXTURE_BINDING_2D,&texture);
+      s->capturing=true;
+    }
+    ~Restore() {
+      glBindFramebuffer(GL_DRAW_FRAMEBUFFER,draw); glBindFramebuffer(GL_READ_FRAMEBUFFER,read);
+      glViewport(viewport[0],viewport[1],viewport[2],viewport[3]);
+      glBindBuffer(GL_PIXEL_PACK_BUFFER,pack); glPixelStorei(GL_PACK_ALIGNMENT,align); glPixelStorei(GL_PACK_ROW_LENGTH,row);
+      glPixelStorei(GL_PACK_SKIP_ROWS,skiprows); glPixelStorei(GL_PACK_SKIP_PIXELS,skippixels);
+      glActiveTexture(GL_TEXTURE0); glBindTexture(GL_TEXTURE_2D,texture); glActiveTexture(active);
+      s->capturing=false;
+      s->next_presented_annotations=std::move(pending_annotations);
+      s->presentation_pending=pending_presentation;
+    }
+  } restore(state);
+  if (!state->capture_fbo) glGenFramebuffers(1,&state->capture_fbo);
+  if (!state->capture_texture) glGenTextures(1,&state->capture_texture);
+  glBindFramebuffer(GL_FRAMEBUFFER,state->capture_fbo);
+  if (state->capture_width!=width || state->capture_height!=height) {
+    glBindTexture(GL_TEXTURE_2D,state->capture_texture);
+    glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,width,height,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+    glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+    glFramebufferTexture2D(GL_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,state->capture_texture,0);
+    if (glCheckFramebufferStatus(GL_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE) {
+      g_set_error_literal(error,G_IO_ERROR,G_IO_ERROR_FAILED,"Unable to allocate capture framebuffer"); return nullptr;
+    }
+    state->capture_width=width; state->capture_height=height;
+  }
+  glViewport(0,0,width,height);
+  if (!on_render(area,gtk_gl_area_get_context(area),nullptr)) {
+    g_set_error_literal(error,G_IO_ERROR,G_IO_ERROR_FAILED,"Scene rendering failed"); return nullptr;
+  }
+  g_autoptr(GdkPixbuf) image=gdk_pixbuf_new(GDK_COLORSPACE_RGB,TRUE,8,width,height);
+  if (!image) { g_set_error_literal(error,G_IO_ERROR,G_IO_ERROR_NO_SPACE,"Unable to allocate frame image"); return nullptr; }
+  glBindFramebuffer(GL_READ_FRAMEBUFFER,state->capture_fbo);
+  glBindBuffer(GL_PIXEL_PACK_BUFFER,0); glPixelStorei(GL_PACK_ALIGNMENT,4);
+  glPixelStorei(GL_PACK_ROW_LENGTH,0); glPixelStorei(GL_PACK_SKIP_ROWS,0); glPixelStorei(GL_PACK_SKIP_PIXELS,0);
+  auto *pixels=gdk_pixbuf_get_pixels(image);
+  glReadPixels(0,0,width,height,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+  if (glGetError()!=GL_NO_ERROR) {
+    g_set_error_literal(error,G_IO_ERROR,G_IO_ERROR_FAILED,"Unable to read rendered frame"); return nullptr;
+  }
+  const int stride=gdk_pixbuf_get_rowstride(image);
+  for(int y=0;y<height/2;++y)
+    std::swap_ranges(pixels+y*stride,pixels+y*stride+width*4,pixels+(height-y-1)*stride);
+  auto *frame=GWORLD_SCENE_FRAME(g_object_new(GWORLD_TYPE_SCENE_FRAME,nullptr));
+  frame->image=g_steal_pointer(&image); frame->timestamp_us=timestamp_us;
+  frame->completed_us=g_get_monotonic_time(); frame->sequence=++state->capture_sequence;
+  // A binding/display may retain only the borrowed pixbuf. Attribution must
+  // follow those pixels even after the frame wrapper itself has been released.
+  g_object_set_data_full(G_OBJECT(frame->image), "gworldscene-frame-imagery-annotations",
+    new gworld_scene::ImageryAnnotations(state->next_presented_annotations),
+    +[](gpointer p) { delete static_cast<gworld_scene::ImageryAnnotations *>(p); });
+  return frame;
+}
+
+static void on_shared_terrain_changed(GWorldSceneTerrainSource *source,gpointer data)
+{
+  auto *self=GWORLD_SCENE_VIEW(data);auto *state=get_state(self);
+  if(state->disposing || state->terrain_source!=source)return;
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    state->terrain_tiles=gworld_scene::terrain_source_snapshot(source);
+    ++state->terrain_revision;state->mesh_key.clear();
+  }
+  schedule_scene_requests(self);gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+void gworld_scene_view_set_terrain_source(GWorldSceneView *self,GWorldSceneTerrainSource *source)
+{
+  g_return_if_fail(GWORLD_IS_SCENE_VIEW(self));
+  g_return_if_fail(!source || GWORLD_IS_SCENE_TERRAIN_SOURCE(source));
+  auto *state=get_state(self);
+  if(state->disposing || state->terrain_source==source)return;
+  if(source)g_object_ref(source);
+  auto *old=state->terrain_source;
+  if(old)g_signal_handler_disconnect(old,state->terrain_source_changed);
+  {
+    std::lock_guard<std::mutex> lock(state->mutex);
+    cancel_pending_downloads_not_in_locked(state,"terrain:",{});
+    state->wanted_terrain_keys.clear();
+    state->terrain_source=source;
+    state->terrain_tiles=source?gworld_scene::terrain_source_snapshot(source):gworld_scene::TerrainTileMap{};
+    state->unavailable_terrain_keys.clear();state->terrain_retry_after_us.clear();
+    ++state->terrain_revision;state->mesh_key.clear();
+  }
+  state->terrain_source_changed=source?g_signal_connect(source,"changed",G_CALLBACK(on_shared_terrain_changed),self):0;
+  if(old)g_object_unref(old);
+  schedule_scene_requests(self);gtk_widget_queue_draw(GTK_WIDGET(self));
+}
+GWorldSceneTerrainSource *gworld_scene_view_get_terrain_source(GWorldSceneView *self)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self),nullptr);return get_state(self)->terrain_source;
 }

@@ -30,6 +30,7 @@ glm_dep = dependency('glm')
 zlib_dep = dependency('zlib')
 
 gworldscene_core_deps = [
+  gio_dep,
   gobject_dep,
   gdk_pixbuf_dep,
   glm_dep,
@@ -40,16 +41,20 @@ gworldscene_inc = include_directories('.')
 gworldscene_core_headers = [
   'gworld-scene-node.h',
   'gworld-scene-tile-provider.h',
+  'gworld-scene-terrain-source.h',
 ]
 
 gworldscene_headers = [
   'gworldscene.h',
   'gworld-scene-node.h',
   'gworld-scene-tile-provider.h',
+  'gworld-scene-terrain-source.h',
   'gworld-scene-view.h',
 ]
 
 gworldscene_core_sources = [
+  'gworld-scene-terrain-source.cpp',
+  'gworld-scene-terrain-source-private.h',
   'gworld-scene-tile-provider.cpp',
   'gworld-scene-tile-provider-private.h',
   'gworld-scene-atmosphere.cpp',
@@ -114,7 +119,7 @@ pkg.generate(
   subdirs: [],
   extra_cflags: ['-I' + (gobject_introspection_includedir / ('gworldscene-core-' + gworldscene_api_version))],
   install_dir: gworldscene_pkgconfigdir,
-  requires: ['gobject-2.0', 'gdk-pixbuf-2.0'],
+  requires: ['gio-2.0', 'gobject-2.0', 'gdk-pixbuf-2.0'],
   version: meson.project_version(),
 )
 

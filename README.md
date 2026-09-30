@@ -33,6 +33,10 @@ and [OpenStreetMap contributors](https://www.openstreetmap.org/copyright).
 - Application-supplied imagery with regional fallback and attribution lifetime tracking.
 - Earth-scale globe rendering when zoomed far out.
 - Default Google-Earth-style camera plus free camera mode.
+- Exact quaternion camera poses, calibrated intrinsics and close/distant depth handling.
+- Retained offscreen capture with shareable timestamped CPU frames.
+- Shared application-fed terrain tiles across views and worker snapshots.
+
 - Scene graph nodes positioned by geodetic coordinates.
 - Local NED orientation for nodes: yaw, pitch, and roll.
 - Primitive nodes: cube, sphere, and cylinder.
@@ -47,6 +51,9 @@ and [OpenStreetMap contributors](https://www.openstreetmap.org/copyright).
 - Configurable sun position/time of day and additional distance fog.
 - Picking signals for terrain and renderable scene nodes.
 - C, Vala, and SQGI examples.
+
+See [calibrated cameras and shared terrain](docs/calibrated-cameras.rst) for API
+conventions, capture ownership and SQGI usage.
 
 ## Dependencies
 

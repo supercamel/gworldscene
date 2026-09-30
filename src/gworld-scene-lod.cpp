@@ -172,6 +172,40 @@ terrain_imagery_plan(double latitude, double longitude, double altitude_agl,
   return plan;
 }
 
+ImageryBand
+camera_imagery_band(double latitude, double longitude, double distance_m,
+                    double focal_pixels, double footprint_radius_m,
+                    int max_tiles, int max_pixels)
+{
+  if (!std::isfinite(latitude) || !std::isfinite(longitude) ||
+      !std::isfinite(distance_m) || !std::isfinite(focal_pixels) ||
+      !std::isfinite(footprint_radius_m) || distance_m <= 0 || focal_pixels <= 0 ||
+      footprint_radius_m <= 0 || max_tiles < 1 || max_pixels < 256)
+    return {};
+  const double scale = std::max(0.05, std::cos(deg_to_rad(latitude)));
+  const double meters_per_pixel = distance_m / focal_pixels;
+  const double level = std::log2(360.0 * kEarthMetersPerDegree * scale /
+                                 (256.0 * meters_per_pixel));
+  const int zoom = static_cast<int>(std::clamp(std::ceil(level), 0.0, 19.0));
+  auto range_for = [&](double radius) {
+    const double delta = radius / kEarthMetersPerDegree;
+    return tile_range_for_bounds(std::max(-90.0, latitude-delta),
+                                  std::min(90.0, latitude+delta),
+                                  longitude-std::min(180.0, delta/scale),
+                                  longitude+std::min(180.0, delta/scale), zoom);
+  };
+  double low = 0, high = footprint_radius_m;
+  for (int i = 0; i < 32; ++i) {
+    const double middle = (low + high) * 0.5;
+    const auto range = range_for(middle);
+    if (range.width_tiles() <= max_pixels/256 && range.height_tiles() <= max_pixels/256 &&
+        static_cast<long long>(range.width_tiles()) * range.height_tiles() <= max_tiles)
+      low = middle;
+    else high = middle;
+  }
+  return {range_for(low), low};
+}
+
 int
 globe_texture_zoom_for_altitude(double altitude_amsl)
 {
