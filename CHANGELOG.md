@@ -1,9 +1,8 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 — 2026-10-01
 
 - Calibrated zoom now requests finer imagery around the viewed terrain, with bounded tile coverage and coarser fallback.
-
 - Add exact quaternion camera pose, calibrated off-centre projection and aspect-preserving resizing.
 - Support millimetre near-plane settings with logarithmic world depth for calibrated views.
 - Add retained offscreen capture and owned timestamped frames for GTK 3/4 and introspection consumers.
