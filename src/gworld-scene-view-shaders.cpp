@@ -95,6 +95,12 @@ layout(location = 6) in vec4 vertex_color;
 layout(location = 7) in float material;
 layout(location = 8) in vec2 surface;
 uniform mat4 mvp;
+uniform bool model_instance;
+uniform mat4 model_transform;
+uniform mat4 model_mvp;
+uniform mat3 model_normal;
+uniform vec4 model_tint;
+uniform vec2 model_surface;
 uniform bool ultra_atlas_valid;
 uniform vec4 ultra_atlas_range;
 uniform vec2 ultra_atlas_size;
@@ -155,8 +161,8 @@ vec2 atlas_uv_for_lat_lon(vec2 lat_lon, vec4 range, vec2 size) {
 }
 
 void main() {
-  vec4 world_position = vec4(position, 1.0);
-  gl_Position = mvp * world_position;
+  vec4 world_position = model_instance ? model_transform * vec4(position, 1.0) : vec4(position, 1.0);
+  gl_Position = model_instance ? model_mvp * vec4(position, 1.0) : mvp * world_position;
   v_camera_depth = gl_Position.w;
   bool is_terrain = material < 0.5;
   bool is_globe = material > 1.5 && material < 2.5;
@@ -187,12 +193,14 @@ void main() {
     ? atlas_uv_for_lat_lon(detail_texcoord, water_mid_range, water_mid_size) : vec2(-1.0);
   v_water_far = water_far_valid && (is_terrain || is_globe)
     ? atlas_uv_for_lat_lon(detail_texcoord, water_far_range, water_far_size) : vec2(-1.0);
-  v_normal = normal;
+  v_normal = model_instance ? normalize(model_normal * normal) : normal;
   v_color = vec4(srgb_to_linear(vertex_color.rgb), vertex_color.a);
+  if (model_instance) v_color *= model_tint;
   v_material = material;
-  v_surface = surface;
-  v_height = position.y;
-  v_world_position = position;
+  v_surface = model_instance ? vec2(model_surface.x >= 0.0 ? model_surface.x : surface.x,
+                                    model_surface.y >= 0.0 ? model_surface.y : surface.y) : surface;
+  v_height = world_position.y;
+  v_world_position = world_position.xyz;
 }
 )GLSL";
 
@@ -564,11 +572,13 @@ layout(location = 1) in vec2 texcoord;
 layout(location = 6) in vec4 vertex_color;
 layout(location = 7) in float material;
 uniform mat4 light_mvp;
+uniform bool model_instance;
+uniform mat4 model_transform;
 out vec2 v_uv;
 out float v_alpha;
 out float v_material;
 void main() {
-  gl_Position = light_mvp * vec4(position, 1.0);
+  gl_Position = light_mvp * (model_instance ? model_transform * vec4(position, 1.0) : vec4(position, 1.0));
   v_uv = texcoord;
   v_alpha = vertex_color.a;
   v_material = material;
@@ -679,7 +689,7 @@ void main() {
 
   static const char *fragment_source = R"GLSL(
 in vec2 v_ndc;
-uniform mat4 inverse_mvp;
+uniform mat4 inverse_ray_projection;
 uniform vec3 camera_position;
 uniform vec3 sun_direction;
 uniform vec3 day_horizon_color;
@@ -692,9 +702,9 @@ uniform float horizon_glow_strength;
 out vec4 color;
 
 void main() {
-  vec4 far_world = inverse_mvp * vec4(v_ndc, 1.0, 1.0);
-  far_world /= far_world.w;
-  vec3 ray = normalize(far_world.xyz - camera_position);
+  // Interior clip depth remains finite even when far/near exceeds float
+  // precision. Translation was removed on the CPU; xyz is a direction.
+  vec3 ray = normalize((inverse_ray_projection * vec4(v_ndc, 0.0, 1.0)).xyz);
   if (atmosphere_enabled) {
     color = vec4(atmosphere_sky(camera_position, ray, sun_direction), 1.0);
     return;

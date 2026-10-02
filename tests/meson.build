@@ -225,3 +225,7 @@ if sqgi.found()
     endif
   endforeach
 endif
+
+mipmaps_test = executable('gworldscene-mipmaps-test', 'mipmaps-test.cpp',
+  include_directories: gworldscene_inc, dependencies: gworldscene_core_dep)
+test('mipmaps', mipmaps_test, suite: 'imagery')

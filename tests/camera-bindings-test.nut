@@ -32,6 +32,18 @@ local image=frame.get_image()
 if(image.get_width()!=320 || image.get_height()!=240 || image.get_n_channels()!=4)throw "Frame pixels"
 local next=view.capture_frame(160,120,234567)
 if(next.get_sequence()!=2 || frame.get_timestamp()!=123456 || image.get_width()!=320)throw "Frame lifetime"
+local scaled=view.capture_frame_scaled(320,240,2.0,160,120,345678)
+if(scaled.get_sequence()!=3 || scaled.get_timestamp()!=345678 || scaled.get_image().get_width()!=160 || scaled.get_image().get_height()!=120)throw "Scaled frame metadata"
+rejected=false;try{view.capture_frame_scaled(320,240,0,160,120,0)}catch(e){rejected=true}
+if(!rejected)throw "Invalid crop accepted"
+if(view.poll_capture_frame()!=null)throw "Unexpected pending capture"
+if(!view.request_capture_frame_scaled(320,240,1.0,160,120,456789))throw "Async request rejected"
+rejected=false;try{view.request_capture_frame_scaled(320,240,1.0,160,120,0)}catch(e){rejected=true}
+if(!rejected)throw "Concurrent capture accepted"
+local completed=null;local until=GLib.get_monotonic_time()+5000000
+while(completed==null && GLib.get_monotonic_time()<until){completed=view.poll_capture_frame();if(completed==null)GLib.usleep(1000)}
+if(completed==null || completed.get_timestamp()!=456789 || completed.get_image().get_width()!=160)throw "Async frame metadata"
+if(view.poll_capture_frame()!=null)throw "Completed capture delivered twice"
 view.reset_camera_projection();view.set_free_camera_orientation(0,0)
 if(view.get_camera_pose_enabled())throw "Legacy camera mode retained exact orientation"
 window.destroy()

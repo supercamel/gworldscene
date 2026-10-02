@@ -1,6 +1,7 @@
 #include "gworld-scene-view.h"
 #include "stalled-tile-server-private.h"
 #include <epoxy/gl.h>
+#include <glib/gstdio.h>
 #include <cmath>
 #include <functional>
 #include <limits>
@@ -113,7 +114,36 @@ static void test_camera(gconstpointer data) {
   g_autoptr(GWorldSceneFrame) large=capture(v,640,480);
   g_assert_cmpuint(gworld_scene_frame_get_sequence(large),>,sequence);
   const int small_red=colored(im,0);
+  // Async readback retains the request's pose/projection and timestamp, has a
+  // bounded pending slot, and returns an immutable top-down image on polling.
+  g_assert_null(gworld_scene_view_poll_capture_frame(v,&error));g_assert_no_error(error);
+  g_assert_true(gworld_scene_view_request_capture_frame_scaled(v,640,480,1,320,240,765432,&error));g_assert_no_error(error);
+  g_assert_false(gworld_scene_view_request_capture_frame_scaled(v,640,480,1,320,240,0,&error));
+  g_assert_error(error,G_IO_ERROR,G_IO_ERROR_BUSY);g_clear_error(&error);
+  g_assert_true(gworld_scene_view_set_camera_projection(v,320,240,320,320,160,120,.01,100000,&error));
+  GWorldSceneFrame *async_frame=nullptr;
+  g_assert_true(wait_until([&]{async_frame=gworld_scene_view_poll_capture_frame(v,&error);g_assert_no_error(error);return async_frame!=nullptr;}));
+  g_assert_cmpint(gworld_scene_frame_get_timestamp(async_frame),==,765432);
+  g_assert_cmpint(std::abs(colored(gworld_scene_frame_get_image(async_frame),0)-small_red),<,small_red/5);
+  g_object_unref(async_frame);
+  g_assert_null(gworld_scene_view_poll_capture_frame(v,&error));g_assert_no_error(error);
+  g_assert_true(gworld_scene_view_set_camera_projection(v,320,240,160,160,160,120,.01,100000,&error));
   g_assert_cmpint(colored(gworld_scene_frame_get_image(large),0),>,small_red*3);
+  // GPU resampling preserves the calibrated sensor FOV; crop changes only framing.
+  g_autoptr(GWorldSceneFrame) scaled=gworld_scene_view_capture_frame_scaled(v,640,480,1,320,240,123,&error);
+  g_assert_no_error(error);g_assert_nonnull(scaled);
+  g_assert_cmpint(gworld_scene_frame_get_timestamp(scaled),==,123);
+  g_assert_cmpint(gdk_pixbuf_get_width(gworld_scene_frame_get_image(scaled)),==,320);
+  g_assert_cmpint(std::abs(colored(gworld_scene_frame_get_image(scaled),0)-small_red),<,small_red/5);
+  g_autoptr(GWorldSceneFrame) cropped=gworld_scene_view_capture_frame_scaled(v,640,480,2,320,240,124,&error);
+  g_assert_no_error(error);g_assert_nonnull(cropped);
+  g_assert_cmpint(colored(gworld_scene_frame_get_image(cropped),0),>,small_red*3);
+  for (double invalid : {0.0,static_cast<double>(NAN),1000.0}) {
+    g_assert_null(gworld_scene_view_capture_frame_scaled(v,640,480,invalid,320,240,0,&error));
+    g_assert_error(error,G_IO_ERROR,G_IO_ERROR_INVALID_ARGUMENT);g_clear_error(&error);
+  }
+  g_assert_null(gworld_scene_view_capture_frame_scaled(v,640,480,1,0,240,0,&error));
+  g_assert_error(error,G_IO_ERROR,G_IO_ERROR_INVALID_ARGUMENT);g_clear_error(&error);
   // Portrait output contains the complete unchanged sensor image with black bars.
   g_autoptr(GWorldSceneFrame) portrait=capture(v,320,480);
   auto *p=gdk_pixbuf_get_pixels(gworld_scene_frame_get_image(portrait));
@@ -205,6 +235,16 @@ static void test_camera(gconstpointer data) {
   g_object_unref(retained_image);
   g_assert_true(wait_until([&]{return gworld_scene_tile_provider_get_annotation_count(provider)==0;}));
   gworld_scene_view_set_offscreen_enabled(v,FALSE);
+  g_assert_true(gworld_scene_view_request_capture_frame_scaled(v,320,240,1,160,120,99,&error));
+  g_assert_no_error(error);
+  gtk_widget_unrealize(GTK_WIDGET(v));
+  g_assert_null(gworld_scene_view_poll_capture_frame(v,&error));g_assert_no_error(error);
+  gtk_widget_realize(GTK_WIDGET(v));
+  g_assert_true(gworld_scene_view_request_capture_frame_scaled(v,320,240,1,160,120,100,&error));
+  g_assert_no_error(error);async_frame=nullptr;
+  g_assert_true(wait_until([&]{async_frame=gworld_scene_view_poll_capture_frame(v,&error);g_assert_no_error(error);return async_frame!=nullptr;}));
+  g_assert_cmpint(gdk_pixbuf_get_width(gworld_scene_frame_get_image(async_frame)),==,160);
+  g_assert_cmpint(gworld_scene_frame_get_timestamp(async_frame),==,100);g_object_unref(async_frame);
   gworld_scene_view_reset_camera_projection(v);
   gworld_scene_view_set_free_camera_orientation(v,0,0);
   g_assert_false(gworld_scene_view_get_camera_pose_enabled(v));
@@ -217,9 +257,99 @@ static void test_camera(gconstpointer data) {
 #endif
   g_assert_cmpint(colored(gworld_scene_frame_get_image(first),0),==,small_red);
 }
+// A camera and a centimetre-scale model must stay aligned before terrain
+// catches up with a relocation of the camera far from the current mesh origin.
+static void test_relative_model(gconstpointer data) {
+#if GWORLD_SCENE_GTK_MAJOR == 4
+  if(!gtk_init_check()) {g_test_skip("No display");return;}
+  auto *window=gtk_window_new();
+#else
+  if(!gtk_init_check(nullptr,nullptr)) {g_test_skip("No display");return;}
+  auto *window=gtk_window_new(GTK_WINDOW_TOPLEVEL);
+#endif
+  StalledTileServer server;
+  auto *v=GWORLD_SCENE_VIEW(gworld_scene_view_new());
+  if(GPOINTER_TO_INT(data)) {
+#if GWORLD_SCENE_GTK_MAJOR == 4 && GTK_CHECK_VERSION(4,12,0)
+    gtk_gl_area_set_allowed_apis(GTK_GL_AREA(v),GDK_GL_API_GLES);
+#else
+    gtk_gl_area_set_use_es(GTK_GL_AREA(v),TRUE);
+#endif
+  }
+  gworld_scene_view_set_cache_enabled(v,FALSE);
+  gworld_scene_view_set_shadows_enabled(v,FALSE);
+  gworld_scene_view_set_atmosphere_enabled(v,FALSE);
+  gworld_scene_view_set_fog_enabled(v,FALSE);
+  gworld_scene_view_set_map_tile_url_template(v,(server.base+"tiles/{z}/{x}/{y}.png").c_str());
+  gworld_scene_view_set_terrain_server(v,(server.base+"terrain/{tile}.hgt").c_str());
+  GError *error=nullptr;
+  g_autofree char *directory=g_dir_make_tmp("gworldscene-relative-model-XXXXXX",&error);
+  g_assert_no_error(error);
+  const std::string path=std::string(directory)+"/near.obj";
+  g_assert_true(g_file_set_contents(path.c_str(),
+    "v -0.01 -0.01 0.05\nv 0.01 -0.01 0.05\nv 0.01 0.01 0.05\nv -0.01 0.01 0.05\nf 1 2 3\nf 1 3 4\n",-1,&error));
+  g_assert_no_error(error);
+  auto *node=GWORLD_SCENE_NODE(gworld_scene_view_add_model(v,path.c_str(),0,0,600));
+  gworld_scene_node_set_color(node,1,0,0);
+  g_assert_true(gworld_scene_view_set_camera_pose(v,0,0,600,1,0,0,0,&error));
+  g_assert_true(gworld_scene_view_set_camera_projection(v,320,240,160,160,160,120,.005,100000,&error));
+#if GWORLD_SCENE_GTK_MAJOR == 4
+  gtk_window_set_child(GTK_WINDOW(window),GTK_WIDGET(v));
+#else
+  gtk_container_add(GTK_CONTAINER(window),GTK_WIDGET(v));
+#endif
+  gtk_window_set_default_size(GTK_WINDOW(window),320,240);
+  gtk_widget_realize(window);gtk_widget_realize(GTK_WIDGET(v));
+  gworld_scene_view_set_offscreen_enabled(v,TRUE);
+  struct Footprint {int count=0;double x=0,y=0;};
+  auto footprint=[](GdkPixbuf *image){Footprint f;
+    for(int y=0;y<240;y++)for(int x=0;x<320;x++){
+      const auto *p=gdk_pixbuf_get_pixels(image)+y*gdk_pixbuf_get_rowstride(image)+x*4;
+      if(p[0]>p[1]+10 && p[0]>p[2]+10){f.count++;f.x+=x+.5;f.y+=y+.5;}
+    }
+    if(f.count){f.x/=f.count;f.y/=f.count;}return f;
+  };
+  g_assert_true(wait_until([&]{g_autoptr(GWorldSceneFrame) f=capture(v);return footprint(gworld_scene_frame_get_image(f)).count>3000;}));
+  // No main-context iteration: the old mesh origin cannot rebase between captures.
+  for(int i=0;i<8;i++) {
+    const double lat=-35.0+i*.000001,lon=149.0;
+    gworld_scene_node_set_position(node,lat,lon,600);
+    g_assert_true(gworld_scene_view_set_camera_pose(v,lat,lon,600,1,0,0,0,&error));
+    g_autoptr(GWorldSceneFrame) f=capture(v);
+    auto *image=gworld_scene_frame_get_image(f);
+    const auto fprint=footprint(image);
+    g_assert_cmpint(fprint.count,>,3500);
+    g_assert_cmpint(fprint.count,<,4700);
+    g_assert_cmpfloat(std::abs(fprint.x-160),<,2);
+    g_assert_cmpfloat(std::abs(fprint.y-120),<,2);
+  }
+  gworld_scene_view_clear_nodes(v);
+  // Sky rays must stay finite with millimetre near clipping and a translated
+  // eye. Inverting a float world MVP loses the perspective terms here.
+  gworld_scene_view_set_atmosphere_enabled(v,TRUE);
+  for(int i=0;i<100;i++) {
+    const double pitch=(50+i*.1)*G_PI/180;
+    const double yaw=i*3.6*G_PI/180,roll=std::sin(i*.3)*.2;
+    const double ch=std::cos(yaw/2),sh=std::sin(yaw/2),cp=std::cos(pitch/2),sp=std::sin(pitch/2),cr=std::cos(roll/2),sr=std::sin(roll/2);
+    g_assert_true(gworld_scene_view_set_camera_pose(v,-35+i*.000001,149,600,
+      ch*cp*cr+sh*sp*sr,ch*cp*sr-sh*sp*cr,ch*sp*cr+sh*cp*sr,sh*cp*cr-ch*sp*sr,&error));
+    g_autoptr(GWorldSceneFrame) f=capture(v);
+    const auto *p=gdk_pixbuf_get_pixels(gworld_scene_frame_get_image(f))+120*320*4+160*4;
+    g_assert_cmpint(int(p[0])+p[1]+p[2],>,100);
+  }
+  gworld_scene_view_set_offscreen_enabled(v,FALSE);
+#if GWORLD_SCENE_GTK_MAJOR == 4
+  gtk_window_destroy(GTK_WINDOW(window));
+#else
+  gtk_widget_destroy(window);
+#endif
+  g_remove(path.c_str());g_rmdir(directory);
+}
 int main(int argc,char **argv) {
   g_test_init(&argc,&argv,nullptr);
   g_test_add_data_func("/camera-capture/automatic",GINT_TO_POINTER(FALSE),test_camera);
   g_test_add_data_func("/camera-capture/gles",GINT_TO_POINTER(TRUE),test_camera);
+  g_test_add_data_func("/camera/relative-model",nullptr,test_relative_model);
+  g_test_add_data_func("/camera/relative-model-gles",GINT_TO_POINTER(1),test_relative_model);
   return g_test_run();
 }

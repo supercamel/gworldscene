@@ -210,6 +210,11 @@ void check_imported_material(GWorldSceneView *view, const char *cache)
   g_assert_true(g_file_set_contents(path.c_str(),json.c_str(),json.size(),nullptr));
   auto *area = GTK_GL_AREA(view);
   const auto ground = render_frame(area);
+  unsigned uploads=0;
+  const auto handler=g_log_set_handler("GWorldScene",G_LOG_LEVEL_DEBUG,
+    +[](const gchar *,GLogLevelFlags,const gchar *message,gpointer data) {
+      if(g_str_has_prefix(message,"Model GPU upload"))++*static_cast<unsigned *>(data);
+    },&uploads);
   auto *node = GWORLD_SCENE_NODE(gworld_scene_view_add_model(view,path.c_str(),0.5,0.5,900));
   std::vector<unsigned char> imported;
   g_assert_true(wait_until([&]() { imported = render_frame(area); return changed_pixels(ground,imported) > 2000; }));
@@ -218,8 +223,30 @@ void check_imported_material(GWorldSceneView *view, const char *cache)
   // Explicit overrides matching the file must reproduce the imported result.
   gworld_scene_node_set_roughness(node,0.2); gworld_scene_node_set_metallic(node,1);
   g_assert_true(wait_until([&]() { return changed_pixels(imported,render_frame(area)) == 0; }));
+  // Pose, nonuniform scale and tint are live uniforms, without a mesh job or reupload.
+  g_assert_cmpuint(uploads,==,1);
+  gworld_scene_node_set_position(node,0.5003,0.5,900);
+  gworld_scene_node_set_orientation_ned(node,25,10,5);
+  gworld_scene_node_set_scale(node,0.5,1.5,1);
+  gworld_scene_node_set_color(node,1,0.2,0.2);
+  const auto moved=render_frame(area);
+  g_assert_cmpint(changed_pixels(imported,moved),>,2000);
+  auto *second=GWORLD_SCENE_NODE(gworld_scene_view_add_model(view,path.c_str(),0.4997,0.5,900));
+  g_assert_cmpint(changed_pixels(moved,render_frame(area)),>,1000);
+  g_assert_cmpuint(uploads,==,1); // Two instances share the immutable asset buffers.
+  gworld_scene_view_remove_node(view,second);
   gworld_scene_view_remove_node(view,node);
   g_assert_true(wait_until([&]() { return changed_pixels(ground,render_frame(area)) == 0; }));
+  // Retain a model across GL context loss: immutable CPU data reuploads once.
+  node=GWORLD_SCENE_NODE(gworld_scene_view_add_model(view,path.c_str(),0.5,0.5,900));
+  render_frame(area);g_assert_cmpuint(uploads,==,1);
+  gtk_widget_unrealize(GTK_WIDGET(view));
+  gtk_widget_realize(GTK_WIDGET(view));
+  const auto recreated=render_frame(area);
+  g_assert_cmpuint(uploads,==,2);
+  gworld_scene_view_remove_node(view,node);
+  g_assert_cmpint(changed_pixels(recreated,render_frame(area)),>,1000);
+  g_log_remove_handler("GWorldScene",handler);
 }
 
 void check_atmosphere(GtkGLArea *area) {

@@ -13,6 +13,9 @@ local terrain = Scene.SceneTerrainSource.new()
 terrain.put_tile(0,0,2,GLib.Bytes.new("\x00\x00\x00\x00\x00\x00\x00\x00"))
 scene.set_terrain_source(terrain)
 local provider = Scene.SceneTileProvider.new(0,19,256)
+local Pb=import("GdkPixbuf","2.0")
+local tile=Pb.Pixbuf.new(Pb.Colorspace.rgb,true,8,256,256);tile.fill(0x209040ff)
+provider.connect("tile-requested",function(id,z,x,y){provider.complete_tile(id,tile)})
 scene.set_tile_provider(provider)
 scene.set_offscreen_enabled(true)
 // 45 degrees down, looking north. Ground focus is ~1 km north of eye.
@@ -51,5 +54,19 @@ local eyeY = (1-log(tan(PI/4 + 0.5*PI/360))/PI)*0.5*pow(2,zoom.z)
 local northOfEye = false
 foreach (tile in zoom.tiles) if (tile[1]+1 < eyeY) northOfEye = true
 if (!northOfEye) throw "Fine imagery did not follow the oblique ground footprint"
+// Continuous pose/projection updates cannot debounce scene work out of existence.
+local ready=false;local end=GLib.get_monotonic_time()+10000000;local next=0
+while(GLib.get_monotonic_time()<end){
+  for(local i=0;i<100 && context.pending();i++)context.iteration(false)
+  local now=GLib.get_monotonic_time()
+  if(now>=next){
+    scene.set_camera_pose(0.5,0.5,1000,cos(PI/8),0,-sin(PI/8),0)
+    scene.set_camera_projection(1280,720,6400,6400,640,360,0.01,100000)
+    scene.capture_frame_scaled(640,360,1,320,180,now);next=now+40000
+    if(scene.get_imagery_ready()){ready=true;break}
+  }
+  GLib.usleep(1000)
+}
+if(!ready)throw "Continuous camera updates starved imagery refresh"
 window.destroy()
 print("1..1\nok 1 - calibrated zoom updates ground-focused imagery demand\n")

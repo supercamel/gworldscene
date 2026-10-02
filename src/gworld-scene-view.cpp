@@ -1,3 +1,4 @@
+#include "gworld-scene-mipmaps-private.h"
 #ifndef G_LOG_DOMAIN
 #define G_LOG_DOMAIN "GWorldScene"
 #endif
@@ -78,7 +79,8 @@ constexpr int kMaxTextureDownloadsPerUpdate = 36;
 constexpr int kMaxPendingTerrainDownloads = 12;
 constexpr int kMaxPendingTextureDownloads = 48;
 constexpr gint64 kTextureAtlasRefreshMinIntervalUs = 650 * 1000;
-constexpr std::size_t kTextureUploadChunkBytes = 32u * 1024u * 1024u;
+// Bound foreground upload work; retain the old complete atlas until publication.
+constexpr std::size_t kTextureUploadChunkBytes = 8u * 1024u * 1024u;
 constexpr gint64 kTerrainRetryBaseDelayUs = 5 * G_USEC_PER_SEC;
 constexpr gint64 kTerrainRetryMaxDelayUs = 120 * G_USEC_PER_SEC;
 constexpr double kGlobeRenderAltitudeM = 45000.0;
@@ -211,6 +213,8 @@ struct TextureUploadSlot {
   int width = 0;
   int height = 0;
   int uploaded_rows = 0;
+  int mip_level = 0;
+  std::size_t mip_offset = 0;
   std::string key;
   AtlasRange range;
 };
@@ -230,6 +234,11 @@ struct ModelMesh {
   std::string error;
   std::vector<ModelVertex> vertices;
   std::vector<unsigned int> indices;
+};
+
+struct ModelGpu {
+  GLuint vao = 0, vbo = 0, ebo = 0;
+  std::size_t index_count = 0;
 };
 
 struct SceneImageTexture {
@@ -362,7 +371,14 @@ struct GWorldSceneViewState {
   bool capturing = false;
   GLuint capture_fbo = 0, capture_texture = 0;
   int capture_width = 0, capture_height = 0;
+  GLuint capture_output_fbo = 0, capture_output_texture = 0;
+  int capture_output_width = 0, capture_output_height = 0;
   guint64 capture_sequence = 0;
+  GLuint capture_pack_buffer = 0;
+  GLsync capture_fence = nullptr;
+  int pending_capture_width = 0, pending_capture_height = 0;
+  gint64 pending_capture_timestamp = 0;
+  gworld_scene::ImageryAnnotations pending_capture_annotations;
   float log_depth_far = 0;
 
   double sun_azimuth_deg = 228.0;
@@ -424,6 +440,7 @@ struct GWorldSceneViewState {
   GWorldSceneNodeId next_node_id = 1;
   std::unordered_map<GWorldSceneNodeId, GWorldSceneNode *> scene_nodes;
   std::unordered_map<std::string, ModelMesh> model_meshes;
+  std::unordered_map<std::string, ModelGpu> model_gpu;
   std::unordered_map<std::string, int> model_texture_slots;
   std::unordered_map<std::string, SceneImageTexture> scene_image_textures;
   AtlasRange mesh_ultra_atlas_range;
@@ -2823,7 +2840,9 @@ pick_model_node_locked(GWorldSceneViewState *state,
                                             state->mesh_origin_latitude,
                                             state->mesh_origin_longitude,
                                             0.0);
-  const glm::dmat3 rotation = node_ned_rotation(node);
+  const auto frame=gworld_scene::local_frame_at(node.latitude,node.longitude,
+    state->mesh_origin_latitude,state->mesh_origin_longitude);
+  const glm::dmat3 rotation=glm::dmat3(frame.north,frame.east,-frame.up)*node_ned_rotation(node);
   bool hit = false;
   double best_distance = best.distance_m;
   glm::dvec3 best_position(0.0);
@@ -2837,7 +2856,7 @@ pick_model_node_locked(GWorldSceneViewState *state,
 
     auto transform_model_vertex = [&](unsigned int index) {
       const glm::dvec3 &p = mesh.vertices[index].position;
-      return node_vertex_position(node, rotation, center, p.z, p.x, -p.y);
+      return center+rotation*glm::dvec3(p.z*node.scale_x,p.x*node.scale_y,-p.y*node.scale_z);
     };
 
     const glm::dvec3 p0 = transform_model_vertex(i0);
@@ -5331,68 +5350,13 @@ append_cylinder_node(GWorldSceneViewState *state, const SceneNode &node)
 }
 
 void
-append_model_node(GWorldSceneViewState *state, const SceneNode &node)
-{
-  const ModelMesh *mesh = model_mesh_for_path(state, node.model_path);
-  if (mesh == nullptr)
-    return;
-
-  const glm::dvec3 center = geodetic_to_enu(node.latitude,
-                                            node.longitude,
-                                            node.altitude_amsl,
-                                            state->mesh_origin_latitude,
-                                            state->mesh_origin_longitude,
-                                            0.0);
-  const glm::dmat3 rotation = node_ned_rotation(node);
-
-  for (unsigned int model_index : mesh->indices) {
-    if (model_index >= mesh->vertices.size())
-      continue;
-
-    const ModelVertex &model_vertex = mesh->vertices[model_index];
-
-    const glm::dvec3 &p = model_vertex.position;
-    const glm::dvec3 position =
-      node_vertex_position(node, rotation, center, p.z, p.x, -p.y);
-
-    const glm::dvec3 &n = model_vertex.normal;
-    const glm::dvec3 normal_ned =
-      safe_normalize(glm::dvec3(n.z, n.x, -n.y), glm::dvec3(0.0, 0.0, -1.0));
-    const glm::dvec3 normal_scene =
-      safe_normalize(ned_to_scene_vector(rotation * normal_ned), glm::dvec3(0.0, 1.0, 0.0));
-    // Assimp material factors/vertex colors are linear reflectance. The shared
-    // mesh attribute stores sRGB, matching public node colors.
-    glm::vec3 color;
-    for (int channel = 0; channel < 3; ++channel)
-      color[channel] = gworld_scene::linear_to_srgb(model_vertex.color[channel] *
-        gworld_scene::srgb_to_linear(node.color[channel]));
-    TexCoords uv{-1.0f, -1.0f, -1.0f, -1.0f, -1.0f, -1.0f};
-    float material = kMaterialSolidNode;
-    if (model_vertex.has_texture) {
-      uv.detail_u = model_vertex.texcoord.x;
-      uv.detail_v = model_vertex.texcoord.y;
-      material = kMaterialTexturedModel;
-    }
-
-    const unsigned int base = static_cast<unsigned int>(state->vertices.size() / kVertexStride);
-    append_vertex(state->vertices,
-                  position,
-                  uv,
-                  glm::vec3(static_cast<float>(normal_scene.x),
-                            static_cast<float>(normal_scene.y),
-                            static_cast<float>(normal_scene.z)),
-                  glm::vec4(color, node.color.a),
-                  material, model_vertex.surface);
-    state->indices.push_back(base);
-  }
-}
-
-void
 append_scene_nodes(GWorldSceneViewState *state)
 {
   for (const auto &entry : state->scene_nodes) {
     GWorldSceneNode *scene_node = entry.second;
     if (!GWORLD_IS_SCENE_NODE(scene_node))
+      continue;
+    if (GWORLD_IS_SCENE_MODEL_NODE(scene_node))
       continue;
     if (GWORLD_IS_SCENE_BILLBOARD_NODE(scene_node))
       continue;
@@ -5473,7 +5437,7 @@ append_scene_nodes(GWorldSceneViewState *state)
       const char *model_path = gworld_scene_model_node_get_model_path(GWORLD_SCENE_MODEL_NODE(scene_node));
       if (model_path != nullptr)
         node.model_path = model_path;
-      append_model_node(state, node);
+      // Models are rendered from resident indexed buffers.
     }
     apply_material();
   }
@@ -6191,7 +6155,7 @@ set_atmosphere_uniforms(GLuint program, const glm::vec3 &settings,
 
 void
 render_sky_background(GWorldSceneViewState *state,
-                      const glm::mat4 &mvp,
+                      const glm::dmat4 &projection,
                       const gworld_scene::CameraPose &camera_pose,
                       const glm::vec3 &sun_direction,
                       const glm::vec3 &fog_color,
@@ -6204,7 +6168,10 @@ render_sky_background(GWorldSceneViewState *state,
   if (!ensure_sky_resources(state))
     return;
 
-  const glm::mat4 inverse_mvp = glm::inverse(mvp);
+  // A direction needs no translated eye. Inverting a float world MVP with
+  // millimetre near clipping loses perspective precision as the eye moves.
+  const glm::dmat4 rotation(glm::dmat3(glm::lookAt(camera_pose.eye,camera_pose.center,camera_pose.up)));
+  const glm::mat4 inverse_ray_projection(glm::inverse(projection*rotation));
   const glm::vec3 day_horizon_color =
     glm::mix(fog_color, glm::vec3(0.76f, 0.86f, 1.0f), 0.45f);
   const glm::vec3 day_zenith_color =
@@ -6214,10 +6181,10 @@ render_sky_background(GWorldSceneViewState *state,
 
   glUseProgram(state->sky_program);
   set_atmosphere_uniforms(state->sky_program, atmosphere_settings, atmosphere_frame);
-  glUniformMatrix4fv(glGetUniformLocation(state->sky_program, "inverse_mvp"),
+  glUniformMatrix4fv(glGetUniformLocation(state->sky_program, "inverse_ray_projection"),
                      1,
                      GL_FALSE,
-                     glm::value_ptr(inverse_mvp));
+                     glm::value_ptr(inverse_ray_projection));
   glUniform3fv(glGetUniformLocation(state->sky_program, "camera_position"),
                1,
                glm::value_ptr(glm::vec3(camera_pose.eye)));
@@ -6620,10 +6587,12 @@ ensure_shadow_resources(GWorldSceneViewState *state)
   return true;
 }
 
+void render_gpu_models(GWorldSceneViewState *state, GLuint program, const glm::dmat4 *view_projection = nullptr);
+
 bool
 render_shadow_map(GWorldSceneViewState *state, const gworld_scene::ShadowCascades &cascades)
 {
-  if (!state->index_count || !ensure_shadow_resources(state)) return false;
+  if ((!state->index_count && state->model_gpu.empty()) || !ensure_shadow_resources(state)) return false;
   GLint previous_fbo = 0, viewport[4] = {};
   glGetIntegerv(GL_DRAW_FRAMEBUFFER_BINDING, &previous_fbo);
   glGetIntegerv(GL_VIEWPORT, viewport);
@@ -6645,6 +6614,8 @@ render_shadow_map(GWorldSceneViewState *state, const gworld_scene::ShadowCascade
     glUniformMatrix4fv(glGetUniformLocation(state->shadow_program, "light_mvp"),
                        1, GL_FALSE, glm::value_ptr(cascades.matrices[i]));
     glDrawElements(GL_TRIANGLES, static_cast<GLsizei>(state->index_count), GL_UNSIGNED_INT, nullptr);
+    render_gpu_models(state, state->shadow_program);
+    glBindVertexArray(state->vao);
   }
   glBindVertexArray(0);
   glDisable(GL_POLYGON_OFFSET_FILL);
@@ -6657,7 +6628,22 @@ render_shadow_map(GWorldSceneViewState *state, const gworld_scene::ShadowCascade
 void
 delete_gl_resources(GWorldSceneViewState *state)
 {
+  for (auto &entry : state->model_gpu) {
+    auto &gpu = entry.second;
+    glDeleteBuffers(1, &gpu.vbo); glDeleteBuffers(1, &gpu.ebo); glDeleteVertexArrays(1, &gpu.vao);
+  }
+  state->model_gpu.clear();
   state->linear_target.destroy();
+  if (state->capture_fence) glDeleteSync(state->capture_fence);
+  state->capture_fence = nullptr;
+  glDeleteBuffers(1, &state->capture_pack_buffer);
+  state->capture_pack_buffer = 0;
+  state->pending_capture_width = state->pending_capture_height = 0;
+  state->pending_capture_annotations.clear();
+  glDeleteFramebuffers(1, &state->capture_output_fbo);
+  glDeleteTextures(1, &state->capture_output_texture);
+  state->capture_output_fbo = state->capture_output_texture = 0;
+  state->capture_output_width = state->capture_output_height = 0;
   glDeleteFramebuffers(1, &state->capture_fbo);
   glDeleteTextures(1, &state->capture_texture);
   state->capture_fbo = state->capture_texture = 0;
@@ -6889,6 +6875,68 @@ upload_vertex_index_buffers(GLuint &vao,
   index_count = indices.size();
 }
 
+// Called with the scene mutex held and its GL context current. Geometry is
+// uploaded once per asset/context; instance pose and material use uniforms.
+void prepare_gpu_models(GWorldSceneViewState *state)
+{
+  for (const auto &entry : state->scene_nodes) {
+    if (!GWORLD_IS_SCENE_MODEL_NODE(entry.second)) continue;
+    const char *path = gworld_scene_model_node_get_model_path(GWORLD_SCENE_MODEL_NODE(entry.second));
+    if (!path || !*path || state->model_gpu.count(path)) continue;
+    const ModelMesh *mesh = model_mesh_for_path(state, path);
+    if (!mesh) continue;
+    std::vector<float> vertices; vertices.reserve(mesh->vertices.size() * kVertexStride);
+    for (const auto &v : mesh->vertices) {
+      TexCoords uv{-1,-1,-1,-1,-1,-1};
+      if (v.has_texture) { uv.detail_u=v.texcoord.x; uv.detail_v=v.texcoord.y; }
+      glm::vec3 color;
+      for (int c=0;c<3;++c) color[c]=gworld_scene::linear_to_srgb(v.color[c]);
+      append_vertex(vertices, glm::dvec3(v.position.z,v.position.x,-v.position.y), uv,
+        glm::vec3(v.normal.z,v.normal.x,-v.normal.y), glm::vec4(color,1),
+        v.has_texture?kMaterialTexturedModel:kMaterialSolidNode, v.surface);
+    }
+    auto &gpu=state->model_gpu[path];
+    upload_vertex_index_buffers(gpu.vao,gpu.vbo,gpu.ebo,vertices,mesh->indices,gpu.index_count);
+    g_debug("Model GPU upload vertices=%zu indices=%zu",mesh->vertices.size(),mesh->indices.size());
+  }
+}
+
+void render_gpu_models(GWorldSceneViewState *state, GLuint program, const glm::dmat4 *view_projection)
+{
+  std::lock_guard<std::mutex> lock(state->mutex);
+  for (const auto &entry : state->scene_nodes) {
+    if (!GWORLD_IS_SCENE_MODEL_NODE(entry.second)) continue;
+    SceneNode node; if (!scene_node_snapshot_locked(entry.second,node)) continue;
+    auto found=state->model_gpu.find(node.model_path); if(found==state->model_gpu.end())continue;
+    const auto &gpu=found->second;
+    const glm::dvec3 center=geodetic_to_enu(node.latitude,node.longitude,node.altitude_amsl,
+      state->mesh_origin_latitude,state->mesh_origin_longitude,0);
+    const auto frame=gworld_scene::local_frame_at(node.latitude,node.longitude,
+      state->mesh_origin_latitude,state->mesh_origin_longitude);
+    const glm::dmat3 rotation=glm::dmat3(frame.north,frame.east,-frame.up)*node_ned_rotation(node);
+    const glm::dmat3 linear(rotation[0]*node.scale_x,rotation[1]*node.scale_y,rotation[2]*node.scale_z);
+    if (std::abs(glm::determinant(linear))<1e-15) continue;
+    glm::dmat4 precise_transform(linear);precise_transform[3]=glm::dvec4(center,1);
+    const glm::mat4 transform(precise_transform);
+    if(view_projection) {
+      // Cancel world/camera translation before rounding centimetre-scale models.
+      const glm::mat4 clip=glm::mat4(*view_projection * precise_transform);
+      glUniformMatrix4fv(glGetUniformLocation(program,"model_mvp"),1,GL_FALSE,glm::value_ptr(clip));
+    }
+    const glm::mat3 normal(glm::transpose(glm::inverse(linear)));
+    double r=1,g=1,b=1;gworld_scene_node_get_color(entry.second,&r,&g,&b);
+    const glm::vec4 tint(gworld_scene::srgb_to_linear(r),gworld_scene::srgb_to_linear(g),gworld_scene::srgb_to_linear(b),1);
+    glUniform1i(glGetUniformLocation(program,"model_instance"),GL_TRUE);
+    glUniformMatrix4fv(glGetUniformLocation(program,"model_transform"),1,GL_FALSE,glm::value_ptr(transform));
+    glUniformMatrix3fv(glGetUniformLocation(program,"model_normal"),1,GL_FALSE,glm::value_ptr(normal));
+    glUniform4fv(glGetUniformLocation(program,"model_tint"),1,glm::value_ptr(tint));
+    glUniform2f(glGetUniformLocation(program,"model_surface"),gworld_scene_node_get_roughness(entry.second),gworld_scene_node_get_metallic(entry.second));
+    glBindVertexArray(gpu.vao);glDrawElements(GL_TRIANGLES,static_cast<GLsizei>(gpu.index_count),GL_UNSIGNED_INT,nullptr);
+  }
+  glUniform1i(glGetUniformLocation(program,"model_instance"),GL_FALSE);
+  glBindVertexArray(0);
+}
+
 bool
 upload_mesh_if_needed(GWorldSceneViewState *state, PerfBufferUploadStats *stats = nullptr)
 {
@@ -7094,7 +7142,7 @@ upload_atlas_texture_chunk_if_needed(GWorldSceneViewState *state,
     return false;
   }
 
-  const std::size_t expected_size = texture_dimensions_bytes(width, height);
+  const std::size_t expected_size = gworld_scene::mip_chain_bytes(width, height);
   if (pixels.size() < expected_size) {
     g_warning("Texture upload skipped: layer=%s size=%dx%d bytes=%zu expected=%zu",
               label,
@@ -7125,6 +7173,7 @@ upload_atlas_texture_chunk_if_needed(GWorldSceneViewState *state,
     upload.width = 0;
     upload.height = 0;
     upload.uploaded_rows = 0;
+    upload.mip_level = 0; upload.mip_offset = 0;
     upload.key.clear();
     upload.range = AtlasRange();
     upload.annotations.clear();
@@ -7144,44 +7193,34 @@ upload_atlas_texture_chunk_if_needed(GWorldSceneViewState *state,
   glBindTexture(GL_TEXTURE_2D, upload.texture);
   gworld_scene::configure_imagery_sampler();
   glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-  if (upload.uploaded_rows <= 0) {
-    glTexImage2D(GL_TEXTURE_2D,
-                 0,
-                 GL_SRGB8_ALPHA8,
-                 width,
-                 height,
-                 0,
-                 GL_RGBA,
-                 GL_UNSIGNED_BYTE,
-                 nullptr);
+  // Mip levels are prepared by the atlas worker. Upload a bounded byte
+  // budget here; glGenerateMipmap can synchronously stall some drivers.
+  std::size_t uploaded_bytes = 0;
+  int rows = 0;
+  bool levels_complete = false;
+  while(uploaded_bytes < kTextureUploadChunkBytes) {
+    const int level_width=std::max(1,width >> upload.mip_level);
+    const int level_height=std::max(1,height >> upload.mip_level);
+    const std::size_t row_bytes=std::size_t(level_width)*4;
+    const int available_rows=int((kTextureUploadChunkBytes-uploaded_bytes)/row_bytes);
+    if(available_rows==0)break;
+    if(upload.uploaded_rows==0)
+      glTexImage2D(GL_TEXTURE_2D,upload.mip_level,GL_SRGB8_ALPHA8,
+                   level_width,level_height,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
+    const int count=std::min(available_rows,level_height-upload.uploaded_rows);
+    glTexSubImage2D(GL_TEXTURE_2D,upload.mip_level,0,upload.uploaded_rows,
+                   level_width,count,GL_RGBA,GL_UNSIGNED_BYTE,
+                   pixels.data()+upload.mip_offset+std::size_t(upload.uploaded_rows)*row_bytes);
+    uploaded_bytes+=std::size_t(count)*row_bytes;rows+=count;upload.uploaded_rows+=count;
+    if(upload.uploaded_rows<level_height)break;
+    if(level_width==1 && level_height==1){levels_complete=true;break;}
+    upload.mip_offset+=std::size_t(level_height)*row_bytes;
+    upload.mip_level++;upload.uploaded_rows=0;
   }
-
-  const std::size_t row_bytes = static_cast<std::size_t>(width) * 4;
-  const int rows_per_chunk =
-    std::max(1, static_cast<int>(kTextureUploadChunkBytes / std::max<std::size_t>(row_bytes, 1)));
-  const int y = std::clamp(upload.uploaded_rows, 0, height);
-  const int rows = std::min(rows_per_chunk, height - y);
-  if (rows > 0) {
-    const auto *src = pixels.data() + static_cast<std::size_t>(y) * row_bytes;
-    glTexSubImage2D(GL_TEXTURE_2D,
-                    0,
-                    0,
-                    y,
-                    width,
-                    rows,
-                    GL_RGBA,
-                    GL_UNSIGNED_BYTE,
-                    src);
-    upload.uploaded_rows = y + rows;
-  }
-
-  // Publish only after all rows and the complete mip chain are ready.
-  if (upload.uploaded_rows >= height)
-    glGenerateMipmap(GL_TEXTURE_2D);
   const GLenum error = glGetError();
   glBindTexture(GL_TEXTURE_2D, 0);
   const double duration_ms = perf_elapsed_ms(start_us);
-  const bool complete = error == GL_NO_ERROR && upload.uploaded_rows >= height;
+  const bool complete = error == GL_NO_ERROR && levels_complete;
 
   if (texture_trace_enabled()) {
     g_message("GWorldScene texture-trace upload layer=%s texture=%u action=chunk row=%d/%d rows=%d size=%dx%d bytes=%.1fMiB duration=%.2fms error=0x%x complete=%d",
@@ -7192,7 +7231,7 @@ upload_atlas_texture_chunk_if_needed(GWorldSceneViewState *state,
               rows,
               width,
               height,
-              bytes_to_mib(static_cast<std::size_t>(std::max(0, rows)) * row_bytes),
+              bytes_to_mib(uploaded_bytes),
               duration_ms,
               error,
               complete ? 1 : 0);
@@ -7223,7 +7262,7 @@ upload_atlas_texture_chunk_if_needed(GWorldSceneViewState *state,
     stats->duration_ms = duration_ms;
     stats->width = width;
     stats->height = rows;
-    stats->bytes = static_cast<std::size_t>(std::max(0, rows)) * row_bytes;
+    stats->bytes = uploaded_bytes;
     stats->error = error;
     stats->deferred = !complete;
   }
@@ -7393,6 +7432,13 @@ GWorldSceneViewBackend::schedule_scene_requests(guint delay_ms)
   {
     std::lock_guard<std::mutex> lock(state_->mutex);
     old_source = state_->scene_update_source;
+    // Pose streams must not postpone terrain/imagery work forever. Coalesce at
+    // the earliest requested deadline; urgent source changes may bring it forward.
+    if (old_source != 0) {
+      auto *pending = g_main_context_find_source_by_id(nullptr, old_source);
+      if (pending && g_source_get_ready_time(pending) <= g_get_monotonic_time() + gint64(delay_ms) * 1000)
+        return;
+    }
     state_->scene_update_source = 0;
   }
 
@@ -7951,6 +7997,14 @@ texture_atlas_build_thread(GTask *task, gpointer source_object, gpointer task_da
     result->height = 0;
   }
 
+  if (!result->pixels.empty() && !gworld_scene::append_srgb_mipmaps(
+        result->pixels, result->width, result->height,
+        [cancellable]{return cancellable && g_cancellable_is_cancelled(cancellable);})) {
+    texture_atlas_build_result_free(result);
+    if (!g_task_get_completed(task))
+      g_task_return_new_error(task,G_IO_ERROR,G_IO_ERROR_CANCELLED,"Texture mip build cancelled");
+    return;
+  }
   result->build_duration_us = perf_now_us() - build_start_us;
   if (g_task_get_completed(task)) {
     texture_atlas_build_result_free(result);
@@ -8049,6 +8103,7 @@ texture_atlas_build_done(GObject *source_object, GAsyncResult *result, gpointer 
       upload.width = atlas_result->width;
       upload.height = atlas_result->height;
       upload.uploaded_rows = 0;
+      upload.mip_level = 0; upload.mip_offset = 0;
       upload.key = range_key;
       upload.range = atlas_result->range;
       upload.annotations = std::move(atlas_result->annotations);
@@ -8176,6 +8231,13 @@ request_texture_atlas_build(GWorldSceneView *self, const AtlasRange &range, Text
     auto &pending_layer_key = texture_layer_pending_key(state, layer);
     const std::string &loaded_key = texture_layer_loaded_key(state, layer);
     TextureUploadSlot &upload = texture_layer_upload_slot(state, layer);
+    // Range motion must not repeatedly discard a partially uploaded atlas.
+    // Its own geographic range/credits remain attached; the next scene update
+    // requests the new range after publication. Source invalidation clears the
+    // slot/pixels separately and is never deferred by this guard.
+    if (!upload.key.empty() && upload.width > 0 && upload.height > 0 &&
+        texture_layer_dirty(state, layer) && !texture_layer_pixels(state, layer).empty())
+      return;
     wanted_key = range_key;
 
     if (loaded_key == range_key) {
@@ -8217,6 +8279,7 @@ request_texture_atlas_build(GWorldSceneView *self, const AtlasRange &range, Text
       upload.width = 0;
       upload.height = 0;
       upload.uploaded_rows = 0;
+      upload.mip_level = 0; upload.mip_offset = 0;
       upload.key.clear();
       upload.range = AtlasRange();
       upload.annotations.clear();
@@ -8417,6 +8480,7 @@ flush_pending_texture_refresh_locked(GWorldSceneViewState *state, gint64 now_us)
       auto &upload = texture_layer_upload_slot(state, layer);
       upload.key.clear();
       upload.uploaded_rows = 0;
+      upload.mip_level = 0; upload.mip_offset = 0;
       upload.height = 0;
       upload.width = 0;
       upload.range = AtlasRange();
@@ -9831,6 +9895,7 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
     far_texture_dirty_before = state->far_texture_dirty;
     base_texture_dirty_before = state->base_texture_dirty;
     globe_texture_dirty_before = state->globe_texture_dirty;
+    prepare_gpu_models(state);
     model_texture_dirty_before = state->model_texture_dirty;
     pending_terrain_downloads = count_pending_downloads_with_prefix_locked(state, "terrain:");
     pending_texture_downloads = count_pending_downloads_with_prefix_locked(state, "texture:");
@@ -9955,6 +10020,8 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
   const glm::vec3 ultra_texture_center = glm::vec3(camera_frame.origin);
   const glm::mat4 view = glm::mat4(glm::lookAt(camera_pose.eye, camera_pose.center, camera_pose.up));
   const glm::mat4 mvp = projection * view;
+  const glm::dmat4 precise_projection=calibrated_projection.enabled ?
+    gworld_scene::camera_projection(calibrated_projection) : glm::dmat4(projection);
   const bool render_world_mesh = state->index_count > 0 && (render_terrain || !mesh_includes_terrain);
   const double camera_setup_ms = perf_elapsed_ms(camera_start_us);
 
@@ -9987,7 +10054,7 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
                 gworld_scene::srgb_to_linear(effective_fog_color.b), 1.0f);
   glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
   render_sky_background(state,
-                        mvp,
+                        precise_projection,
                         camera_pose,
                         sun_direction,
                         fog_color,
@@ -10135,6 +10202,15 @@ on_render(GtkGLArea *area, GdkGLContext *context, gpointer user_data)
     glBindVertexArray(0);
     glDisable(GL_BLEND);
   }
+  glDisable(GL_CULL_FACE);
+  glUniform1i(glGetUniformLocation(state->program,"has_shadow_texture"),shadow_available);
+  glUniform1i(glGetUniformLocation(state->program,"has_model_texture"),state->model_texture!=0);
+  glActiveTexture(GL_TEXTURE4);glBindTexture(GL_TEXTURE_2D,state->model_texture);
+  glEnable(GL_BLEND);
+  glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+  const glm::dmat4 precise_view_projection=precise_projection * glm::lookAt(camera_pose.eye,camera_pose.center,camera_pose.up);
+  render_gpu_models(state,state->program,&precise_view_projection);
+  glDisable(GL_BLEND);
   glUseProgram(0);
   render_ground_overlays(state, ground_overlays, mvp);
   render_billboards(state,
@@ -11551,6 +11627,7 @@ reset_imagery_locked(GWorldSceneViewState *state)
     texture_layer_active_range(state, layer) = AtlasRange();
     auto &upload = texture_layer_upload_slot(state, layer);
     upload.width = 0; upload.height = 0; upload.uploaded_rows = 0;
+    upload.mip_level = 0; upload.mip_offset = 0;
     upload.key.clear(); upload.range = AtlasRange();
     upload.annotations.clear();
   }
@@ -12171,7 +12248,8 @@ mark_scene_nodes_changed(GWorldSceneView *self, GWorldSceneViewState *state)
 static bool
 scene_node_requires_mesh_rebuild(GWorldSceneNode *node)
 {
-  return !GWORLD_IS_SCENE_BILLBOARD_NODE(node) &&
+  return !GWORLD_IS_SCENE_MODEL_NODE(node) &&
+         !GWORLD_IS_SCENE_BILLBOARD_NODE(node) &&
          !GWORLD_IS_SCENE_GROUND_OVERLAY_NODE(node) &&
          !GWORLD_IS_SCENE_TEXT_LABEL_NODE(node);
 }
@@ -12660,15 +12738,28 @@ gboolean gworld_scene_view_get_offscreen_enabled(GWorldSceneView *self)
 GWorldSceneFrame *gworld_scene_view_capture_frame(GWorldSceneView *self,
   int width, int height, gint64 timestamp_us, GError **error)
 {
+  return gworld_scene_view_capture_frame_scaled(self,width,height,1.0,width,height,timestamp_us,error);
+}
+
+static GWorldSceneFrame *capture_frame_scaled_internal(GWorldSceneView *self,
+  int width, int height, double crop_factor, int output_width, int output_height,
+  gint64 timestamp_us, bool deferred, GError **error)
+{
   g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self), nullptr);
   auto *state = get_state(self);
-  if (width<1 || height<1 || width>8192 || height>8192 || gint64(width)*height>16777216) {
+  if (width<1 || height<1 || width>8192 || height>8192 || gint64(width)*height>16777216 ||
+      output_width<1 || output_height<1 || output_width>8192 || output_height>8192 ||
+      gint64(output_width)*output_height>16777216 || !std::isfinite(crop_factor) ||
+      crop_factor<1.0 || crop_factor>std::min(width,height)) {
     g_set_error_literal(error,G_IO_ERROR,G_IO_ERROR_INVALID_ARGUMENT,"Invalid capture dimensions");
     return nullptr;
   }
   if (state->disposing || state->capturing || !gtk_widget_get_realized(GTK_WIDGET(self))) {
     g_set_error_literal(error,G_IO_ERROR,G_IO_ERROR_FAILED,"Capture requires a realized, idle scene view");
     return nullptr;
+  }
+  if (deferred && state->capture_fence) {
+    g_set_error_literal(error,G_IO_ERROR,G_IO_ERROR_BUSY,"A capture is already pending"); return nullptr;
   }
   struct ContextRestore {
     GdkGLContext *previous = gdk_gl_context_get_current();
@@ -12685,7 +12776,7 @@ GWorldSceneFrame *gworld_scene_view_capture_frame(GWorldSceneView *self,
   }
   GLint maximum=0;
   glGetIntegerv(GL_MAX_TEXTURE_SIZE,&maximum);
-  if (width>maximum || height>maximum) {
+  if (width>maximum || height>maximum || output_width>maximum || output_height>maximum) {
     g_set_error_literal(error,G_IO_ERROR,G_IO_ERROR_NOT_SUPPORTED,"Capture exceeds the GL texture limit"); return nullptr;
   }
   // Preserve GTK's framebuffer and pixel-pack state even on allocation failure.
@@ -12731,19 +12822,63 @@ GWorldSceneFrame *gworld_scene_view_capture_frame(GWorldSceneView *self,
   if (!on_render(area,gtk_gl_area_get_context(area),nullptr)) {
     g_set_error_literal(error,G_IO_ERROR,G_IO_ERROR_FAILED,"Scene rendering failed"); return nullptr;
   }
-  g_autoptr(GdkPixbuf) image=gdk_pixbuf_new(GDK_COLORSPACE_RGB,TRUE,8,width,height);
+  GLuint read_fbo=state->capture_fbo;
+  if (crop_factor!=1.0 || output_width!=width || output_height!=height) {
+    if (!state->capture_output_fbo) glGenFramebuffers(1,&state->capture_output_fbo);
+    if (!state->capture_output_texture) glGenTextures(1,&state->capture_output_texture);
+    glBindFramebuffer(GL_DRAW_FRAMEBUFFER,state->capture_output_fbo);
+    if (state->capture_output_width!=output_width || state->capture_output_height!=output_height) {
+      glBindTexture(GL_TEXTURE_2D,state->capture_output_texture);
+      glTexImage2D(GL_TEXTURE_2D,0,GL_RGBA8,output_width,output_height,0,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
+      glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MIN_FILTER,GL_NEAREST);
+      glTexParameteri(GL_TEXTURE_2D,GL_TEXTURE_MAG_FILTER,GL_NEAREST);
+      glFramebufferTexture2D(GL_DRAW_FRAMEBUFFER,GL_COLOR_ATTACHMENT0,GL_TEXTURE_2D,state->capture_output_texture,0);
+      if (glCheckFramebufferStatus(GL_DRAW_FRAMEBUFFER)!=GL_FRAMEBUFFER_COMPLETE) {
+        g_set_error_literal(error,G_IO_ERROR,G_IO_ERROR_FAILED,"Unable to allocate scaled capture framebuffer");return nullptr;
+      }
+      state->capture_output_width=output_width;state->capture_output_height=output_height;
+    }
+    const int cw=int(std::floor(width/crop_factor)),ch=int(std::floor(height/crop_factor));
+    const int x=(width-cw)/2,y=(height-ch)/2;
+    glBindFramebuffer(GL_READ_FRAMEBUFFER,state->capture_fbo);
+    glBlitFramebuffer(x,y,x+cw,y+ch,0,0,output_width,output_height,GL_COLOR_BUFFER_BIT,GL_LINEAR);
+    read_fbo=state->capture_output_fbo;
+  }
+  if (deferred) {
+    if (!state->capture_pack_buffer) glGenBuffers(1,&state->capture_pack_buffer);
+    glBindFramebuffer(GL_READ_FRAMEBUFFER,read_fbo);
+    glBindBuffer(GL_PIXEL_PACK_BUFFER,state->capture_pack_buffer);
+    if (state->pending_capture_width!=output_width || state->pending_capture_height!=output_height) {
+      glBufferData(GL_PIXEL_PACK_BUFFER,GLsizeiptr(output_width)*output_height*4,nullptr,GL_STREAM_READ);
+      state->pending_capture_width=output_width;state->pending_capture_height=output_height;
+    }
+    glPixelStorei(GL_PACK_ALIGNMENT,4);glPixelStorei(GL_PACK_ROW_LENGTH,0);
+    glPixelStorei(GL_PACK_SKIP_ROWS,0);glPixelStorei(GL_PACK_SKIP_PIXELS,0);
+    glReadPixels(0,0,output_width,output_height,GL_RGBA,GL_UNSIGNED_BYTE,nullptr);
+    state->capture_fence=glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE,0);
+    if (glGetError()!=GL_NO_ERROR || !state->capture_fence) {
+      if(state->capture_fence)glDeleteSync(state->capture_fence);
+      state->capture_fence=nullptr;
+      g_set_error_literal(error,G_IO_ERROR,G_IO_ERROR_FAILED,"Unable to enqueue rendered frame");return nullptr;
+    }
+    state->pending_capture_timestamp=timestamp_us;
+    state->pending_capture_annotations=state->next_presented_annotations;
+    glFlush();
+    return nullptr;
+  }
+  g_autoptr(GdkPixbuf) image=gdk_pixbuf_new(GDK_COLORSPACE_RGB,TRUE,8,output_width,output_height);
   if (!image) { g_set_error_literal(error,G_IO_ERROR,G_IO_ERROR_NO_SPACE,"Unable to allocate frame image"); return nullptr; }
-  glBindFramebuffer(GL_READ_FRAMEBUFFER,state->capture_fbo);
+  glBindFramebuffer(GL_READ_FRAMEBUFFER,read_fbo);
   glBindBuffer(GL_PIXEL_PACK_BUFFER,0); glPixelStorei(GL_PACK_ALIGNMENT,4);
   glPixelStorei(GL_PACK_ROW_LENGTH,0); glPixelStorei(GL_PACK_SKIP_ROWS,0); glPixelStorei(GL_PACK_SKIP_PIXELS,0);
   auto *pixels=gdk_pixbuf_get_pixels(image);
-  glReadPixels(0,0,width,height,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
+  glReadPixels(0,0,output_width,output_height,GL_RGBA,GL_UNSIGNED_BYTE,pixels);
   if (glGetError()!=GL_NO_ERROR) {
     g_set_error_literal(error,G_IO_ERROR,G_IO_ERROR_FAILED,"Unable to read rendered frame"); return nullptr;
   }
   const int stride=gdk_pixbuf_get_rowstride(image);
-  for(int y=0;y<height/2;++y)
-    std::swap_ranges(pixels+y*stride,pixels+y*stride+width*4,pixels+(height-y-1)*stride);
+  for(int y=0;y<output_height/2;++y)
+    std::swap_ranges(pixels+y*stride,pixels+y*stride+output_width*4,pixels+(output_height-y-1)*stride);
   auto *frame=GWORLD_SCENE_FRAME(g_object_new(GWORLD_TYPE_SCENE_FRAME,nullptr));
   frame->image=g_steal_pointer(&image); frame->timestamp_us=timestamp_us;
   frame->completed_us=g_get_monotonic_time(); frame->sequence=++state->capture_sequence;
@@ -12752,6 +12887,58 @@ GWorldSceneFrame *gworld_scene_view_capture_frame(GWorldSceneView *self,
   g_object_set_data_full(G_OBJECT(frame->image), "gworldscene-frame-imagery-annotations",
     new gworld_scene::ImageryAnnotations(state->next_presented_annotations),
     +[](gpointer p) { delete static_cast<gworld_scene::ImageryAnnotations *>(p); });
+  return frame;
+}
+
+GWorldSceneFrame *gworld_scene_view_capture_frame_scaled(GWorldSceneView *self,
+  int width,int height,double crop_factor,int output_width,int output_height,gint64 timestamp_us,GError **error)
+{
+  return capture_frame_scaled_internal(self,width,height,crop_factor,output_width,output_height,timestamp_us,false,error);
+}
+
+gboolean gworld_scene_view_request_capture_frame_scaled(GWorldSceneView *self,
+  int width,int height,double crop_factor,int output_width,int output_height,gint64 timestamp_us,GError **error)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self),FALSE);
+  g_autoptr(GError) problem=nullptr;
+  capture_frame_scaled_internal(self,width,height,crop_factor,output_width,output_height,timestamp_us,true,&problem);
+  if(problem){g_propagate_error(error,g_steal_pointer(&problem));return FALSE;}
+  return TRUE;
+}
+
+GWorldSceneFrame *gworld_scene_view_poll_capture_frame(GWorldSceneView *self,GError **error)
+{
+  g_return_val_if_fail(GWORLD_IS_SCENE_VIEW(self),nullptr);
+  auto *state=get_state(self);
+  if(!state->capture_fence)return nullptr;
+  struct RestoreContext {
+    GdkGLContext *previous=gdk_gl_context_get_current();
+    RestoreContext(){if(previous)g_object_ref(previous);}
+    ~RestoreContext(){if(previous){gdk_gl_context_make_current(previous);g_object_unref(previous);}else gdk_gl_context_clear_current();}
+  } restore_context;
+  gtk_gl_area_make_current(GTK_GL_AREA(self));
+  if(const auto *problem=gtk_gl_area_get_error(GTK_GL_AREA(self))){g_propagate_error(error,g_error_copy(problem));return nullptr;}
+  const auto ready=glClientWaitSync(state->capture_fence,0,0);
+  if(ready==GL_TIMEOUT_EXPIRED)return nullptr;
+  glDeleteSync(state->capture_fence);state->capture_fence=nullptr;
+  if(ready==GL_WAIT_FAILED){g_set_error_literal(error,G_IO_ERROR,G_IO_ERROR_FAILED,"Capture fence failed");return nullptr;}
+  const int w=state->pending_capture_width,h=state->pending_capture_height;
+  g_autoptr(GdkPixbuf) image=gdk_pixbuf_new(GDK_COLORSPACE_RGB,TRUE,8,w,h);
+  if(!image){g_set_error_literal(error,G_IO_ERROR,G_IO_ERROR_NO_SPACE,"Unable to allocate captured image");return nullptr;}
+  GLint previous_pack=0;glGetIntegerv(GL_PIXEL_PACK_BUFFER_BINDING,&previous_pack);
+  glBindBuffer(GL_PIXEL_PACK_BUFFER,state->capture_pack_buffer);
+  const auto *pixels=static_cast<const guint8 *>(glMapBufferRange(GL_PIXEL_PACK_BUFFER,0,GLsizeiptr(w)*h*4,GL_MAP_READ_BIT));
+  if(!pixels){glBindBuffer(GL_PIXEL_PACK_BUFFER,previous_pack);g_set_error_literal(error,G_IO_ERROR,G_IO_ERROR_FAILED,"Unable to map completed capture");return nullptr;}
+  auto *destination=gdk_pixbuf_get_pixels(image);const int stride=gdk_pixbuf_get_rowstride(image);
+  for(int y=0;y<h;++y)std::memcpy(destination+y*stride,pixels+(h-y-1)*w*4,w*4);
+  const bool valid=glUnmapBuffer(GL_PIXEL_PACK_BUFFER);glBindBuffer(GL_PIXEL_PACK_BUFFER,previous_pack);
+  if(!valid){g_set_error_literal(error,G_IO_ERROR,G_IO_ERROR_FAILED,"Completed capture buffer became invalid");return nullptr;}
+  auto *frame=GWORLD_SCENE_FRAME(g_object_new(GWORLD_TYPE_SCENE_FRAME,nullptr));
+  frame->image=g_steal_pointer(&image);frame->timestamp_us=state->pending_capture_timestamp;
+  frame->completed_us=g_get_monotonic_time();frame->sequence=++state->capture_sequence;
+  g_object_set_data_full(G_OBJECT(frame->image),"gworldscene-frame-imagery-annotations",
+    new gworld_scene::ImageryAnnotations(std::move(state->pending_capture_annotations)),
+    +[](gpointer p){delete static_cast<gworld_scene::ImageryAnnotations *>(p);});
   return frame;
 }
 

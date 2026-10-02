@@ -1,11 +1,13 @@
 gworldscene_api_version = '0.1'
 
 gobject_introspection_dep = dependency('gobject-introspection-1.0')
-gobject_introspection_girdir = gobject_introspection_dep.get_variable(pkgconfig: 'girdir')
-gobject_introspection_typelibdir = gobject_introspection_dep.get_variable(pkgconfig: 'typelibdir')
-gobject_introspection_libdir = gobject_introspection_dep.get_variable(pkgconfig: 'libdir')
-gobject_introspection_includedir = gobject_introspection_dep.get_variable(pkgconfig: 'includedir')
-gobject_introspection_datadir = gobject_introspection_dep.get_variable(pkgconfig: 'datadir')
+# Project install destinations must not come from dependency pkg-config variables:
+# cross SDKs may prefix those variables with a temporary sysroot.
+gobject_introspection_libdir = get_option('prefix') / get_option('libdir')
+gobject_introspection_includedir = get_option('prefix') / get_option('includedir')
+gobject_introspection_datadir = get_option('prefix') / get_option('datadir')
+gobject_introspection_girdir = gobject_introspection_datadir / 'gir-1.0'
+gobject_introspection_typelibdir = gobject_introspection_libdir / 'girepository-1.0'
 gworldscene_pkgconfigdir = gobject_introspection_libdir / 'pkgconfig'
 gworldscene_vapidir = gobject_introspection_datadir / 'vala' / 'vapi'
 gworldscene_core_headerdir = gobject_introspection_includedir / ('gworldscene-core-' + gworldscene_api_version) / 'gworldscene'

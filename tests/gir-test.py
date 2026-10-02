@@ -72,6 +72,16 @@ def check(path):
     assert frame.get("throws") == "1"
     assert frame.find("gi:return-value", NS).get("transfer-ownership") == "full"
     assert frame.find("gi:return-value", NS).get("nullable") == "1"
+    scaled = methods["gworld_scene_view_capture_frame_scaled"]
+    assert scaled.get("throws") == "1"
+    assert scaled.find("gi:return-value", NS).get("transfer-ownership") == "full"
+    assert scaled.find("gi:return-value", NS).get("nullable") == "1"
+    assert [p.get("name") for p in scaled.findall("gi:parameters/gi:parameter", NS)] == ["sensor_width", "sensor_height", "crop_factor", "output_width", "output_height", "timestamp_us"]
+    assert methods["gworld_scene_view_request_capture_frame_scaled"].get("throws") == "1"
+    polled = methods["gworld_scene_view_poll_capture_frame"]
+    assert polled.get("throws") == "1"
+    assert polled.find("gi:return-value", NS).get("transfer-ownership") == "full"
+    assert polled.find("gi:return-value", NS).get("nullable") == "1"
     image = methods["gworld_scene_frame_get_image"].find("gi:return-value", NS)
     assert image.get("transfer-ownership") == "none"
     assert image.find("gi:type", NS).get("name") == "GdkPixbuf.Pixbuf"

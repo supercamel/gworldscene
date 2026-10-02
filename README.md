@@ -95,6 +95,14 @@ meson setup builddir -Dgtk3=enabled -Dgtk4=disabled
 meson setup builddir -Dgtk3=disabled -Dgtk4=enabled
 ```
 
+New builds default to `debugoptimized` (optimized code with debug symbols).
+For an existing unoptimized build, run
+`meson configure builddir -Dbuildtype=debugoptimized` and rebuild before measuring
+interactive camera/terrain performance. Explicit debug and release builds remain
+available. Continuous CPU-frame consumers can use `request_capture_frame_scaled`
+and `poll_capture_frame` to avoid waiting on GPU readback in their UI callbacks;
+see [asynchronous capture](docs/asynchronous-capture.md).
+
 When both backends are enabled, applications should still link only one of
 `gworldscene-gtk3-0.1` or `gworldscene-gtk4-0.1` in a single process.
 
@@ -443,3 +451,7 @@ impact and validation on the affected GTK and OpenGL/GLES paths.
 
 Supported behavior and current limitations are documented in the
 [concepts guide](docs/concepts.rst) and [API reference](docs/api-reference.rst).
+
+Moving imported models use resident indexed GPU buffers. See
+[model rendering and scaled capture](docs/moving-model-rendering.md) for lifecycle,
+GPU crop/resize, and continuous-camera imagery scheduling guarantees.

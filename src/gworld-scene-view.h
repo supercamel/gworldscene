@@ -162,6 +162,59 @@ gboolean gworld_scene_view_get_offscreen_enabled(GWorldSceneView *self);
 GWorldSceneFrame *gworld_scene_view_capture_frame(GWorldSceneView *self,
   int width, int height, gint64 timestamp_us, GError **error);
 
+/**
+ * gworld_scene_view_capture_frame_scaled:
+ * @self: a realized scene view
+ * @sensor_width: render width in pixels, 1 to 8192
+ * @sensor_height: render height in pixels, 1 to 8192
+ * @crop_factor: finite centered digital crop factor, at least 1
+ * @output_width: returned image width, 1 to 8192
+ * @output_height: returned image height, 1 to 8192
+ * @timestamp_us: caller-provided timestamp in microseconds
+ * @error: return location for a render/context/validation error
+ *
+ * Renders at sensor resolution, then crops and scales with GPU linear filtering
+ * before CPU readback. Both sensor and output are limited to 16777216 pixels;
+ * the crop must retain at least one sensor pixel on each axis. Projection and
+ * imagery demand use sensor dimensions. Same threading, lifetime and attribution
+ * guarantees as capture_frame(). Buffers are retained across calls.
+ * Returns: (transfer full) (nullable): an owned captured frame, or %NULL on error
+ */
+GWorldSceneFrame *gworld_scene_view_capture_frame_scaled(GWorldSceneView *self,
+  int sensor_width, int sensor_height, double crop_factor,
+  int output_width, int output_height, gint64 timestamp_us, GError **error);
+
+/**
+ * gworld_scene_view_request_capture_frame_scaled:
+ * @self: a realized scene view
+ * @sensor_width: render width in pixels
+ * @sensor_height: render height in pixels
+ * @crop_factor: centered digital crop factor
+ * @output_width: returned image width
+ * @output_height: returned image height
+ * @timestamp_us: caller-provided capture timestamp
+ * @error: return location for an error
+ *
+ * Enqueues GPU rendering/readback with the same limits as capture_frame_scaled().
+ * Does not wait for GPU completion. Only one asynchronous request may be pending.
+ * Poll on subsequent GTK main-loop turns. Unrealize cancels pending captures.
+ * Returns: %TRUE if enqueued, %FALSE on validation, context, or busy error
+ */
+gboolean gworld_scene_view_request_capture_frame_scaled(GWorldSceneView *self,
+  int sensor_width,int sensor_height,double crop_factor,
+  int output_width,int output_height,gint64 timestamp_us,GError **error);
+
+/**
+ * gworld_scene_view_poll_capture_frame:
+ * @self: a scene view
+ * @error: return location for an error
+ *
+ * Checks the pending GPU fence with zero timeout. Once ready, copies its pixels
+ * into an immutable frame and retires the request. Does not wait for GPU work.
+ * Returns: (transfer full) (nullable): the completed frame, or %NULL if none is ready or on error
+ */
+GWorldSceneFrame *gworld_scene_view_poll_capture_frame(GWorldSceneView *self,GError **error);
+
 typedef enum {
   GWORLD_SCENE_CAMERA_MODE_DEFAULT,
   GWORLD_SCENE_CAMERA_MODE_FREE,
